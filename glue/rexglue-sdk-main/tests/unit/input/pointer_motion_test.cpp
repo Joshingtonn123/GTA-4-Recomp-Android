@@ -30,6 +30,25 @@ TEST_CASE("raw pointer motion wins over its accelerated duplicate", "[pointer_mo
   CHECK(sample.delta_y == -1.25);
 }
 
+TEST_CASE("pointer motion observation is repeatable and non-consuming", "[pointer_motion]") {
+  PointerMotionAccumulator accumulator;
+  accumulator.Add(MotionSource::kRawMouse, 2.5, -1.25);
+
+  const auto first_observation = accumulator.Peek();
+  const auto second_observation = accumulator.Peek();
+  REQUIRE(first_observation.has_motion);
+  REQUIRE(second_observation.has_motion);
+  CHECK(second_observation.source == first_observation.source);
+  CHECK(second_observation.delta_x == first_observation.delta_x);
+  CHECK(second_observation.delta_y == first_observation.delta_y);
+
+  const auto consumed = accumulator.Consume();
+  CHECK(consumed.source == first_observation.source);
+  CHECK(consumed.delta_x == first_observation.delta_x);
+  CHECK(consumed.delta_y == first_observation.delta_y);
+  CHECK_FALSE(accumulator.Peek().has_motion);
+}
+
 TEST_CASE("an idle raw mouse does not block accelerated trackpad motion", "[pointer_motion]") {
   PointerMotionAccumulator accumulator;
   accumulator.Add(MotionSource::kSystemAccelerated, -3.25, 4.5);

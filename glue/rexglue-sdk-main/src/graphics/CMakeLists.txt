@@ -268,7 +268,12 @@ if(REXGLUE_USE_VULKAN)
 
     add_library(rexgpu-gta4-native SHARED
         gta4_native/graphics_system.cpp
+        gta4_native/native_buffer_arena.cpp
+        gta4_native/native_descriptor_backend.cpp
+        gta4_native/native_frame_context.cpp
+        gta4_native/native_memory_samples.cpp
         gta4_native/native_performance_samples.cpp
+        gta4_native/native_submission_lifetime.cpp
         gta4_native/postfx_resource_pool.cpp
         gta4_native/smaa_pipeline.cpp
         gta4_native/split_postfx_pass.cpp

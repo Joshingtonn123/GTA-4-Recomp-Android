@@ -11,7 +11,13 @@
 
 #pragma once
 
+#include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -75,6 +81,11 @@ static_assert_size(X_USER_PROFILE_SETTING, 40);
 
 class UserProfile {
  public:
+  static constexpr uint32_t kGta4TitleId = 0x545407F2;
+  static constexpr uint32_t kGta4TitleProfileSettingId = 0x63E83FFF;
+  static constexpr size_t kGta4TitleProfileMaximumSize = 1000;
+  static constexpr size_t kGta4TitleProfileEntrySize = 8;
+
   class SettingByteStream : public stream::ByteStream {
    public:
     SettingByteStream(uint32_t ptr, uint8_t* data, size_t data_length, size_t offset = 0)
@@ -216,8 +227,8 @@ class UserProfile {
 
   UserProfile();
 
-  uint64_t xuid() const { return xuid_; }
-  std::string name() const { return name_; }
+  uint64_t xuid() const;
+  std::string name() const;
   std::string storage_id() const;
   uint32_t signin_state() const;
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
@@ -226,7 +237,26 @@ class UserProfile {
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
 
   void AddSetting(std::unique_ptr<Setting> setting);
-  Setting* GetSetting(uint32_t setting_id);
+  bool HasSetting(uint32_t setting_id) const;
+
+  struct SettingReadResult {
+    bool is_set = false;
+    bool is_title_specific = false;
+  };
+  std::optional<SettingReadResult> AppendSetting(uint32_t setting_id,
+                                                X_USER_PROFILE_SETTING_DATA* data,
+                                                SettingByteStream* stream);
+
+  using TitleProfileWriteCallback =
+      std::function<void(std::vector<uint8_t> blob, uint64_t generation)>;
+  static bool ValidateGta4TitleProfileBlob(std::span<const uint8_t> blob);
+  bool WriteGuestBinarySetting(uint32_t title_id, uint32_t setting_id,
+                               std::vector<uint8_t> value);
+  std::optional<std::vector<uint8_t>> SnapshotGta4TitleProfileBlob();
+  bool ImportGta4TitleProfileBlobIfGeneration(std::span<const uint8_t> blob,
+                                              uint64_t expected_generation);
+  uint64_t gta4_title_profile_generation() const;
+  void SetGta4TitleProfileWriteCallback(TitleProfileWriteCallback callback);
 
  private:
   uint64_t xuid_;
@@ -234,9 +264,19 @@ class UserProfile {
   std::vector<std::unique_ptr<Setting>> setting_list_;
   std::unordered_map<uint32_t, Setting*> settings_;
   KernelState* kernel_state_ = nullptr;
+  mutable std::mutex mutex_;
+  uint64_t gta4_title_profile_generation_ = 0;
+  TitleProfileWriteCallback gta4_title_profile_write_callback_;
 
-  void LoadSetting(UserProfile::Setting*);
-  void SaveSetting(UserProfile::Setting*);
+  std::string StorageIdLocked() const;
+  std::optional<std::filesystem::path> ResolveTitleSettingContentPath(
+      uint32_t setting_id) const;
+  void AddSettingLocked(std::unique_ptr<Setting> setting,
+                        const std::filesystem::path* content_dir);
+  Setting* GetSettingLocked(uint32_t setting_id,
+                            const std::filesystem::path* content_dir);
+  void LoadSettingLocked(UserProfile::Setting*, const std::filesystem::path& content_dir);
+  void SaveSettingLocked(UserProfile::Setting*, const std::filesystem::path& content_dir);
 };
 
 }  // namespace xam

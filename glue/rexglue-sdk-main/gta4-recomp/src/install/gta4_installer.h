@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "gta4_source_inspector.h"
+
 namespace gta4::install {
 
 enum class Episode {

@@ -20,6 +20,7 @@ project(ReXGlue
 # Build Options
 #==========================================================
 option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+option(REXGLUE_BUILD_GTA4_RECOMP "Build the bundled GTA IV recomp application" OFF)
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
@@ -56,6 +57,16 @@ endif()
 # Root of the SDK source tree
 set(REXGLUE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# The live SDK is nested under glue/ in the LibertyRecomp workspace.  Keep the
+# location explicit instead of assuming that CMAKE_SOURCE_DIR is the workspace
+# root; standalone SDK builds may override it when the title assets live
+# elsewhere.
+get_filename_component(_REXGLUE_DEFAULT_LIBERTY_WORKSPACE
+    "${REXGLUE_ROOT}/../.." ABSOLUTE)
+set(LIBERTY_RECOMP_WORKSPACE_ROOT "${_REXGLUE_DEFAULT_LIBERTY_WORKSPACE}"
+    CACHE PATH "Root containing LibertyRecompLib and title build tools")
+unset(_REXGLUE_DEFAULT_LIBERTY_WORKSPACE)
+
 # SDK install support
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -79,8 +90,9 @@ elseif(APPLE)
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
 endif()
 
-# Enforce Clang18 compiler
-if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+# Enforce the Clang family. CMake reports Apple's supported Clang toolchain as
+# AppleClang even when the configured compiler executable is clang++.
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
     message(FATAL_ERROR "ReXGlue requires Clang compiler. Please set CMAKE_CXX_COMPILER to clang++")
 endif()
 
@@ -243,6 +255,20 @@ add_subdirectory(src/system)
 add_subdirectory(src/kernel)
 add_subdirectory(src/codegen)
 add_subdirectory(src/rexglue)
+
+# The GTA IV title is kept as an optional SDK consumer so normal RexGlue builds
+# stay lightweight while the live application can still be configured entirely
+# from this source tree.  gta4-recomp uses rexglue_configure_target(), which is
+# normally exported only when RexGlue is consumed by another project.
+if(REXGLUE_BUILD_GTA4_RECOMP)
+    if(NOT DEFINED LIBERTY_RECOMP_TARGET_PLATFORM)
+        set(LIBERTY_RECOMP_TARGET_PLATFORM "desktop" CACHE STRING
+            "Liberty Recompiled target platform")
+    endif()
+    set(REXGLUE_SHARE_DIR "${REXGLUE_ROOT}/src/ui")
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rexglue_helpers.cmake)
+    add_subdirectory(gta4-recomp)
+endif()
 
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)

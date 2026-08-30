@@ -66,6 +66,14 @@ class VulkanDevice {
     uint32_t maxPerStageDescriptorStorageBuffers = 4;
     uint32_t maxPerStageDescriptorSampledImages = 16;
     uint32_t maxPerStageResources = 128;
+    uint32_t maxDescriptorSetSamplers = 96;
+    uint32_t maxDescriptorSetSampledImages = 96;
+    uint32_t maxUpdateAfterBindDescriptorsInAllPools = 0;
+    uint32_t maxPerStageDescriptorUpdateAfterBindSamplers = 0;
+    uint32_t maxPerStageDescriptorUpdateAfterBindSampledImages = 0;
+    uint32_t maxPerStageUpdateAfterBindResources = 0;
+    uint32_t maxDescriptorSetUpdateAfterBindSamplers = 0;
+    uint32_t maxDescriptorSetUpdateAfterBindSampledImages = 0;
     uint32_t maxVertexOutputComponents = 64;
     uint32_t maxTessellationEvaluationOutputComponents = 64;
     uint32_t maxGeometryInputComponents = 64;
@@ -117,6 +125,9 @@ class VulkanDevice {
     // Vulkan 1.2 features used by Liberty's precompiled native shader cache.
     bool runtimeDescriptorArray = false;
     bool descriptorBindingPartiallyBound = false;
+    bool descriptorBindingSampledImageUpdateAfterBind = false;
+    bool descriptorBindingSamplerUpdateAfterBind = false;
+    bool descriptorBindingVariableDescriptorCount = false;
     bool bufferDeviceAddress = false;
 
     // VK_KHR_sampler_mirror_clamp_to_edge (#15, promoted to 1.2)

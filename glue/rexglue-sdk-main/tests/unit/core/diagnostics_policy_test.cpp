@@ -60,6 +60,18 @@ TEST_CASE("Profiler artifacts do not implicitly enable general logging",
       diagnostics::Category::kLogging)]);
 }
 
+TEST_CASE("Memory profiler is independently selectable", "[diagnostics][policy]") {
+  diagnostics::Policy policy{};
+  REQUIRE(diagnostics::ParsePolicy(true, "native-memory-profiler", &policy));
+  REQUIRE(policy.enabled);
+  REQUIRE(policy.categories[static_cast<std::size_t>(
+      diagnostics::Category::kNativeMemoryProfiler)]);
+  REQUIRE_FALSE(policy.categories[static_cast<std::size_t>(
+      diagnostics::Category::kNativeProfiler)]);
+  REQUIRE_FALSE(policy.categories[static_cast<std::size_t>(
+      diagnostics::Category::kLogging)]);
+}
+
 TEST_CASE("Diagnostics queries reject out-of-range categories",
           "[diagnostics][policy]") {
   struct PolicyResetGuard {

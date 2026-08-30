@@ -393,7 +393,7 @@ std::optional<MountedSource> MountSource(const std::filesystem::path& path, std:
 
   MountedSource source;
   source.package_title_id = header->metadata.execution_info.title_id;
-  source.device = std::make_unique<rex::filesystem::StfsContainerDevice>("install:", path);
+  source.device = std::make_unique<rex::filesystem::StfsContainerDevice>("install:", path, false);
   if (!source.device->Initialize()) {
     error = "The Xbox content package is corrupt or unsupported.";
     return std::nullopt;
@@ -622,6 +622,11 @@ std::optional<PreparedSource> PrepareGameSource(const std::filesystem::path& pat
   if (!ReadEntryBytes(source.xex.entry, source.xex_bytes, error) ||
       !ParseXex(source.xex_bytes, source.xex_info, error) ||
       !ValidateBaseXex(source.xex_info, error)) {
+    return std::nullopt;
+  }
+  const GameSourceInspection inspection = InspectGameXex(source.xex_bytes);
+  if (!inspection.supported()) {
+    error = inspection.rejection_reason;
     return std::nullopt;
   }
   if (source.mounted.package_title_id && *source.mounted.package_title_id != kGta4TitleId) {
@@ -914,6 +919,11 @@ Result Install(const Selection& selection, const std::filesystem::path& install_
 
   std::optional<PreparedSource> game;
   if (!selection.game_source.empty()) {
+    const GameSourceInspection inspection = InspectGameSource(selection.game_source);
+    if (!inspection.supported()) {
+      result.error = inspection.rejection_reason;
+      return result;
+    }
     game = PrepareGameSource(selection.game_source, result.error);
     if (!game) {
       return result;
@@ -935,15 +945,15 @@ Result Install(const Selection& selection, const std::filesystem::path& install_
   }
 
   std::optional<PreparedUpdate> update;
-  if (game && !selection.update_source.empty()) {
+  if (game && selection.update_source.empty()) {
+    result.error = "The supported retail 1.00 source requires the GTA IV v8 title update.";
+    return result;
+  }
+  if (game) {
     update = PrepareUpdateSource(selection.update_source, game->xex_info, result.error);
     if (!update) {
       return result;
     }
-  } else if (game && (game->xex_info.version != kRequiredTargetVersion ||
-                      HashBytes(game->xex_bytes) != kEmbeddedTargetXexSha256)) {
-    result.error = "The retail GTA IV source requires the v8 title update package.";
-    return result;
   }
 
   std::vector<PreparedDlc> dlc;
@@ -1024,6 +1034,13 @@ Result Install(const Selection& selection, const std::filesystem::path& install_
 
   if (game && !CopyTree(game->payload_root, staged_game, progress, result.error)) {
     return fail(std::move(result.error));
+  }
+  if (game) {
+    const GameSourceInspection staged_inspection = InspectGameSource(staged_game);
+    if (!staged_inspection.supported()) {
+      return fail("The copied base game no longer matches the selected retail 1.00 source: " +
+                  staged_inspection.rejection_reason);
+    }
   }
 
   if (update) {

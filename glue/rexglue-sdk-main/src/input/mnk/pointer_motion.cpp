@@ -37,7 +37,7 @@ void PointerMotionAccumulator::Add(rex::ui::MouseEvent::MotionSource source, dou
   bucket->seen = true;
 }
 
-PointerMotionSample PointerMotionAccumulator::Consume() {
+PointerMotionSample PointerMotionAccumulator::Peek() const {
   PointerMotionSample sample;
   const Bucket* selected = nullptr;
 
@@ -60,6 +60,12 @@ PointerMotionSample PointerMotionAccumulator::Consume() {
     sample.delta_y = selected->delta_y;
     sample.has_motion = true;
   }
+
+  return sample;
+}
+
+PointerMotionSample PointerMotionAccumulator::Consume() {
+  const PointerMotionSample sample = Peek();
 
   Reset();
   return sample;

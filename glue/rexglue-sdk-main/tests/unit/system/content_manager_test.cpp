@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 #include <catch2/catch_test_macros.hpp>
@@ -57,6 +58,47 @@ TEST_CASE("marketplace content is common and enumerated exactly once", "[system]
   CHECK(packages[1].file_name() == "TLAD");
   CHECK(packages[0].xuid == 0);
   CHECK(packages[1].xuid == 0);
+}
+
+TEST_CASE("marketplace entitlement allowlist filters enumeration and direct mounts",
+          "[system][content][entitlements]") {
+  ContentTestDirectory temp;
+  rex::system::xam::ContentManager manager(nullptr, temp.path() / "user",
+                                           temp.path() / "marketplace");
+  manager.SetMarketplacePackageAllowlist(
+      std::unordered_set<std::string>{"TLAD"});
+
+  const auto packages = manager.ListContentForUser(
+      static_cast<uint32_t>(rex::system::xam::DummyDeviceId::HDD), 0x1122334455667788,
+      rex::system::XContentType::kMarketplaceContent, 0x545407F2);
+  REQUIRE(packages.size() == 1);
+  CHECK(packages.front().file_name() == "TLAD");
+
+  rex::system::xam::XCONTENT_AGGREGATE_DATA denied{};
+  denied.device_id = static_cast<uint32_t>(rex::system::xam::DummyDeviceId::HDD);
+  denied.content_type = rex::system::XContentType::kMarketplaceContent;
+  denied.set_file_name("TBOGT");
+  denied.title_id = 0x545407F2;
+  denied.xuid = 0;
+  CHECK_FALSE(manager.ContentExists(0, denied));
+  CHECK(manager.ResolvePackage("extra", 0, denied) == nullptr);
+  uint32_t license = 0;
+  CHECK(manager.OpenContent("extra", 0, denied, license) == rex::X_RESULT{0x00000005});
+
+  manager.SetMarketplacePackageAllowlist(std::unordered_set<std::string>{});
+  CHECK(manager.ListContentForUser(
+            static_cast<uint32_t>(rex::system::xam::DummyDeviceId::HDD),
+            0x1122334455667788, rex::system::XContentType::kMarketplaceContent,
+            0x545407F2)
+            .empty());
+
+  manager.SetMarketplacePackageAllowlist(std::nullopt);
+  const auto install_based_packages = manager.ListContentForUser(
+      static_cast<uint32_t>(rex::system::xam::DummyDeviceId::HDD), 0x1122334455667788,
+      rex::system::XContentType::kMarketplaceContent, 0x545407F2);
+  REQUIRE(install_based_packages.size() == 2);
+  CHECK(install_based_packages[0].file_name() == "TBOGT");
+  CHECK(install_based_packages[1].file_name() == "TLAD");
 }
 
 TEST_CASE("aggregate content metadata preserves package identity when copied",

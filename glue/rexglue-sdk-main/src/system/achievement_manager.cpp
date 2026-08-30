@@ -156,6 +156,26 @@ AchievementUnlockResult AchievementManager::UnlockAchievement(
   return AchievementUnlockResult::kUnlocked;
 }
 
+AchievementUnlockResult AchievementManager::ImportUnlockedAchievement(uint32_t id) {
+  {
+    std::lock_guard lock(mutex_);
+    const auto info =
+        std::find_if(achievements_.begin(), achievements_.end(),
+                     [&](const AchievementInfo& current) { return current.id == id; });
+    if (info == achievements_.end()) {
+      REXSYS_WARN("Achievement import: ignoring unknown achievement {:08X}", id);
+      return AchievementUnlockResult::kUnknownAchievement;
+    }
+    if (!unlocked_achievements_.emplace(id, CurrentFileTime()).second) {
+      return AchievementUnlockResult::kAlreadyUnlocked;
+    }
+  }
+
+  REXSYS_INFO("Achievement imported without notification: {:08X}", id);
+  SaveUnlockState();
+  return AchievementUnlockResult::kUnlocked;
+}
+
 bool AchievementManager::ShowAchievementNotification(uint32_t id) {
   AchievementEvent event;
   {

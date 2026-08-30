@@ -110,7 +110,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // If there's an active pointer, the ImGui mouse is controlled by this touch.
   // If it's TouchEvent::kPointerIDNone, the ImGui mouse is controlled by the
   // mouse.
-  uint32_t touch_pointer_id_ = TouchEvent::kPointerIDNone;
+  uint64_t touch_pointer_id_ = TouchEvent::kPointerIDNone;
   // Whether after the next frame (since the mouse up event needs to be handled
   // with the correct mouse position still), the ImGui mouse position should be
   // reset (for instance, after releasing a touch), so it's not hovering over

@@ -30,8 +30,10 @@ set(REXSYSTEM_SOURCES
 
     # XAM services
     xam/app_manager.cpp
+    xam/arbitration_async.cpp
     xam/content_manager.cpp
     xam/live_compatibility.cpp
+    xam/multiplayer_validation.cpp
     xam/user_profile.cpp
     xam/xsession.cpp
 
@@ -65,6 +67,13 @@ target_include_directories(rexruntime PUBLIC
 target_include_directories(rexruntime PRIVATE
     ${REXGLUE_ROOT}/thirdparty
 )
+
+# rexruntime embeds rexui as an OBJECT library, so rexui's public usage
+# requirements are used to build rexruntime but are not automatically exposed
+# to runtime consumers such as GPU plugins. This definition changes types in
+# rex/ui/presenter.h and therefore must be identical on both sides of the
+# runtime/plugin ABI boundary.
+target_compile_definitions(rexruntime PUBLIC REX_HAS_FIDELITYFX_FSR1=1)
 
 target_link_libraries(rexruntime
     PUBLIC

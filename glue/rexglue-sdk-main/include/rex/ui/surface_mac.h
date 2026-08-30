@@ -19,6 +19,11 @@ struct SDL_Window;
 
 namespace rex::ui {
 
+// Applies the CAMetalLayer presentation contract used by the Vulkan backend.
+// Kept in an Objective-C++ translation unit so the rest of the SDL window
+// implementation remains platform-neutral C++.
+void ConfigureMetalLayerForPresentation(void* layer);
+
 class CAMetalLayerSurface final : public Surface {
  public:
   CAMetalLayerSurface(SDL_Window* sdl_window, void* layer)

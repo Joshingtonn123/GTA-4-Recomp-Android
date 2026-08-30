@@ -71,6 +71,7 @@ if(WIN32)
 elseif(APPLE)
     set(REXUI_PLATFORM_SOURCES
         accelerated_pointer_mac.mm
+        metal_layer_config_mac.mm
         surface_mac.cpp
     )
 else()

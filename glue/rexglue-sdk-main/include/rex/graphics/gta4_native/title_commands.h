@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <type_traits>
 
@@ -8,7 +9,7 @@
 namespace rex::graphics::gta4_native {
 
 inline constexpr uint32_t kTitleId = 0x545407F2;
-inline constexpr uint32_t kTitleCommandAbi = 23;
+inline constexpr uint32_t kTitleCommandAbi = 24;
 inline constexpr uint32_t kGuestDeviceSize = 0x5780;
 inline constexpr uint32_t kTextureStageCount = 26;
 inline constexpr uint32_t kRenderTargetCount = 4;
@@ -205,8 +206,7 @@ struct SetDepthStencilCommand {
 // Only depth is transferred; the destination object's stencil contents remain
 // owned by the forward path.
 struct DepthSurfaceHandoffCommand {
-  CommandHeader header{sizeof(DepthSurfaceHandoffCommand),
-                       CommandType::kDepthSurfaceHandoff};
+  CommandHeader header{sizeof(DepthSurfaceHandoffCommand), CommandType::kDepthSurfaceHandoff};
   uint32_t device = 0;
   SurfaceDescriptor source;
   SurfaceDescriptor destination;
@@ -239,6 +239,19 @@ struct SetIndexBufferCommand {
   uint32_t buffer;
 };
 
+struct NativeDirtyState {
+  std::array<uint64_t, 5> words{};
+
+  constexpr bool Any() const {
+    for (uint64_t word : words) {
+      if (word) {
+        return true;
+      }
+    }
+    return false;
+  }
+};
+
 struct DrawPrimitiveCommand {
   CommandHeader header{sizeof(DrawPrimitiveCommand), CommandType::kDrawPrimitive};
   uint32_t device;
@@ -248,6 +261,7 @@ struct DrawPrimitiveCommand {
   uint32_t vertex_count;
   uint32_t instance_flags;
   uint64_t depth_bias_bits;
+  NativeDirtyState dirty_state{};
 };
 
 struct DrawPrimitiveUpCommand {
@@ -258,6 +272,7 @@ struct DrawPrimitiveUpCommand {
   uint32_t stride;
   uint32_t vertex_data;
   uint32_t vertex_data_size;
+  NativeDirtyState dirty_state{};
 };
 
 struct DrawIndexedPrimitiveCommand {
@@ -273,6 +288,7 @@ struct DrawIndexedPrimitiveCommand {
   uint32_t origin_flags;
   uint32_t command_list;
   uint64_t draw_id;
+  NativeDirtyState dirty_state{};
 };
 
 enum DrawCommandOriginFlags : uint32_t {
@@ -358,6 +374,7 @@ struct ClearCommand {
   uint32_t color_bits[4];
   uint64_t depth_bits;
   uint32_t stencil;
+  NativeDirtyState dirty_state{};
 };
 
 struct RenderPhaseMarkerCommand {
@@ -403,6 +420,7 @@ static_assert(sizeof(DepthSurfaceHandoffCommand) == 100);
 static_assert(std::is_trivially_copyable<SetRenderTargetCommand>::value);
 static_assert(std::is_trivially_copyable<SetVertexStreamCommand>::value);
 static_assert(std::is_trivially_copyable<SetIndexBufferCommand>::value);
+static_assert(std::is_trivially_copyable<NativeDirtyState>::value);
 static_assert(std::is_trivially_copyable<DrawPrimitiveCommand>::value);
 static_assert(std::is_trivially_copyable<DrawPrimitiveUpCommand>::value);
 static_assert(std::is_trivially_copyable<DrawIndexedPrimitiveCommand>::value);

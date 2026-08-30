@@ -10,15 +10,14 @@ extern const size_t GameFilesSize;
 // XXH3-64 hashes for GTA IV Xbox 360 disc content
 // Hash count per file allows multiple valid versions (NTSC, PAL, etc.)
 const uint64_t GameHashes[] = {
-    // default.xex hashes (add more for different disc versions)
-    0ULL,  // Placeholder - run fshasher on disc dump to generate
+    2823947441600373906ULL,  // default.xex — USA retail 1.00
 };
 
 // GTA IV Xbox 360 base game files
 // Format: { "filename", hash_count } where hash_count = number of valid hashes
 // hash_count = 0 means skip hash validation (file presence still required)
 const std::pair<const char *, uint32_t> GameFiles[] = {
-    { "default.xex", 0 },
+    { "default.xex", 1 },
     { "audio.rpf", 0 },
     { "common.rpf", 0 },
     { "xbox360.rpf", 0 },

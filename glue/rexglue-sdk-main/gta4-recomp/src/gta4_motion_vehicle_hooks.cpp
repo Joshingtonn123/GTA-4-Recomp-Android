@@ -13,6 +13,7 @@
 #include <rex/logging.h>
 
 #include "gta4_init.h"
+#include "gta4_pc_input_bridge.h"
 
 REXCVAR_DEFINE_INT32(gta4_motion_vehicle_reentry_ms, 750, "GTA IV/Motion Sensor/Tuning",
                      "Gap after which the same vehicle is treated as a new entry")
@@ -216,7 +217,9 @@ void InvokeVehicleControl(PPCContext& ctx, uint8_t* base, PPCFunc* original,
 
 extern "C" void sub_82163CE0(PPCContext& ctx, uint8_t* base) {
   const uint32_t action_record = ctx.r3.u32;
+  const uint32_t caller = ctx.lr;
   __imp__sub_82163CE0(ctx, base);
+  gta4::input::MaybeForceDirectWeaponAction(ctx, base, action_record, caller);
   if (action_record != gta4::kPrimaryReloadActionRecord) {
     return;
   }

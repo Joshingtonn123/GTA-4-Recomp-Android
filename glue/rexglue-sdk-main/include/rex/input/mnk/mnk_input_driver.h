@@ -25,18 +25,23 @@ namespace rex::input::mnk {
 
 struct NativeInputState {
   std::array<uint8_t, 256> keys{};
+  uint32_t user_index = 0;
   double mouse_dx = 0.0;
   double mouse_dy = 0.0;
   int32_t mouse_wheel = 0;
   double mouse_sensitivity = 1.0;
-  rex::ui::MouseEvent::MotionSource mouse_source =
-      rex::ui::MouseEvent::MotionSource::kGeneric;
+  rex::ui::MouseEvent::MotionSource mouse_source = rex::ui::MouseEvent::MotionSource::kGeneric;
   bool mouse_has_motion = false;
   uint64_t mouse_reset_generation = 0;
   bool invert_mouse_y = false;
+  uint64_t last_key_event_sequence = 0;
+  uint64_t key_state_generation = 0;
+  std::array<uint64_t, 256> key_event_sequences{};
 };
 
-// Returns a snapshot for the game thread and consumes relative mouse/wheel motion.
+// Native gameplay's explicit sampling boundary. A successful call transfers
+// ownership of one accumulated relative-mouse/wheel interval to the caller.
+// Connectivity observations must not call this function.
 bool ConsumeNativeInputState(NativeInputState* out_state);
 
 class MnkInputDriver final : public InputDriver,
@@ -47,6 +52,7 @@ class MnkInputDriver final : public InputDriver,
   ~MnkInputDriver() override;
 
   X_STATUS Setup() override;
+  const char* trace_name() const override { return "mnk"; }
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                            X_INPUT_CAPABILITIES* out_caps) override;
@@ -70,6 +76,8 @@ class MnkInputDriver final : public InputDriver,
   void OnLostFocus(rex::ui::UISetupEvent& e) override;
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 
+  // This and controller-emulation GetState are mutually exclusive consumers:
+  // the mnk_controller_emulation mode selects exactly one sampling owner.
   bool ConsumeNativeState(NativeInputState* out_state);
 
  private:
@@ -78,7 +86,7 @@ class MnkInputDriver final : public InputDriver,
   void CenterCursor();
   void UpdateMouseCapture();
   void ResetPointerMotionLocked();
-  void SetKeyState(uint16_t vk, bool down);
+  bool SetKeyState(uint16_t vk, bool down);
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
 
   rex::ui::Window* attached_window_ = nullptr;
@@ -98,6 +106,12 @@ class MnkInputDriver final : public InputDriver,
       rex::ui::Window::CursorVisibility::kVisible;
   bool has_focus_ = true;
   uint64_t mouse_reset_generation_ = 0;
+  uint64_t last_key_event_sequence_ = 0;
+  uint64_t key_state_generation_ = 0;
+  std::array<uint64_t, 256> key_event_sequences_{};
+  uint64_t last_traced_snapshot_generation_ = 0;
+  bool trace_snapshot_initialized_ = false;
+  int32_t last_traced_consume_status_ = -1;
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;

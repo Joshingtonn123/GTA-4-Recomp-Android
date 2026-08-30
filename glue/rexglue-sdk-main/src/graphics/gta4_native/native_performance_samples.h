@@ -12,38 +12,108 @@ namespace rex::graphics::gta4_native::performance {
 // are intended to remain cheap enough for representative multi-frame captures.
 enum class GpuRange : uint8_t {
   kFrame,
+  kFrameSetup,
   kTexturePreparation,
   kOpaqueControl,
   kMirrorReflections,
   kWaterReflections,
   kEnvironmentReflections,
+  kResolve,
   kDepthResolve,
   kStencilSave,
   kDepthCopy,
   kStencilRestore,
+  kLightSetup,
   kDeferredLightVolumes,
+  kRadar,
   kTranslucentWaterSurface,
   kTranslucentWaterTexture,
   kTranslucentVehicleGlass,
   kTranslucentGeneralGlass,
   kTranslucentVehicleLights,
   kTranslucentLightSprites,
+  kTranslucentOther,
   kComposite,
+  kSceneSnapshot,
+  kPostFxStipple,
+  kPostFxBokeh,
+  kPostFxBlur,
+  kPostFxDofCombine,
+  kPostFxCopyBack,
+  kSunShaftPrepass,
+  kSunShaftRadialFirst,
+  kSunShaftRadialSecond,
+  kSunShaftComposite,
+  kSunShaftCopyBack,
+  kSmaaLookupUpload,
+  kSmaaEdges,
+  kSmaaWeights,
+  kSmaaNeighborhood,
   kPresent,
+  kFrameRelease,
+  kUnattributed,
   kCount,
 };
 
 enum class CpuRange : uint8_t {
+  kFrameInterval,
   kFenceWait,
+  kHousekeeping,
+  kUploadCapacity,
+  kCommandSetup,
   kTexturePreparation,
   kCommandRecording,
+  kCommandFinalize,
   kQueueSubmit,
   kRenderCallback,
+  kPublish,
+  kPresenterAcquire,
+  kPresenterSubmit,
+  kPresenterPresent,
+  kPresenterTotal,
+  kOutsideRenderer,
   kCount,
 };
 
 enum class Counter : uint8_t {
   kUploadBytes,
+  kTextureUploadBytes,
+  kVertexUploadBytes,
+  kIndexUploadBytes,
+  kPersistentBufferUploadBytes,
+  kPersistentBufferHits,
+  kPersistentBufferMisses,
+  kPersistentBufferResidentBytes,
+  kPersistentBufferLiveAllocations,
+  kVertexConstantUploadBytes,
+  kPixelConstantUploadBytes,
+  kSharedConstantUploadBytes,
+  kDrawUpUploadBytes,
+  kDescriptorSetsAllocated,
+  kDescriptorEntriesWritten,
+  kPipelineLookups,
+  kPipelineMisses,
+  kPipelineCreates,
+  kSurfaceImagesLive,
+  kSurfaceImageBytes,
+  kTextureImagesLive,
+  kTextureImageBytes,
+  kBufferCaptureReuses,
+  kBufferShadowValidations,
+  kBufferShadowMismatches,
+  kBufferFastPathDisables,
+  kTextureImageEvictions,
+  kTextureImageEvictedBytes,
+  kTextureAllocationRetries,
+  kTextureAllocationFailures,
+  kTextureHeapUsage,
+  kTextureHeapBudget,
+  kProcessPhysicalFootprintBytes,
+  kProcessResidentBytes,
+  kUploadBufferCapacityBytes,
+  kUploadBufferAllocationBytes,
+  kPendingTextureReleases,
+  kPipelinesLive,
   kUnavailableGpuRanges,
   kDroppedGpuRanges,
   kCount,
@@ -52,13 +122,13 @@ enum class Counter : uint8_t {
 constexpr size_t kGpuRangeCount = size_t(GpuRange::kCount);
 constexpr size_t kCpuRangeCount = size_t(CpuRange::kCount);
 constexpr size_t kCounterCount = size_t(Counter::kCount);
-// Matches the native timestamp pool budget. Every span owns exactly two
-// queries, so the metadata store can represent every legal query-pool pair.
-constexpr size_t kMaximumGpuQueriesPerFrame = 4096;
+// The profiler records one timestamp at frame start and one at every exclusive
+// range boundary. This deliberately bounded pool keeps profiling overhead
+// independent of draw count while still allowing 255 pass/category slices.
+constexpr size_t kMaximumGpuQueriesPerFrame = 256;
 constexpr size_t kQueriesPerGpuSpan = 2;
-constexpr size_t kMaximumGpuSpansPerFrame =
-    kMaximumGpuQueriesPerFrame / kQueriesPerGpuSpan;
-constexpr size_t kFrameSampleCapacity = 256;
+constexpr size_t kMaximumGpuSpansPerFrame = kMaximumGpuQueriesPerFrame / kQueriesPerGpuSpan;
+constexpr size_t kFrameSampleCapacity = 600;
 
 struct GpuSpan {
   GpuRange range = GpuRange::kFrame;
@@ -99,19 +169,18 @@ class FrameBuilder {
   bool active() const { return active_; }
   uint32_t frame() const { return sample_.frame; }
 
-  GpuSpanToken BeginGpuRange(GpuRange range, uint32_t command_index,
-                             uint32_t begin_query, uint32_t end_query);
+  GpuSpanToken BeginGpuRange(GpuRange range, uint32_t command_index, uint32_t begin_query,
+                             uint32_t end_query);
   bool EndGpuRange(GpuSpanToken token);
-  bool ResolveGpuRange(GpuSpanToken token, uint64_t elapsed_ticks,
-                       bool available);
+  bool ResolveGpuRange(GpuSpanToken token, uint64_t elapsed_ticks, bool available);
+  void AddGpuRange(GpuRange range, uint64_t elapsed_ticks, bool available = true);
   const FrameSample& Finish();
   void AddCpuRange(CpuRange range, uint64_t elapsed_ticks);
   void AddCounter(Counter counter, uint64_t value = 1);
+  void SetCounter(Counter counter, uint64_t value);
 
   const FrameSample& sample() const { return sample_; }
-  const std::array<GpuSpan, kMaximumGpuSpansPerFrame>& spans() const {
-    return spans_;
-  }
+  const std::array<GpuSpan, kMaximumGpuSpansPerFrame>& spans() const { return spans_; }
   size_t span_count() const { return span_count_; }
 
  private:
@@ -147,8 +216,7 @@ class FrameSampleRing {
 const char* GpuRangeName(GpuRange range);
 const char* CpuRangeName(CpuRange range);
 const char* CounterName(Counter counter);
-bool CalculateTimestampDelta(uint64_t begin, uint64_t end,
-                             uint32_t valid_bits, uint64_t* delta);
+bool CalculateTimestampDelta(uint64_t begin, uint64_t end, uint32_t valid_bits, uint64_t* delta);
 
 }  // namespace rex::graphics::gta4_native::performance
 

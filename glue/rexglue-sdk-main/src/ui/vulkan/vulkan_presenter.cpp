@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/diagnostics/policy.h>
 #include <rex/logging.h>
@@ -57,7 +58,13 @@
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
 
-REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate,
+#if REX_PLATFORM_MAC
+                    false,
+#else
+                    true,
+#endif
+                    "UI/Vulkan",
                     "Allow immediate present mode (no vsync)");
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
@@ -65,6 +72,13 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
+
+REXCVAR_DEFINE_UINT32(vulkan_present_acquire_timeout_ms, 50, "UI/Vulkan",
+                      "Maximum wait for a swapchain image before dropping a paint attempt")
+    .range(1, 1000);
+
+REXCVAR_DEFINE_BOOL(vulkan_presenter_probe_guest_output_pixels, false, "UI/Vulkan",
+                    "Periodically read back guest output for pixel diagnostics");
 
 static constexpr bool kVulkanHDRDefault = false;
 REXCVAR_DEFINE_BOOL(vulkan_hdr, kVulkanHDRDefault, "UI/Vulkan",
@@ -167,9 +181,6 @@ VulkanPresenter::PaintContext::Submission::~Submission() {
     dfn.vkDestroyCommandPool(device, draw_command_pool_, nullptr);
   }
 
-  if (present_semaphore_ != VK_NULL_HANDLE) {
-    dfn.vkDestroySemaphore(device, present_semaphore_, nullptr);
-  }
   if (acquire_semaphore_ != VK_NULL_HANDLE) {
     dfn.vkDestroySemaphore(device, acquire_semaphore_, nullptr);
   }
@@ -190,14 +201,6 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
         "semaphore");
     return false;
   }
-  if (dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr, &present_semaphore_) !=
-      VK_SUCCESS) {
-    REXLOG_ERROR(
-        "VulkanPresenter: Failed to create a swapchain image presentation "
-        "semaphore");
-    return false;
-  }
-
   VkCommandPoolCreateInfo command_pool_create_info;
   command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
   command_pool_create_info.pNext = nullptr;
@@ -243,6 +246,12 @@ VulkanPresenter::~VulkanPresenter() {
   // (paint submission completion already awaited).
   // From most likely the latest to most likely the earliest to be signaled, so
   // just one sleep will likely be needed.
+  for (GuestOutputImageInstance& image_instance : guest_output_images_) {
+    if (image_instance.refresher_completion) {
+      image_instance.refresher_completion->Await();
+      image_instance.refresher_completion.reset();
+    }
+  }
   ui_submission_tracker_.Shutdown();
   guest_output_image_refresher_submission_tracker_.Shutdown();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -1011,6 +1020,34 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         render_pass_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
   }
 
+  // Swapchain paint pipelines are render-pass-format-specific. Keep their
+  // recorded format synchronized with the object lifetime and compile the
+  // small, bounded final-effect set at connection time. Previously the lazy
+  // creation path left swapchain_format as VK_FORMAT_UNDEFINED, so the next
+  // frame treated the freshly-created pipeline as incompatible, waited for
+  // the prior paint submission, destroyed it, and compiled it again.
+  for (size_t effect_index = 0; effect_index < size_t(GuestOutputPaintEffect::kCount);
+       ++effect_index) {
+    PaintContext::GuestOutputPaintPipeline& effect_pipeline =
+        paint_context_.guest_output_paint_pipelines[effect_index];
+    if (effect_pipeline.swapchain_pipeline != VK_NULL_HANDLE &&
+        effect_pipeline.swapchain_format != paint_context_.swapchain_render_pass_format) {
+      util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                 effect_pipeline.swapchain_pipeline);
+      effect_pipeline.swapchain_format = VK_FORMAT_UNDEFINED;
+    }
+    const GuestOutputPaintEffect effect = GuestOutputPaintEffect(effect_index);
+    if (effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE &&
+        CanGuestOutputPaintEffectBeFinal(effect) &&
+        guest_output_paint_fs_[effect_index] != VK_NULL_HANDLE) {
+      effect_pipeline.swapchain_pipeline =
+          CreateGuestOutputPaintPipeline(effect, paint_context_.swapchain_render_pass);
+      if (effect_pipeline.swapchain_pipeline != VK_NULL_HANDLE) {
+        effect_pipeline.swapchain_format = paint_context_.swapchain_render_pass_format;
+      }
+    }
+  }
+
   // Get the swapchain images.
   paint_context_.swapchain_images.clear();
   VkResult swapchain_images_get_result;
@@ -1037,6 +1074,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.DestroySwapchainAndVulkanSurface();
     return SurfacePaintConnectResult::kFailure;
   }
+  REXLOG_INFO("VulkanPresenter: Swapchain exposes {} images",
+              paint_context_.swapchain_images.size());
 
   // Create the image views and the framebuffers.
   assert_true(paint_context_.swapchain_framebuffers.empty());
@@ -1083,7 +1122,19 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
       paint_context_.DestroySwapchainAndVulkanSurface();
       return SurfacePaintConnectResult::kFailure;
     }
-    paint_context_.swapchain_framebuffers.emplace_back(image_view, framebuffer);
+    VkSemaphoreCreateInfo semaphore_create_info = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkSemaphore present_semaphore = VK_NULL_HANDLE;
+    if (dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr, &present_semaphore) !=
+        VK_SUCCESS) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Failed to create a swapchain-image presentation semaphore");
+      dfn.vkDestroyFramebuffer(device, framebuffer, nullptr);
+      dfn.vkDestroyImageView(device, image_view, nullptr);
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+    paint_context_.swapchain_framebuffers.emplace_back(image_view, framebuffer,
+                                                       present_semaphore);
   }
 
   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
@@ -1110,8 +1161,13 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   GuestOutputImageInstance& image_instance = guest_output_images_[mailbox_index];
   if (image_instance.image && (image_instance.image->extent().width != frontbuffer_width ||
                                image_instance.image->extent().height != frontbuffer_height)) {
-    guest_output_image_refresher_submission_tracker_.AwaitSubmissionCompletion(
-        image_instance.last_refresher_submission);
+    if (image_instance.refresher_completion) {
+      image_instance.refresher_completion->Await();
+      image_instance.refresher_completion.reset();
+    } else {
+      guest_output_image_refresher_submission_tracker_.AwaitSubmissionCompletion(
+          image_instance.last_refresher_submission);
+    }
     image_instance.image.reset();
   }
   if (!image_instance.image) {
@@ -1145,23 +1201,23 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   // some commands referencing the image. It's better to put an excessive
   // signal and wait slightly longer, for nothing important, while shutting down
   // than to destroy the image while it's still in use.
-  image_instance.last_refresher_submission =
-      guest_output_image_refresher_submission_tracker_.GetCurrentSubmission();
-  // No need to make the refresher signal the fence by itself - signal it here
-  // instead to have more control:
-  // "Fence signal operations that are defined by vkQueueSubmit additionally
-  //  include in the first synchronization scope all commands that occur earlier
-  //  in submission order."
-  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
-  {
-    VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
+  image_instance.refresher_completion = context.completion();
+  if (!image_instance.refresher_completion) {
+    // Legacy refreshers don't expose their completion. Preserve the old
+    // queue-order fence fallback for those backends/callers only.
+    image_instance.last_refresher_submission =
+        guest_output_image_refresher_submission_tracker_.GetCurrentSubmission();
+    const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+    VulkanSubmissionTracker::FenceAcquisition fence_acquisition(
         guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-    if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, fence_acqusition.fence()) !=
+    if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, fence_acquisition.fence()) !=
         VK_SUCCESS) {
-      fence_acqusition.SubmissionSucceededSignalFailed();
+      fence_acquisition.SubmissionSucceededSignalFailed();
     }
+  } else {
+    image_instance.last_refresher_submission = 0;
   }
 
   return refresher_succeeded;
@@ -1463,23 +1519,21 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     swapchain_create_info.compositeAlpha =
         VkCompositeAlphaFlagBitsKHR(uint32_t(1) << composite_alpha_shift);
   }
-  // As presentation is usually controlled by the GPU command processor, it's
-  // better to use modes that allow as quick acquisition as possible to avoid
-  // interfering with GPU command processing, and also to allow tearing so
-  // variable refresh rate may be used where it's available.
-  // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  // Prefer mailbox where available. It keeps multiple drawable images in
+  // circulation without the sustained above-refresh immediate-present
+  // behavior that can turn MoltenVK drawable acquisition into periodic CPU
+  // stalls. Immediate remains an explicit opt-in.
+  if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
+      std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
+          present_modes.cend()) {
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
     // (though on Windows with borderless fullscreen, GDI copying is used
     // instead of independent flip, so it's not supported there).
     swapchain_create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-  } else if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
-             std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
-                 present_modes.cend()) {
-    // Allowing dropping frames to reduce latency, but no tearing.
-    swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
   } else if (REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
              std::find(present_modes.cbegin(), present_modes.cend(),
                        VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.cend()) {
@@ -1520,6 +1574,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
   const VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   for (const SwapchainFramebuffer& framebuffer : swapchain_framebuffers) {
+    dfn.vkDestroySemaphore(device, framebuffer.present_semaphore, nullptr);
     dfn.vkDestroyFramebuffer(device, framebuffer.framebuffer, nullptr);
     dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
   }
@@ -1621,6 +1676,10 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  const uint64_t paint_timing_begin = rex::chrono::Clock::QueryHostTickCount();
+  uint64_t paint_acquire_ticks = 0;
+  uint64_t paint_submit_ticks = 0;
+  uint64_t paint_present_ticks = 0;
   // HDR selection changes both the swapchain format and its color-space
   // contract. Reconnect immediately instead of only changing shader behavior
   // while an incompatible swapchain remains alive.
@@ -1636,8 +1695,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       paint_context_.submission_tracker.GetCurrentSubmission();
   uint64_t paint_submission_count = uint64_t(paint_context_.submissions.size());
   if (current_paint_submission_index >= paint_submission_count) {
-    paint_context_.submission_tracker.AwaitSubmissionCompletion(current_paint_submission_index -
-                                                                paint_submission_count);
+    const uint64_t reusable_submission_index =
+        current_paint_submission_index - paint_submission_count;
+    if (!paint_context_.submission_tracker.IsSubmissionComplete(reusable_submission_index)) {
+      // MoltenVK may acquire the actual CAMetalDrawable lazily while encoding
+      // this submission on its asynchronous queue. Never wait for that work on
+      // the AppKit thread: yielding to the event loop is what lets Core
+      // Animation recycle drawables and break drawable-starvation cycles.
+      return PaintResult::kNotPresentedRetry;
+    }
   }
   const PaintContext::Submission& paint_submission =
       *paint_context_.submissions[current_paint_submission_index % paint_submission_count];
@@ -1670,9 +1736,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
-  VkResult acquire_result =
-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
-                                VK_NULL_HANDLE, &swapchain_image_index);
+  // An occluded, minimized, or drawable-starved surface must not block this
+  // thread forever. A timeout drops only this paint attempt.
+  const uint64_t acquire_timeout_nanoseconds =
+      uint64_t(REXCVAR_GET(vulkan_present_acquire_timeout_ms)) * 1000000ull;
+  const uint64_t paint_acquire_begin = rex::chrono::Clock::QueryHostTickCount();
+  VkResult acquire_result = dfn.vkAcquireNextImageKHR(
+      device, paint_context_.swapchain, acquire_timeout_nanoseconds, acquire_semaphore,
+      VK_NULL_HANDLE, &swapchain_image_index);
+  paint_acquire_ticks = rex::chrono::Clock::QueryHostTickCount() - paint_acquire_begin;
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
@@ -1691,6 +1763,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           "VulkanPresenter: Presentation to the swapchain image has been "
           "dropped as the swapchain or the surface has become outdated");
       return PaintResult::kNotPresentedConnectionOutdated;
+    case VK_TIMEOUT:
+    case VK_NOT_READY:
+      REXLOG_WARN("VulkanPresenter: Timed out while acquiring a swapchain image");
+      return PaintResult::kNotPresentedRetry;
     default:
       REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image");
       return PaintResult::kNotPresented;
@@ -1955,6 +2031,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 swapchain_effect, paint_context_.swapchain_render_pass);
             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
               guest_output_flow.effect_count = 0;
+            } else {
+              swapchain_effect_pipeline.swapchain_format =
+                  paint_context_.swapchain_render_pass_format;
             }
           }
         }
@@ -2289,7 +2368,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     paint_context_.ui_setup_command_buffer_current_index = SIZE_MAX;
   }
   command_buffers[command_buffer_count++] = draw_command_buffer;
-  VkSemaphore present_semaphore = paint_submission.present_semaphore();
+  // A render-finished semaphore is owned by the acquired swapchain image, not
+  // by the CPU frame slot. Reacquisition is the WSI guarantee that the prior
+  // present operation for this image has consumed its semaphore wait.
+  VkSemaphore present_semaphore =
+      paint_context_.swapchain_framebuffers[swapchain_image_index].present_semaphore;
   VkSubmitInfo submit_info;
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.pNext = nullptr;
@@ -2310,6 +2393,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       ui_fence_acquisition = ui_submission_tracker_.AcquireFenceToAdvanceSubmission();
     }
     VkResult submit_result;
+    const uint64_t paint_submit_begin = rex::chrono::Clock::QueryHostTickCount();
     {
       const VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
@@ -2322,6 +2406,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         }
       }
     }
+    paint_submit_ticks = rex::chrono::Clock::QueryHostTickCount() - paint_submit_begin;
     if (submit_result != VK_SUCCESS) {
       REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers");
       fence_acqusition.SubmissionFailedOrDropped();
@@ -2352,11 +2437,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pImageIndices = &swapchain_image_index;
   present_info.pResults = nullptr;
   VkResult present_result;
+  const uint64_t paint_present_begin = rex::chrono::Clock::QueryHostTickCount();
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
+  paint_present_ticks = rex::chrono::Clock::QueryHostTickCount() - paint_present_begin;
+  PublishPaintTiming(paint_acquire_ticks, paint_submit_ticks, paint_present_ticks,
+                     rex::chrono::Clock::QueryHostTickCount() - paint_timing_begin);
 
   if (rex::diagnostics::IsEnabled(
           rex::diagnostics::Category::kPresenter)) {
@@ -2400,7 +2489,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   const bool guest_output_pixel_milestone =
       vulkan_paint_flow_count == 128 || vulkan_paint_flow_count == 1024 ||
       (vulkan_paint_flow_count >= 2048 && !(vulkan_paint_flow_count % 2048));
-  if (guest_output_pixel_milestone) {
+  // This forces a GPU readback and copies a full-resolution frame. Keep it
+  // explicitly opt-in rather than coupling it to general presenter logging.
+  if (guest_output_pixel_milestone &&
+      REXCVAR_GET(vulkan_presenter_probe_guest_output_pixels)) {
     RawImage captured_image;
     if (CaptureGuestOutputImage(guest_output_image, captured_image)) {
       uint64_t red_sum = 0;
@@ -2448,8 +2540,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           static_cast<unsigned long long>(green_sum),
           static_cast<unsigned long long>(blue_sum));
       std::fflush(stderr);
-      std::string capture_path =
-          "/tmp/liberty_guest_output_" + std::to_string(vulkan_paint_flow_count) + ".rgba";
+      // Keep disk usage bounded even during a long diagnostic run.
+      std::string capture_path = "/tmp/liberty_guest_output_latest.rgba";
       std::ofstream capture_file(capture_path, std::ios::binary);
       capture_file.write(reinterpret_cast<const char*>(captured_image.data.data()),
                          std::streamsize(captured_image.data.size()));

@@ -10,7 +10,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/input.h>
@@ -40,14 +42,36 @@ class InputSystem : public system::IInputSystem {
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
+  // Returns the most recent state produced by GetState without polling any
+  // driver. Game-specific bridges use this to observe controller buttons at a
+  // deterministic guest poll boundary without consuming transient input a
+  // second time.
+  bool TryGetLastState(uint32_t user_index, X_INPUT_STATE* out_state);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
   bool TryGetMotionState(uint32_t user_index, MotionState* out_state);
 
  private:
+  struct MergedStateTracker {
+    X_INPUT_GAMEPAD gamepad{};
+    uint32_t packet_number = 0;
+    bool initialized = false;
+    bool available = false;
+  };
+
+  struct DriverTraceTracker {
+    X_INPUT_GAMEPAD gamepad{};
+    X_RESULT result = X_ERROR_DEVICE_NOT_CONNECTED;
+    bool initialized = false;
+  };
+
   rex::ui::Window* window_ = nullptr;
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
+  std::vector<std::array<DriverTraceTracker, 4>> driver_trace_trackers_;
+  std::mutex trace_mutex_;
+  std::mutex merged_state_mutex_;
+  std::array<MergedStateTracker, 4> merged_state_trackers_{};
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

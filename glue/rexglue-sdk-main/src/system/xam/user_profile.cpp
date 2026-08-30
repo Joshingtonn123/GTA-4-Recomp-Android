@@ -10,6 +10,7 @@
  */
 
 #include <sstream>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
@@ -95,12 +96,23 @@ UserProfile::UserProfile() {
 
 uint32_t UserProfile::signin_state() const {
   return kernel_state_ && kernel_state_->live_compatibility() &&
-                 kernel_state_->live_compatibility()->available()
+                 kernel_state_->live_compatibility()->signed_in()
              ? 2
              : 1;
 }
 
+uint64_t UserProfile::xuid() const {
+  std::lock_guard lock(mutex_);
+  return xuid_;
+}
+
+std::string UserProfile::name() const {
+  std::lock_guard lock(mutex_);
+  return name_;
+}
+
 void UserProfile::SetIdentity(uint64_t xuid, std::string name) {
+  std::lock_guard lock(mutex_);
   if (xuid) {
     xuid_ = xuid;
   }
@@ -110,18 +122,41 @@ void UserProfile::SetIdentity(uint64_t xuid, std::string name) {
 }
 
 std::string UserProfile::storage_id() const {
+  std::lock_guard lock(mutex_);
+  return StorageIdLocked();
+}
+
+std::string UserProfile::StorageIdLocked() const {
   // Multiplayer display names are user-editable and must not select the
   // title-specific profile directory. XUID is the stable local identity that
   // already owns this XAM profile.
   return fmt::format("{:016X}", xuid_);
 }
 
+std::optional<std::filesystem::path> UserProfile::ResolveTitleSettingContentPath(
+    uint32_t setting_id) const {
+  if (!kernel_state_ || (setting_id & 0x3F00) != 0x3F00) {
+    return std::nullopt;
+  }
+  // Resolve before acquiring the profile mutex. ContentManager consults the
+  // stable profile identity while migrating legacy directories.
+  return kernel_state_->content_manager()->ResolveGameUserContentPath();
+}
+
 void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
+  const auto content_dir = ResolveTitleSettingContentPath(setting->setting_id);
+  std::lock_guard lock(mutex_);
+  AddSettingLocked(std::move(setting), content_dir ? &*content_dir : nullptr);
+}
+
+void UserProfile::AddSettingLocked(std::unique_ptr<Setting> setting,
+                                   const std::filesystem::path* content_dir) {
   Setting* previous_setting = setting.get();
   std::swap(settings_[setting->setting_id], previous_setting);
 
-  if (setting->is_set && setting->is_title_specific()) {
-    SaveSetting(setting.get());
+  if (kernel_state_ && setting->is_set && setting->is_title_specific()) {
+    assert_not_null(content_dir);
+    SaveSettingLocked(setting.get(), *content_dir);
   }
 
   if (previous_setting) {
@@ -138,39 +173,171 @@ void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
   }
 }
 
-UserProfile::Setting* UserProfile::GetSetting(uint32_t setting_id) {
+bool UserProfile::HasSetting(uint32_t setting_id) const {
+  std::lock_guard lock(mutex_);
+  return settings_.contains(setting_id);
+}
+
+UserProfile::Setting* UserProfile::GetSettingLocked(
+    uint32_t setting_id, const std::filesystem::path* content_dir) {
   const auto& it = settings_.find(setting_id);
   if (it == settings_.end()) {
     return nullptr;
   }
   UserProfile::Setting* setting = it->second;
-  if (setting->is_title_specific()) {
+  if (kernel_state_ && setting->is_title_specific()) {
     // If what we have loaded in memory isn't for the title that is running
     // right now, then load it from disk.
     if (kernel_state_->title_id() != setting->loaded_title_id) {
-      LoadSetting(setting);
+      assert_not_null(content_dir);
+      LoadSettingLocked(setting, *content_dir);
     }
   }
   return setting;
 }
 
-void UserProfile::LoadSetting(UserProfile::Setting* setting) {
+std::optional<UserProfile::SettingReadResult> UserProfile::AppendSetting(
+    uint32_t setting_id, X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) {
+  const auto content_dir = ResolveTitleSettingContentPath(setting_id);
+  std::lock_guard lock(mutex_);
+  auto* setting = GetSettingLocked(setting_id, content_dir ? &*content_dir : nullptr);
+  if (!setting) {
+    return std::nullopt;
+  }
+  if (setting->is_set) {
+    setting->Append(data, stream);
+  }
+  return SettingReadResult{.is_set = setting->is_set,
+                           .is_title_specific = setting->is_title_specific()};
+}
+
+bool UserProfile::ValidateGta4TitleProfileBlob(std::span<const uint8_t> blob) {
+  if (blob.size() > kGta4TitleProfileMaximumSize ||
+      blob.size() % kGta4TitleProfileEntrySize != 0) {
+    return false;
+  }
+
+  std::unordered_set<uint32_t> keys;
+  keys.reserve(blob.size() / kGta4TitleProfileEntrySize);
+  for (size_t offset = 0; offset < blob.size(); offset += kGta4TitleProfileEntrySize) {
+    const uint32_t key = memory::load_and_swap<uint32_t>(blob.data() + offset);
+    if (!keys.insert(key).second) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool UserProfile::WriteGuestBinarySetting(uint32_t title_id, uint32_t setting_id,
+                                          std::vector<uint8_t> value) {
+  const bool is_gta4_profile =
+      title_id == kGta4TitleId && setting_id == kGta4TitleProfileSettingId;
+  if (is_gta4_profile && !ValidateGta4TitleProfileBlob(value)) {
+    return false;
+  }
+
+  TitleProfileWriteCallback callback;
+  uint64_t generation = 0;
+  std::vector<uint8_t> callback_blob;
+  const auto content_dir = ResolveTitleSettingContentPath(setting_id);
+  {
+    std::lock_guard lock(mutex_);
+    AddSettingLocked(std::make_unique<BinarySetting>(setting_id, value),
+                     content_dir ? &*content_dir : nullptr);
+    if (is_gta4_profile) {
+      generation = ++gta4_title_profile_generation_;
+      callback = gta4_title_profile_write_callback_;
+      if (callback) {
+        callback_blob = std::move(value);
+      }
+    }
+  }
+  if (callback) {
+    callback(std::move(callback_blob), generation);
+  }
+  return true;
+}
+
+std::optional<std::vector<uint8_t>> UserProfile::SnapshotGta4TitleProfileBlob() {
+  const auto content_dir = ResolveTitleSettingContentPath(kGta4TitleProfileSettingId);
+  std::lock_guard lock(mutex_);
+  auto* setting = GetSettingLocked(kGta4TitleProfileSettingId,
+                                   content_dir ? &*content_dir : nullptr);
+  auto* binary = setting ? dynamic_cast<BinarySetting*>(setting) : nullptr;
+  if (!binary || !binary->is_set || !ValidateGta4TitleProfileBlob(binary->value)) {
+    return std::nullopt;
+  }
+  return binary->value;
+}
+
+bool UserProfile::ImportGta4TitleProfileBlobIfGeneration(
+    std::span<const uint8_t> blob, uint64_t expected_generation) {
+  if (!ValidateGta4TitleProfileBlob(blob)) {
+    return false;
+  }
+  const auto content_dir = ResolveTitleSettingContentPath(kGta4TitleProfileSettingId);
+  std::lock_guard lock(mutex_);
+  if (gta4_title_profile_generation_ != expected_generation) {
+    return false;
+  }
+  AddSettingLocked(
+      std::make_unique<BinarySetting>(kGta4TitleProfileSettingId,
+                                      std::vector<uint8_t>(blob.begin(), blob.end())),
+      content_dir ? &*content_dir : nullptr);
+  return true;
+}
+
+uint64_t UserProfile::gta4_title_profile_generation() const {
+  std::lock_guard lock(mutex_);
+  return gta4_title_profile_generation_;
+}
+
+void UserProfile::SetGta4TitleProfileWriteCallback(TitleProfileWriteCallback callback) {
+  std::lock_guard lock(mutex_);
+  gta4_title_profile_write_callback_ = std::move(callback);
+}
+
+void UserProfile::LoadSettingLocked(UserProfile::Setting* setting,
+                                    const std::filesystem::path& content_dir) {
   if (setting->is_title_specific()) {
-    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+    BinarySetting* gta4_profile = nullptr;
+    if (kernel_state_->title_id() == kGta4TitleId &&
+        setting->setting_id == kGta4TitleProfileSettingId) {
+      gta4_profile = dynamic_cast<BinarySetting*>(setting);
+    }
+    if (gta4_profile) {
+      gta4_profile->value.clear();
+      gta4_profile->is_set = false;
+    }
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "rb");
     if (file) {
       fseek(file, 0, SEEK_END);
-      uint32_t input_file_size = static_cast<uint32_t>(ftell(file));
+      const long input_file_size = ftell(file);
       fseek(file, 0, SEEK_SET);
+      if (input_file_size < 0 ||
+          (gta4_profile && static_cast<unsigned long>(input_file_size) >
+                               kGta4TitleProfileMaximumSize)) {
+        fclose(file);
+        REXSYS_WARN("Ignoring oversized or unreadable GTA IV title-profile blob from {}",
+                    file_path.string());
+        setting->loaded_title_id = kernel_state_->title_id();
+        return;
+      }
 
-      std::vector<uint8_t> serialized_data(input_file_size);
-      fread(serialized_data.data(), 1, serialized_data.size(), file);
+      std::vector<uint8_t> serialized_data(static_cast<size_t>(input_file_size));
+      const size_t bytes_read = fread(serialized_data.data(), 1, serialized_data.size(), file);
       fclose(file);
-      setting->Deserialize(serialized_data);
-      setting->loaded_title_id = kernel_state_->title_id();
+      if (bytes_read != serialized_data.size()) {
+        REXSYS_WARN("Ignoring incompletely read profile setting from {}", file_path.string());
+      } else if (!gta4_profile || ValidateGta4TitleProfileBlob(serialized_data)) {
+        setting->Deserialize(std::move(serialized_data));
+      } else {
+        REXSYS_WARN("Ignoring malformed GTA IV title-profile blob from {}", file_path.string());
+      }
     }
+    setting->loaded_title_id = kernel_state_->title_id();
   } else {
     // Unsupported for now.  Other settings aren't per-game and need to be
     // stored some other way.
@@ -178,14 +345,19 @@ void UserProfile::LoadSetting(UserProfile::Setting* setting) {
   }
 }
 
-void UserProfile::SaveSetting(UserProfile::Setting* setting) {
+void UserProfile::SaveSettingLocked(UserProfile::Setting* setting,
+                                    const std::filesystem::path& content_dir) {
   if (setting->is_title_specific()) {
     auto serialized_setting = setting->Serialize();
-    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
     std::filesystem::create_directories(content_dir);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "wb");
+    if (!file) {
+      REXSYS_WARN("Unable to save profile setting {:08X} to {}", setting->setting_id,
+                  file_path.string());
+      return;
+    }
     fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
     fclose(file);
   } else {

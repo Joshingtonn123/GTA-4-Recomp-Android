@@ -540,7 +540,7 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
     REXCVAR_SET(test_int32_flag, 777);
     REXCVAR_SET(test_string_flag, "saved_value");
 
-    rex::cvar::SaveConfig(save_path);
+    CHECK(rex::cvar::SaveConfig(save_path));
 
     // Verify file exists and contains expected content
     REQUIRE(std::filesystem::exists(save_path));
@@ -560,7 +560,7 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
 
   SECTION("SaveConfig with no modifications creates no file or empty") {
     rex::cvar::testing::ResetAllForTesting();
-    rex::cvar::SaveConfig(save_path);
+    CHECK(rex::cvar::SaveConfig(save_path));
     // Either file doesn't exist or is minimal (just header comment)
   }
 }

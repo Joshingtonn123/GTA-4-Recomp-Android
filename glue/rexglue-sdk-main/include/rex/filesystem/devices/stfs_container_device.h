@@ -32,7 +32,8 @@ class StfsContainerDevice : public Device {
  public:
   const static uint32_t kBlockSize = 0x1000;
 
-  StfsContainerDevice(const std::string_view mount_path, const std::filesystem::path& host_path);
+  StfsContainerDevice(const std::string_view mount_path, const std::filesystem::path& host_path,
+                      bool log_host_path = true);
   ~StfsContainerDevice() override;
 
   bool Initialize() override;
@@ -124,6 +125,7 @@ class StfsContainerDevice : public Device {
 
   std::string name_;
   std::filesystem::path host_path_;
+  bool log_host_path_;
 
   std::map<size_t, FILE*> files_;
   size_t files_total_size_;

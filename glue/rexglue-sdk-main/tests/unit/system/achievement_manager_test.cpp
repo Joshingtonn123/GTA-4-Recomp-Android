@@ -139,6 +139,25 @@ TEST_CASE("achievement notifications are explicit and replaceable", "[achievemen
   CHECK_FALSE(manager.ShowAchievementNotification(99));
 }
 
+TEST_CASE("achievement imports suppress title callbacks and notifications", "[achievements]") {
+  rex::system::AchievementManager manager;
+  manager.RegisterAchievement(MakeAchievement(1, "Imported"));
+
+  int unlock_count = 0;
+  int notification_count = 0;
+  manager.RegisterUnlockCallback([&](const rex::system::AchievementEvent&) { ++unlock_count; });
+  manager.RegisterNotificationCallback(
+      [&](const rex::system::AchievementEvent&) { ++notification_count; });
+
+  CHECK(manager.ImportUnlockedAchievement(1) == rex::system::AchievementUnlockResult::kUnlocked);
+  CHECK(manager.IsUnlocked(1));
+  CHECK(manager.GetUnlockTime(1) != 0);
+  CHECK(unlock_count == 0);
+  CHECK(notification_count == 0);
+  CHECK(manager.ImportUnlockedAchievement(1) ==
+        rex::system::AchievementUnlockResult::kAlreadyUnlocked);
+}
+
 TEST_CASE("achievement unlock state persists across manager instances", "[achievements]") {
   TempDirectory temp("rex_achievement_save");
   auto save_path = temp.path() / "saves" / "12345678.toml";

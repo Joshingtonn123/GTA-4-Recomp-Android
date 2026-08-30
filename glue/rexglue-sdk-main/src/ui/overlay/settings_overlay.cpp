@@ -501,7 +501,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   // Bottom bar: Save button.
   ImGui::Separator();
   if (ImGui::Button("Save to config")) {
-    rex::cvar::SaveConfig(config_path_);
+    (void)rex::cvar::SaveConfig(config_path_);
   }
   ImGui::SameLine();
   ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());

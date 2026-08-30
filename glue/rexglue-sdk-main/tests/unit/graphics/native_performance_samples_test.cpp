@@ -10,8 +10,7 @@ namespace {
 TEST_CASE("GTA IV native performance ranges reject stale and duplicate tokens") {
   FrameBuilder builder;
   builder.Begin(7);
-  const GpuSpanToken token =
-      builder.BeginGpuRange(GpuRange::kDepthCopy, 11, 0, 1);
+  const GpuSpanToken token = builder.BeginGpuRange(GpuRange::kDepthCopy, 11, 0, 1);
   REQUIRE(token);
   CHECK(builder.EndGpuRange(token));
   CHECK_FALSE(builder.EndGpuRange(token));
@@ -24,10 +23,8 @@ TEST_CASE("GTA IV native performance ranges reject stale and duplicate tokens") 
 TEST_CASE("GTA IV native performance ranges enforce query and nesting order") {
   FrameBuilder builder;
   builder.Begin(17);
-  const GpuSpanToken parent =
-      builder.BeginGpuRange(GpuRange::kFrame, 0, 0, 1);
-  const GpuSpanToken child =
-      builder.BeginGpuRange(GpuRange::kDepthCopy, 1, 2, 3);
+  const GpuSpanToken parent = builder.BeginGpuRange(GpuRange::kFrame, 0, 0, 1);
+  const GpuSpanToken child = builder.BeginGpuRange(GpuRange::kDepthCopy, 1, 2, 3);
   REQUIRE(parent);
   REQUIRE(child);
   CHECK_FALSE(builder.EndGpuRange(parent));
@@ -35,18 +32,15 @@ TEST_CASE("GTA IV native performance ranges enforce query and nesting order") {
   CHECK(builder.EndGpuRange(parent));
   CHECK_FALSE(builder.BeginGpuRange(GpuRange::kComposite, 2, 2, 3));
   CHECK_FALSE(builder.BeginGpuRange(GpuRange::kComposite, 2, 4, 4));
-  CHECK_FALSE(builder.BeginGpuRange(GpuRange::kComposite, 2, 4,
-                                    kMaximumGpuQueriesPerFrame));
+  CHECK_FALSE(builder.BeginGpuRange(GpuRange::kComposite, 2, 4, kMaximumGpuQueriesPerFrame));
 }
 
 TEST_CASE("GTA IV native performance ranges aggregate only available ended spans") {
   FrameBuilder builder;
   builder.Begin(23);
-  const GpuSpanToken available =
-      builder.BeginGpuRange(GpuRange::kDeferredLightVolumes, 41, 0, 1);
+  const GpuSpanToken available = builder.BeginGpuRange(GpuRange::kDeferredLightVolumes, 41, 0, 1);
   REQUIRE(builder.EndGpuRange(available));
-  const GpuSpanToken unavailable =
-      builder.BeginGpuRange(GpuRange::kDeferredLightVolumes, 47, 2, 3);
+  const GpuSpanToken unavailable = builder.BeginGpuRange(GpuRange::kDeferredLightVolumes, 47, 2, 3);
   REQUIRE(builder.EndGpuRange(unavailable));
   const GpuSpanToken incomplete =
       builder.BeginGpuRange(GpuRange::kTranslucentWaterSurface, 53, 4, 5);
@@ -78,11 +72,9 @@ TEST_CASE("GTA IV native performance timestamp deltas mask and wrap") {
   CHECK(delta == 13);
   REQUIRE(CalculateTimestampDelta(1, 0, 1, &delta));
   CHECK(delta == 1);
-  REQUIRE(CalculateTimestampDelta((uint64_t(1) << 63) - 3, 1, 63,
-                                  &delta));
+  REQUIRE(CalculateTimestampDelta((uint64_t(1) << 63) - 3, 1, 63, &delta));
   CHECK(delta == 4);
-  REQUIRE(CalculateTimestampDelta(0x100000005ull, 0x200000009ull, 32,
-                                  &delta));
+  REQUIRE(CalculateTimestampDelta(0x100000005ull, 0x200000009ull, 32, &delta));
   CHECK(delta == 4);
   REQUIRE(CalculateTimestampDelta(9, 9, 32, &delta));
   CHECK(delta == 0);
@@ -94,8 +86,7 @@ TEST_CASE("GTA IV native performance timestamp deltas mask and wrap") {
 TEST_CASE("GTA IV native performance finalize counts unresolved spans once") {
   FrameBuilder builder;
   builder.Begin(55);
-  const GpuSpanToken incomplete =
-      builder.BeginGpuRange(GpuRange::kComposite, 77, 0, 1);
+  const GpuSpanToken incomplete = builder.BeginGpuRange(GpuRange::kComposite, 77, 0, 1);
   REQUIRE(incomplete);
   const FrameSample& sample = builder.Finish();
   CHECK(sample.counters[size_t(Counter::kDroppedGpuRanges)] == 1);
@@ -104,20 +95,16 @@ TEST_CASE("GTA IV native performance finalize counts unresolved spans once") {
 }
 
 TEST_CASE("GTA IV native performance range names cover reflection families") {
-  CHECK(std::string_view(GpuRangeName(GpuRange::kMirrorReflections)) ==
-        "mirror-reflections");
-  CHECK(std::string_view(GpuRangeName(GpuRange::kWaterReflections)) ==
-        "water-reflections");
+  CHECK(std::string_view(GpuRangeName(GpuRange::kMirrorReflections)) == "mirror-reflections");
+  CHECK(std::string_view(GpuRangeName(GpuRange::kWaterReflections)) == "water-reflections");
   CHECK(std::string_view(GpuRangeName(GpuRange::kEnvironmentReflections)) ==
         "environment-reflections");
 }
 
 TEST_CASE("GTA IV native performance keeps water surface and texture separate") {
-  CHECK(std::string_view(
-            GpuRangeName(GpuRange::kTranslucentWaterSurface)) ==
+  CHECK(std::string_view(GpuRangeName(GpuRange::kTranslucentWaterSurface)) ==
         "translucent-water-surface");
-  CHECK(std::string_view(
-            GpuRangeName(GpuRange::kTranslucentWaterTexture)) ==
+  CHECK(std::string_view(GpuRangeName(GpuRange::kTranslucentWaterTexture)) ==
         "translucent-water-texture");
 }
 
@@ -153,11 +140,87 @@ TEST_CASE("GTA IV native performance CPU ranges and counters aggregate without a
   builder.AddCpuRange(CpuRange::kCommandRecording, 19);
   builder.AddCounter(Counter::kUploadBytes, 130);
   builder.AddCounter(Counter::kUploadBytes, 26);
+  builder.SetCounter(Counter::kSurfaceImagesLive, 12);
+  builder.SetCounter(Counter::kSurfaceImagesLive, 9);
 
   const FrameSample& sample = builder.sample();
   CHECK(sample.cpu_ticks[size_t(CpuRange::kCommandRecording)] == 36);
   CHECK(sample.cpu_range_counts[size_t(CpuRange::kCommandRecording)] == 2);
   CHECK(sample.counters[size_t(Counter::kUploadBytes)] == 156);
+  CHECK(sample.counters[size_t(Counter::kSurfaceImagesLive)] == 9);
+}
+
+TEST_CASE("GTA IV native performance exclusive GPU slices aggregate additively") {
+  FrameBuilder builder;
+  builder.Begin(101);
+  builder.AddGpuRange(GpuRange::kFrame, 300);
+  builder.AddGpuRange(GpuRange::kOpaqueControl, 110);
+  builder.AddGpuRange(GpuRange::kComposite, 70);
+  builder.AddGpuRange(GpuRange::kPresent, 90);
+  builder.AddGpuRange(GpuRange::kUnattributed, 30);
+  builder.AddGpuRange(GpuRange::kSmaaEdges, 25, false);
+
+  const FrameSample& sample = builder.sample();
+  CHECK(sample.gpu_ticks[size_t(GpuRange::kFrame)] == 300);
+  CHECK(sample.gpu_ticks[size_t(GpuRange::kOpaqueControl)] == 110);
+  CHECK(sample.gpu_ticks[size_t(GpuRange::kComposite)] == 70);
+  CHECK(sample.gpu_ticks[size_t(GpuRange::kPresent)] == 90);
+  CHECK(sample.gpu_ticks[size_t(GpuRange::kUnattributed)] == 30);
+  CHECK(sample.gpu_range_counts[size_t(GpuRange::kSmaaEdges)] == 0);
+  CHECK(sample.counters[size_t(Counter::kUnavailableGpuRanges)] == 1);
+}
+
+TEST_CASE("GTA IV native performance capture stores six hundred consecutive samples") {
+  FrameSampleRing ring;
+  CHECK(ring.capacity() == 600);
+  FrameSample sample{};
+  for (uint32_t frame = 1; frame <= 600; ++frame) {
+    sample.frame = frame;
+    ring.Push(sample);
+  }
+  REQUIRE(ring.size() == 600);
+  FrameSample copied{};
+  REQUIRE(ring.CopyOldest(0, &copied));
+  CHECK(copied.frame == 1);
+  REQUIRE(ring.CopyNewest(0, &copied));
+  CHECK(copied.frame == 600);
+}
+
+TEST_CASE("GTA IV native performance ring clears without exposing stale samples") {
+  FrameSampleRing ring;
+  FrameSample sample{};
+  sample.frame = 41;
+  ring.Push(sample);
+  REQUIRE(ring.size() == 1);
+
+  ring.Clear();
+  CHECK(ring.empty());
+  CHECK(ring.size() == 0);
+  CHECK_FALSE(ring.CopyOldest(0, &sample));
+  CHECK_FALSE(ring.CopyNewest(0, &sample));
+
+  sample.frame = 42;
+  ring.Push(sample);
+  REQUIRE(ring.CopyOldest(0, &sample));
+  CHECK(sample.frame == 42);
+}
+
+TEST_CASE("GTA IV native performance names cover streaming validation and memory pressure") {
+  CHECK(std::string_view(CounterName(Counter::kBufferCaptureReuses)) ==
+        "buffer-capture-reuses");
+  CHECK(std::string_view(CounterName(Counter::kBufferShadowMismatches)) ==
+        "buffer-shadow-mismatches");
+  CHECK(std::string_view(CounterName(Counter::kTextureImageEvictedBytes)) ==
+        "texture-image-evicted-bytes");
+  CHECK(std::string_view(CounterName(Counter::kTextureAllocationRetries)) ==
+        "texture-allocation-retries");
+  CHECK(std::string_view(CounterName(Counter::kTextureHeapBudget)) == "texture-heap-budget");
+  CHECK(std::string_view(CounterName(Counter::kProcessPhysicalFootprintBytes)) ==
+        "process-physical-footprint-bytes");
+  CHECK(std::string_view(CounterName(Counter::kPendingTextureReleases)) ==
+        "pending-texture-releases");
+  CHECK(std::string_view(CpuRangeName(CpuRange::kPresenterAcquire)) == "presenter-acquire");
+  CHECK(std::string_view(CpuRangeName(CpuRange::kPresenterTotal)) == "presenter-total");
 }
 
 }  // namespace

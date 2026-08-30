@@ -31,6 +31,7 @@
 #include <rex/platform.h>
 #include <rex/types.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/guest_output_transform.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/ui_drawer.h>
 
@@ -190,6 +191,12 @@ class Presenter {
 
   class GuestOutputRefreshContext {
    public:
+    class Completion {
+     public:
+      virtual ~Completion() = default;
+      virtual bool Await() = 0;
+    };
+
     GuestOutputRefreshContext(const GuestOutputRefreshContext& context) = delete;
     GuestOutputRefreshContext& operator=(const GuestOutputRefreshContext& context) = delete;
     virtual ~GuestOutputRefreshContext() = default;
@@ -198,6 +205,10 @@ class Presenter {
     // (though the image provided by the refresher may still have a higher
     // storage precision). If never called, assuming it's false.
     void SetIs8bpc(bool is_8bpc) { is_8bpc_out_ref_ = is_8bpc; }
+    void SetCompletion(std::shared_ptr<Completion> completion) {
+      completion_ = std::move(completion);
+    }
+    const std::shared_ptr<Completion>& completion() const { return completion_; }
 
    protected:
     GuestOutputRefreshContext(bool& is_8bpc_out_ref) : is_8bpc_out_ref_(is_8bpc_out_ref) {
@@ -206,6 +217,7 @@ class Presenter {
 
    private:
     bool& is_8bpc_out_ref_;
+    std::shared_ptr<Completion> completion_;
   };
 
   class GuestOutputPaintConfig {
@@ -365,6 +377,9 @@ class Presenter {
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
+  // Thread-safe snapshot of the exact final guest-output rectangle last
+  // calculated by the common presenter path.
+  GuestOutputTransform GetGuestOutputTransform() const;
   // For simplicity, may be called repeatedly even if no changes have been made.
   void SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config);
 
@@ -381,6 +396,9 @@ class Presenter {
     // Refused for internal reasons or a host API side failure, but still may
     // try to present without resetting the graphics provider in the future.
     kNotPresented,
+    // Temporarily backpressured. The caller must yield to the window event
+    // loop and request another paint rather than blocking for GPU/WSI progress.
+    kNotPresentedRetry,
     kNotPresentedConnectionOutdated,
     kGpuLostExternally,
     kGpuLostResponsible,
@@ -823,7 +841,8 @@ class Presenter {
   // (not closed) is available in it, so doesn't check the surface painting
   // connection state. Returns whether the window_->RequestPaint() call has been
   // made.
-  bool RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_paint_tick);
+  bool RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_paint_tick,
+                                                   bool defer_until_ui_tick = false);
 
   // Platform-specific function refreshing the monitor the current window
   // surface is on, through the Surface or its Window. A reference to the
@@ -848,6 +867,8 @@ class Presenter {
   PaintResult PaintAndPresent(bool execute_ui_drawers);
 
   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
+  void InvalidateGuestOutputTransform() const;
+  void UpdateGuestOutputTransform(const GuestOutputTransform& transform) const;
 
   bool AreUITicksNeededFromUIThread() const {
     // UI drawing should be done, and painting needs to be possible (coarsely
@@ -942,6 +963,9 @@ class Presenter {
   std::mutex guest_output_paint_config_mutex_;
   // UI thread: writable, guest output thread: read-only.
   GuestOutputPaintConfig guest_output_paint_config_;
+
+  mutable std::mutex guest_output_transform_mutex_;
+  mutable GuestOutputTransform guest_output_transform_;
 
   // Single-producer-multiple-consumers (lock-free SPSC + consumer lock) mailbox
   // for presenting of the most up-to-date guest output image without long

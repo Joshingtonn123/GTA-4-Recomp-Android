@@ -23,10 +23,11 @@
 namespace rex::filesystem {
 
 StfsContainerDevice::StfsContainerDevice(const std::string_view mount_path,
-                                         const std::filesystem::path& host_path)
+                                         const std::filesystem::path& host_path, bool log_host_path)
     : Device(mount_path),
       name_("STFS"),
       host_path_(host_path),
+      log_host_path_(log_host_path),
       files_total_size_(),
       svod_base_offset_(),
       header_(),
@@ -70,12 +71,21 @@ std::unique_ptr<StfsHeader> StfsContainerDevice::ReadPackageHeader(
 bool StfsContainerDevice::Initialize() {
   // Resolve a valid STFS file if a directory is given.
   if (std::filesystem::is_directory(host_path_) && !ResolveFromFolder(host_path_)) {
-    REXFS_ERROR("Could not resolve an STFS container given path {}", rex::path_to_utf8(host_path_));
+    if (log_host_path_) {
+      REXFS_ERROR("Could not resolve an STFS container given path {}",
+                  rex::path_to_utf8(host_path_));
+    } else {
+      REXFS_ERROR("Could not resolve the selected STFS container.");
+    }
     return false;
   }
 
   if (!std::filesystem::exists(host_path_)) {
-    REXFS_ERROR("Path to STFS container does not exist: {}", rex::path_to_utf8(host_path_));
+    if (log_host_path_) {
+      REXFS_ERROR("Path to STFS container does not exist: {}", rex::path_to_utf8(host_path_));
+    } else {
+      REXFS_ERROR("The selected STFS container does not exist.");
+    }
     return false;
   }
 
@@ -101,7 +111,9 @@ bool StfsContainerDevice::Initialize() {
 
 StfsContainerDevice::Error StfsContainerDevice::OpenFiles() {
   // Map the file containing the STFS Header and read it.
-  REXFS_INFO("Loading STFS header file: {}", rex::path_to_utf8(host_path_));
+  if (log_host_path_) {
+    REXFS_INFO("Loading STFS header file: {}", rex::path_to_utf8(host_path_));
+  }
 
   auto header_file = rex::filesystem::OpenFile(host_path_, "rb");
   if (!header_file) {
@@ -131,8 +143,12 @@ StfsContainerDevice::Error StfsContainerDevice::OpenFiles() {
   auto data_fragment_path = host_path_;
   data_fragment_path += ".data";
   if (!std::filesystem::exists(data_fragment_path)) {
-    REXFS_ERROR("STFS container is multi-file, but path {} does not exist.",
-                rex::path_to_utf8(data_fragment_path));
+    if (log_host_path_) {
+      REXFS_ERROR("STFS container is multi-file, but path {} does not exist.",
+                  rex::path_to_utf8(data_fragment_path));
+    } else {
+      REXFS_ERROR("The selected multi-file STFS container is missing its data fragments.");
+    }
     return Error::kErrorFileMismatch;
   }
 
@@ -154,7 +170,11 @@ StfsContainerDevice::Error StfsContainerDevice::OpenFiles() {
     auto path = fragment.path / fragment.name;
     auto file = rex::filesystem::OpenFile(path, "rb");
     if (!file) {
-      REXFS_INFO("Failed to map SVOD file {}.", rex::path_to_utf8(path));
+      if (log_host_path_) {
+        REXFS_INFO("Failed to map SVOD file {}.", rex::path_to_utf8(path));
+      } else {
+        REXFS_INFO("Failed to map an SVOD data fragment.");
+      }
       CloseFiles();
       return Error::kErrorReadError;
     }
@@ -818,7 +838,9 @@ bool StfsContainerDevice::ResolveFromFolder(const std::filesystem::path& path) {
       if (magic == XContentPackageType::kCon || magic == XContentPackageType::kLive ||
           magic == XContentPackageType::kPirs) {
         host_path_ = current_file.path / current_file.name;
-        REXFS_INFO("STFS Package found: {}", rex::path_to_utf8(host_path_));
+        if (log_host_path_) {
+          REXFS_INFO("STFS Package found: {}", rex::path_to_utf8(host_path_));
+        }
         return true;
       }
     }

@@ -342,8 +342,7 @@ else()
 endif()
 
 set(LIBERTY_RECOMP_PATCHES_CXX_SOURCES
-    # Input
-    "patches/gta4_input_patches.cpp"         # GTA IV input remapping
+    # Input (GTA IV keyboard/mouse remapping moved to the active RexGlue target.)
     "patches/gta4_motion_patches.cpp"        # GTA IV motion (PlayStation gyro/accel)
     "patches/gta4_ds4_patches.cpp"           # DualShock 4/DualSense features
 

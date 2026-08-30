@@ -12,7 +12,9 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <new>
 #include <string>
+#include <thread>
 
 #include <fmt/format.h>
 #include <rex/assert.h>
@@ -28,8 +30,6 @@
 #include <rex/system/kernel_module.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
-#include <chrono>
-#include <thread>
 
 #include <rex/system/flags.h>
 #include <rex/system/guest_path.h>
@@ -42,6 +42,7 @@
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
+#include <rex/system/xam/arbitration_async.h>
 
 namespace rex::system {
 
@@ -77,6 +78,10 @@ KernelState::KernelState(Runtime* emulator)
       emulator_->saved_game_root());
   live_compatibility_ =
       std::make_unique<xam::LiveCompatibilityRuntime>(emulator_->live_config(), user_data_root);
+  if (live_compatibility_->config().backend == xam::LiveBackend::kCommunity) {
+    arbitration_async_manager_ =
+        std::make_unique<xam::ArbitrationAsyncManager>();
+  }
   user_profile_->SetIdentity(live_compatibility_->identity().xuid,
                              live_compatibility_->identity().player_name);
 
@@ -127,6 +132,13 @@ KernelState::KernelState(Runtime* emulator)
   // SetExecutableModule() (e.g. XMA decoder) can link into its thread_list.
   // SetExecutableModule() will re-initialize it fully with XEX header values.
   InitializeProcess(&globals->title_process, X_PROCTYPE_USER, 0, 0, 0);
+
+  // Deferred APIs may be used during module setup, before SetExecutableModule.
+  // Start the bound worker as soon as its process/thread globals are valid.
+  StartHostTaskWorker();
+
+  live_compatibility_->SetInviteNotificationHandler(
+      [this] { BroadcastNotification(0x02000002, 0); });
 }
 
 void KernelState::InitializeProcess(X_KPROCESS* process, uint32_t process_type, uint8_t unk_18,
@@ -167,14 +179,19 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
 }
 
 KernelState::~KernelState() {
-  app_manager_.reset();
+  // Cancel and join retail-length arbitration HTTP work before tearing down
+  // the directory it calls or the guest memory its cancellation completes.
+  if (arbitration_async_manager_) arbitration_async_manager_->Shutdown();
 
-  // Stop the dispatch thread before touching the object table
-  if (dispatch_thread_running_) {
-    dispatch_thread_running_ = false;
-    dispatch_cond_.notify_all();
-    dispatch_thread_->Wait(0, 0, 0, nullptr);
-  }
+  // Stop host-side Live workers and detach their notification callback before
+  // destroying listeners or any service object they can reach.
+  if (live_compatibility_) live_compatibility_->Shutdown();
+
+  // Drain and join the bound host worker while all guest objects, threads and
+  // memory referenced by accepted requests are still alive.
+  StopHostTaskWorker();
+
+  app_manager_.reset();
 
   // Unload through UnloadUserModule so the recompiled-DLL teardown runs.
   // call_entry=false because guest DllMain is unsafe at shutdown.
@@ -648,49 +665,7 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
     rex::string::copy_truncating(variable_ptr, executable_module_->path(), kExLoadedImageNameSize);
   }
 
-  // Spin up deferred dispatch worker.
-  // TODO(benvanik): move someplace more appropriate (out of ctor, but around
-  // here).
-  if (!dispatch_thread_running_) {
-    dispatch_thread_running_ = true;
-    dispatch_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
-      auto global_lock = global_critical_region_.AcquireDeferred();
-      while (dispatch_thread_running_) {
-        global_lock.lock();
-        if (dispatch_queue_.empty()) {
-          dispatch_cond_.wait(global_lock);
-          if (!dispatch_thread_running_) {
-            global_lock.unlock();
-            break;
-          }
-        }
-        auto fn = std::move(dispatch_queue_.front());
-        dispatch_queue_.pop_front();
-        REXSYS_NOISY_DEBUG("Dispatch thread processing queued item ({} remaining)",
-                           dispatch_queue_.size());
-        global_lock.unlock();
-
-        // Throws out of fn leave the originating overlapped uncompleted and
-        // the waiting guest thread stuck; fail visibly rather than swallow.
-        try {
-          fn();
-        } catch (const std::exception& e) {
-          REX_FATAL("Dispatch thread: deferred completion threw '{}'", e.what());
-        } catch (...) {
-          REX_FATAL("Dispatch thread: deferred completion threw non-std exception");
-        }
-        REXSYS_NOISY_DEBUG("Dispatch thread completed item");
-      }
-      return 0;
-    }));
-    dispatch_thread_->set_name("Kernel Dispatch");
-    X_STATUS create_status = dispatch_thread_->Create();
-    if (XFAILED(create_status)) {
-      dispatch_thread_running_ = false;
-      dispatch_thread_.reset();
-      REX_FATAL("Failed to create kernel dispatch thread (status {:#x})", create_status);
-    }
-  }
+  StartHostTaskWorker();
 
   LoadAchievementsData();
 }
@@ -991,6 +966,16 @@ void KernelState::TerminateTitle() {
   // (XThread::CheckTitleTermination) and self-exit.
   terminating_title_.store(true, std::memory_order_release);
 
+  // Retire every arbitration generation before guest objects or output
+  // buffers can be destroyed or reused by a subsequent title.
+  if (arbitration_async_manager_) arbitration_async_manager_->CancelAll();
+
+  // No new host work can be admitted after the flag above. Drain all work
+  // accepted before it before guest threads are allowed to exit or are removed
+  // from the object map; accepted I/O owns strong refs, but APC insertion also
+  // requires the guest thread's live kernel state.
+  WaitForHostTasks();
+
   // Retained so a thread that wakes and exits below can't be freed mid-drain.
   std::vector<object_ref<XThread>> target_threads;
   {
@@ -1112,6 +1097,14 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     listener->EnqueueNotification(0x00000013, 0);
     listener->EnqueueNotification(0x00000013, 0);
   }
+
+  // Accepted invite state remains cached until the title consumes it. A new
+  // listener must observe that state even if the original edge notification
+  // was delivered before this registration.
+  auto* social = live_compatibility_ ? live_compatibility_->social_service() : nullptr;
+  if (social && social->HasAcceptedInvitation()) {
+    listener->EnqueueNotification(0x02000002, 0);
+  }
 }
 
 void KernelState::UnregisterNotifyListener(XNotifyListener* listener) {
@@ -1226,28 +1219,161 @@ void KernelState::CompleteOverlappedDeferredEx(
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
-  auto global_lock = global_critical_region_.Acquire();
-  dispatch_queue_.push_back(
-      [this, completion_callback, overlapped_ptr, pre_callback, post_callback]() {
-        REXSYS_DEBUG("Deferred overlapped {:08X}: running pre_callback", overlapped_ptr);
-        if (pre_callback) {
-          pre_callback();
-        }
-        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
-                     kDeferredOverlappedDelayMillis);
-        rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
-        uint32_t extended_error, length;
-        REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
-        auto result = completion_callback(extended_error, length);
-        REXSYS_DEBUG("Deferred overlapped {:08X}: completing with result {:08X}", overlapped_ptr,
-                     result);
-        CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
-        if (post_callback) {
-          REXSYS_DEBUG("Deferred overlapped {:08X}: running post_callback", overlapped_ptr);
-          post_callback();
-        }
+  HostTaskAdmissionResult admission = HostTaskAdmissionResult::kNoMemory;
+  try {
+    admission =
+        QueueHostTask([this, completion_callback, overlapped_ptr, pre_callback, post_callback]() {
+          REXSYS_DEBUG("Deferred overlapped {:08X}: running pre_callback", overlapped_ptr);
+          if (pre_callback) {
+            pre_callback();
+          }
+          REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
+                       kDeferredOverlappedDelayMillis);
+          rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
+          uint32_t extended_error, length;
+          REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
+          auto result = completion_callback(extended_error, length);
+          REXSYS_DEBUG("Deferred overlapped {:08X}: completing with result {:08X}", overlapped_ptr,
+                       result);
+          CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+          if (post_callback) {
+            REXSYS_DEBUG("Deferred overlapped {:08X}: running post_callback", overlapped_ptr);
+            post_callback();
+          }
+        });
+  } catch (const std::bad_alloc&) {
+    admission = HostTaskAdmissionResult::kNoMemory;
+  }
+  if (admission != HostTaskAdmissionResult::kAccepted) {
+    REXSYS_WARN("CompleteOverlappedDeferredEx: host task admission rejected for {:08X}",
+                overlapped_ptr);
+    CompleteOverlappedEx(overlapped_ptr, host_task_policy::kAdmissionFailureResult,
+                         host_task_policy::kAdmissionFailureResult, 0);
+  }
+}
+
+void KernelState::StartHostTaskWorker() {
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (dispatch_thread_running_) {
+      dispatch_accepting_ = true;
+      return;
+    }
+    dispatch_thread_running_.store(true, std::memory_order_release);
+    dispatch_accepting_ = true;
+  }
+
+  dispatch_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
+    auto global_lock = global_critical_region_.AcquireDeferred();
+    for (;;) {
+      global_lock.lock();
+      dispatch_cond_.wait(global_lock, [this]() {
+        return !dispatch_queue_.empty() ||
+               !dispatch_thread_running_.load(std::memory_order_acquire);
       });
-  dispatch_cond_.notify_all();
+      if (dispatch_queue_.empty() && !dispatch_thread_running_.load(std::memory_order_acquire)) {
+        global_lock.unlock();
+        break;
+      }
+
+      auto task = std::move(dispatch_queue_.front());
+      dispatch_queue_.pop_front();
+      ++dispatch_active_count_;
+      REXSYS_NOISY_DEBUG("Host task worker processing item ({} queued, {} active)",
+                         dispatch_queue_.size(), dispatch_active_count_);
+      global_lock.unlock();
+
+      // A thrown task would otherwise strand its IOSB and every waiter. Keep
+      // this fail-fast, as with the previous deferred-overlapped worker.
+      try {
+        task();
+      } catch (const std::exception& e) {
+        REX_FATAL("Host task worker threw '{}'", e.what());
+      } catch (...) {
+        REX_FATAL("Host task worker threw non-std exception");
+      }
+
+      global_lock.lock();
+      --dispatch_active_count_;
+      host_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
+      if (dispatch_queue_.empty() && dispatch_active_count_ == 0) {
+        dispatch_idle_cond_.notify_all();
+      }
+      global_lock.unlock();
+    }
+    return 0;
+  }));
+  dispatch_thread_->set_name("Kernel Host Tasks");
+  X_STATUS create_status = dispatch_thread_->Create();
+  if (XFAILED(create_status)) {
+    auto global_lock = global_critical_region_.Acquire();
+    dispatch_accepting_ = false;
+    dispatch_thread_running_.store(false, std::memory_order_release);
+    dispatch_thread_.reset();
+    REX_FATAL("Failed to create kernel host-task thread (status {:#x})", create_status);
+  }
+}
+
+void KernelState::StopHostTaskWorker() {
+  object_ref<XHostThread> worker;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    dispatch_accepting_ = false;
+    dispatch_thread_running_.store(false, std::memory_order_release);
+    worker = dispatch_thread_;
+    dispatch_cond_.notify_all();
+  }
+  if (worker) {
+    worker->Wait(0, 0, 0, nullptr);
+  }
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    dispatch_thread_.reset();
+    assert_true(dispatch_queue_.empty());
+    assert_zero(dispatch_active_count_);
+  }
+  REXSYS_DEBUG("Host task worker stopped (accepted={}, completed={}, rejected={})",
+               host_tasks_accepted_.load(std::memory_order_relaxed),
+               host_tasks_completed_.load(std::memory_order_relaxed),
+               host_tasks_rejected_.load(std::memory_order_relaxed));
+}
+
+HostTaskAdmissionResult KernelState::QueueHostTask(std::function<void()> task,
+                                                   std::function<void()> admitted_callback) {
+  if (!task) {
+    host_tasks_rejected_.fetch_add(1, std::memory_order_relaxed);
+    return HostTaskAdmissionResult::kRejected;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  if (!host_task_policy::CanAdmit(dispatch_accepting_,
+                                  dispatch_thread_running_.load(std::memory_order_acquire),
+                                  terminating_title_.load(std::memory_order_acquire))) {
+    host_tasks_rejected_.fetch_add(1, std::memory_order_relaxed);
+    return HostTaskAdmissionResult::kRejected;
+  }
+  try {
+    dispatch_queue_.push_back(std::move(task));
+  } catch (const std::bad_alloc&) {
+    host_tasks_rejected_.fetch_add(1, std::memory_order_relaxed);
+    return HostTaskAdmissionResult::kNoMemory;
+  }
+  // Run only after queue allocation succeeds and while the worker is excluded
+  // by the global lock. Async imports use this to publish PENDING and reset
+  // wait events without stranding them on admission failure.
+  if (admitted_callback) {
+    admitted_callback();
+  }
+  host_tasks_accepted_.fetch_add(1, std::memory_order_relaxed);
+  dispatch_cond_.notify_one();
+  return HostTaskAdmissionResult::kAccepted;
+}
+
+void KernelState::WaitForHostTasks() {
+  auto global_lock = global_critical_region_.AcquireDeferred();
+  global_lock.lock();
+  dispatch_idle_cond_.wait(
+      global_lock, [this]() { return dispatch_queue_.empty() && dispatch_active_count_ == 0; });
+  global_lock.unlock();
 }
 
 DPCImpersonationScope KernelState::BeginDPCImpersonation() {

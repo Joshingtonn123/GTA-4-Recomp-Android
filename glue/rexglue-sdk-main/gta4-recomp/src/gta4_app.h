@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #include <rex/filesystem.h>
 #include <rex/rex_app.h>
@@ -11,19 +12,32 @@
 
 #include "gta4_init.h"
 
+namespace rex::system::xam {
+class IAchievementService;
+class IEntitlementService;
+class ITitleProfileService;
+}
+
+namespace gta4::input {
+class TextChatDialog;
+class ContextTouchOverlay;
+class UserMusicPlayer;
+}
+
 #ifndef GTA4_RECOMP_ASSET_XEX
 #error "GTA4_RECOMP_ASSET_XEX must point to the preserved GTA IV XEX"
 #endif
 
 class GTA4App final : public rex::ReXApp {
  public:
+  ~GTA4App() override;
+
   static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& context) {
     return std::unique_ptr<GTA4App>(new GTA4App(context));
   }
 
  private:
-  explicit GTA4App(rex::ui::WindowedAppContext& context)
-      : ReXApp(context, "Liberty Recompiled", PPCImageConfig) {}
+  explicit GTA4App(rex::ui::WindowedAppContext& context);
 
   void OnPreSetup(rex::RuntimeConfig& config) override;
 
@@ -34,6 +48,12 @@ class GTA4App final : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override;
   bool RequiresSynchronizedInitialThreadResume() const override;
   void OnShutdown() override;
+  void QueueAchievementUpload(uint32_t achievement_id);
+  void AchievementSyncWorkerMain();
+  void TitleProfileSyncWorkerMain();
+
+  struct AchievementSyncState;
+  struct TitleProfileSyncState;
 
   void OnConfigurePaths(rex::PathConfig& paths) override {
     std::error_code error;
@@ -71,6 +91,16 @@ class GTA4App final : public rex::ReXApp {
   }
 
   rex::system::AchievementListenerHandle achievement_listener_ = 0;
+  rex::system::xam::IAchievementService* achievement_service_ = nullptr;
+  rex::system::xam::IEntitlementService* entitlement_service_ = nullptr;
+  std::shared_ptr<AchievementSyncState> achievement_sync_state_;
+  std::thread achievement_sync_worker_;
+  rex::system::xam::ITitleProfileService* title_profile_service_ = nullptr;
+  std::shared_ptr<TitleProfileSyncState> title_profile_sync_state_;
+  std::thread title_profile_sync_worker_;
   std::filesystem::path liberty_root_;
   std::filesystem::path native_config_path_;
+  std::unique_ptr<gta4::input::UserMusicPlayer> user_music_player_;
+  std::unique_ptr<gta4::input::TextChatDialog> text_chat_dialog_;
+  std::unique_ptr<gta4::input::ContextTouchOverlay> context_touch_overlay_;
 };

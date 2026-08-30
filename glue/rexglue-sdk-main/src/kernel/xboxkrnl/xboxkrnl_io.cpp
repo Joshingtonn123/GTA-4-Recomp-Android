@@ -29,6 +29,8 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
 
+#include <new>
+
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
@@ -98,6 +100,77 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
     }
   }
   return true;
+}
+
+struct FileReadCompletion {
+  object_ref<XFile> file;
+  object_ref<XEvent> supplied_event;
+  object_ref<XThread> requesting_thread;
+  uint32_t io_status_block = 0;
+  uint32_t apc_routine = 0;
+  uint32_t apc_context = 0;
+
+  void PrepareWaitObject() const {
+    // A supplied per-request event replaces FileHandle as the wait object.
+    // Resetting both makes overlapping requests destroy unrelated file-object
+    // completion signals.
+    if (file_io::SelectReadWaitObject(!!supplied_event) ==
+        file_io::ReadWaitObject::kSuppliedEvent) {
+      supplied_event->Reset();
+    } else {
+      file->ResetWaitEvent();
+    }
+  }
+
+  void Complete(X_STATUS status, uint32_t bytes_transferred) const {
+    // Completion ordering is observable by the guest. The transfer has already
+    // made data visible before this function is entered.
+    if (io_status_block) {
+      auto* iosb = file->memory()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block);
+      iosb->status = status;
+      iosb->information = bytes_transferred;
+    }
+    file->NotifyIOCompletion(status, bytes_transferred, apc_context);
+    if (apc_routine && requesting_thread) {
+      // A null APC context is valid. Accepted requests deliver their APC for
+      // success, EOF and transfer errors alike. Publish the APC before waking
+      // an alertable wait so the event can't win and strand the APC until an
+      // unrelated later alertable wait.
+      requesting_thread->EnqueueApc(apc_routine, apc_context, io_status_block, 0);
+    }
+    if (file_io::SelectReadWaitObject(!!supplied_event) ==
+        file_io::ReadWaitObject::kSuppliedEvent) {
+      supplied_event->Set(0, false);
+    } else {
+      file->SignalWaitEvent();
+    }
+    REXKRNL_DEBUG("[AsyncIO] complete iosb={:08X} status={:08X} bytes={} wait={} apc={:08X}",
+                  io_status_block, status, bytes_transferred, supplied_event ? "event" : "file",
+                  apc_routine);
+  }
+};
+
+static X_STATUS ValidateReadRequest(const object_ref<XFile>& file, uint32_t io_status_block_address,
+                                    uint32_t buffer_guest_address, uint32_t buffer_length) {
+  if (io_status_block_address &&
+      !file->ValidateGuestRange(io_status_block_address, sizeof(X_IO_STATUS_BLOCK), true)) {
+    return X_STATUS_ACCESS_VIOLATION;
+  }
+  if (!file->ValidateGuestRange(buffer_guest_address, buffer_length, true)) {
+    return X_STATUS_ACCESS_VIOLATION;
+  }
+  return X_STATUS_SUCCESS;
+}
+
+static void StoreImmediateIoStatus(const object_ref<XFile>& file, uint32_t io_status_block_address,
+                                   X_STATUS status, uint32_t information) {
+  if (!io_status_block_address ||
+      !file->ValidateGuestRange(io_status_block_address, sizeof(X_IO_STATUS_BLOCK), true)) {
+    return;
+  }
+  auto* iosb = file->memory()->TranslateVirtual<X_IO_STATUS_BLOCK*>(io_status_block_address);
+  iosb->status = status;
+  iosb->information = information;
 }
 
 u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
@@ -187,196 +260,181 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
 u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
                      mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                      mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
-  uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
-  const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
+  const uint64_t byte_offset =
+      byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : file_io::kUseCurrentPosition;
+  const uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr) & ~1u;
   REXKRNL_IMPORT_TRACE(
       "NtReadFile",
       "handle={:#x} event={:#x} apc={:#x} apc_ctx={:#x} iosb={:#x} buf={:#x} len={:#x} offset={}",
       (uint32_t)file_handle, (uint32_t)event_handle, apc_routine_ptr.guest_address(),
       apc_context.guest_address(), io_status_block.guest_address(), buffer.guest_address(),
       (uint32_t)buffer_length, byte_offset_ptr ? (int64_t)byte_offset : -1);
-  X_STATUS result = X_STATUS_SUCCESS;
-  bool apc_queued = false;
-
-  bool signal_event = false;
-  auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
-  if (event_handle && !ev) {
-    result = X_STATUS_INVALID_HANDLE;
-  }
 
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   if (!file) {
-    result = X_STATUS_INVALID_HANDLE;
-  }
-
-  if (XSUCCEEDED(result)) {
-    if (true || file->is_synchronous()) {
-      // Synchronous.
-      uint32_t bytes_read = 0;
-      result = file->Read(buffer.guest_address(), buffer_length,
-                          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-                          &bytes_read, apc_context.guest_address());
-      if (io_status_block) {
-        io_status_block->status = result;
-        io_status_block->information = bytes_read;
-      }
-
-      // Queue the APC callback. It must be delivered via the APC mechanism even
-      // though were are completing immediately.
-      // Low bit probably means do not queue to IO ports.
-      if ((uint32_t)apc_routine_ptr & ~1) {
-        if (apc_context && result == X_STATUS_SUCCESS) {
-          auto thread = XThread::GetCurrentThread();
-          uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr) & ~1u;
-          uint32_t apc_ctx = apc_context.guest_address();
-          uint32_t apc_arg1 = io_status_block.guest_address();
-          REXKRNL_IMPORT_TRACE("NtReadFile",
-                               "queue_apc thid={} normal={:#x} ctx={:#x} arg1={:#x} arg2=0",
-                               thread ? thread->thread_id() : 0, apc_routine, apc_ctx, apc_arg1);
-          thread->EnqueueApc(apc_routine, apc_ctx, apc_arg1, 0);
-          apc_queued = true;
-        } else {
-          REXKRNL_IMPORT_TRACE("NtReadFile", "skip_apc_queue (apc_ctx={:#x}, status={:#x})",
-                               apc_context.guest_address(), result);
-        }
-      }
-
-      if (!file->is_synchronous() && result != X_STATUS_END_OF_FILE) {
-        result = X_STATUS_PENDING;
-      }
-
-      // Mark that we should signal the event now. We do this after
-      // we have written the info out.
-      signal_event = true;
-    } else {
-      // TODO(benvanik): async.
-
-      // X_STATUS_PENDING if not returning immediately.
-      // XFile is waitable and signalled after each async req completes.
-      // reset the input event (->Reset())
-      /*xeNtReadFileState* call_state = new xeNtReadFileState();
-      XAsyncRequest* request = new XAsyncRequest(
-      state, file,
-      (XAsyncRequest::CompletionCallback)xeNtReadFileCompleted,
-      call_state);*/
-      // result = file->Read(buffer.guest_address(), buffer_length, byte_offset,
-      //                     request);
-      if (io_status_block) {
-        io_status_block->status = X_STATUS_PENDING;
-        io_status_block->information = 0;
-      }
-
-      result = X_STATUS_PENDING;
+    if (io_status_block) {
+      io_status_block->status = X_STATUS_INVALID_HANDLE;
+      io_status_block->information = 0;
     }
+    return X_STATUS_INVALID_HANDLE;
+  }
+  auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+  if (event_handle && !ev) {
+    StoreImmediateIoStatus(file, io_status_block.guest_address(), X_STATUS_INVALID_HANDLE, 0);
+    return X_STATUS_INVALID_HANDLE;
   }
 
-  if (XFAILED(result) && io_status_block) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
+  X_STATUS result = ValidateReadRequest(file, io_status_block.guest_address(),
+                                        buffer.guest_address(), buffer_length);
+  if (XFAILED(result)) {
+    StoreImmediateIoStatus(file, io_status_block.guest_address(), result, 0);
+    return result;
   }
 
-  if (ev && signal_event) {
-    ev->Set(0, false);
-  }
+  XThread* current_thread = XThread::GetCurrentThread();
+  FileReadCompletion completion{file,
+                                ev,
+                                retain_object(current_thread),
+                                io_status_block.guest_address(),
+                                apc_routine,
+                                apc_context.guest_address()};
 
-  // Log detailed completion info for debugging async IO issues
-  if (file) {
+  const bool has_completion_port = file->HasIOCompletionPorts();
+  const bool inline_completion = file_io::IsInlineCompletionEligible(
+      file->is_synchronous(), !!ev, apc_routine != 0, has_completion_port);
+  if (inline_completion) {
+    completion.PrepareWaitObject();
+    uint32_t bytes_read = 0;
+    result = file->ReadTransfer(buffer.guest_address(), buffer_length, byte_offset, &bytes_read);
+    completion.Complete(result, bytes_read);
     REXKRNL_IMPORT_RESULT(
-        "NtReadFile",
-        "{:#x} (sync={}, iosb_status={:#x}, iosb_info={}, ev_signaled={}, apc_requested={}, "
-        "apc_queued={})",
-        result, file->is_synchronous(),
-        io_status_block ? (uint32_t)io_status_block->status : 0xDEAD,
-        io_status_block ? (uint32_t)io_status_block->information : 0, ev && signal_event,
-        apc_requested, apc_queued);
-  } else {
-    REXKRNL_IMPORT_RESULT("NtReadFile", "{:#x} (apc_requested={}, apc_queued={})", result,
-                          apc_requested, apc_queued);
+        "NtReadFile", "{:#x} inline=1 synchronous={} completion_port={} wait={} transferred={}",
+        result, file->is_synchronous(), has_completion_port, ev ? "event" : "file", bytes_read);
+    return result;
   }
-  return result;
+
+  HostTaskAdmissionResult admission = HostTaskAdmissionResult::kNoMemory;
+  try {
+    admission = REX_KERNEL_STATE()->QueueHostTask(
+        [completion, buffer_address = buffer.guest_address(),
+         length = static_cast<uint32_t>(buffer_length), byte_offset]() {
+          REXKRNL_DEBUG("[AsyncIO] worker start iosb={:08X} kind=read", completion.io_status_block);
+          uint32_t bytes_read = 0;
+          const X_STATUS status =
+              completion.file->ReadTransfer(buffer_address, length, byte_offset, &bytes_read);
+          completion.Complete(status, bytes_read);
+        },
+        [completion]() {
+          completion.PrepareWaitObject();
+          StoreImmediateIoStatus(completion.file, completion.io_status_block, X_STATUS_PENDING, 0);
+          REXKRNL_DEBUG("[AsyncIO] admitted iosb={:08X} wait={} apc={:08X}",
+                        completion.io_status_block, completion.supplied_event ? "event" : "file",
+                        completion.apc_routine);
+        });
+  } catch (const std::bad_alloc&) {
+    admission = HostTaskAdmissionResult::kNoMemory;
+  }
+  if (admission != HostTaskAdmissionResult::kAccepted) {
+    const X_STATUS failure = admission == HostTaskAdmissionResult::kNoMemory
+                                 ? X_STATUS_NO_MEMORY
+                                 : X_STATUS_THREAD_IS_TERMINATING;
+    StoreImmediateIoStatus(file, io_status_block.guest_address(), failure, 0);
+    REXKRNL_IMPORT_RESULT("NtReadFile", "{:#x} async admission rejected", failure);
+    return failure;
+  }
+
+  REXKRNL_IMPORT_RESULT("NtReadFile", "{:#x} inline=0 wait={} completion_port={}", X_STATUS_PENDING,
+                        ev ? "event" : "file", has_completion_port);
+  return X_STATUS_PENDING;
 }
 
 u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
                             mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                             mapped_u32 segment_array, u32 length, mapped_u64 byte_offset_ptr) {
-  X_STATUS result = X_STATUS_SUCCESS;
-
-  bool signal_event = false;
-  auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
-  if (event_handle && !ev) {
-    result = X_STATUS_INVALID_HANDLE;
-  }
-
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
   if (!file) {
-    result = X_STATUS_INVALID_HANDLE;
-  }
-
-  if (XSUCCEEDED(result)) {
-    if (true || file->is_synchronous()) {
-      // Synchronous.
-      uint32_t bytes_read = 0;
-      result = file->ReadScatter(segment_array.guest_address(), length,
-                                 byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-                                 &bytes_read, apc_context.guest_address());
-      if (io_status_block) {
-        io_status_block->status = result;
-        io_status_block->information = bytes_read;
-      }
-
-      // Queue the APC callback. It must be delivered via the APC mechanism even
-      // though were are completing immediately.
-      // Low bit probably means do not queue to IO ports.
-      if ((uint32_t)apc_routine_ptr & ~1) {
-        if (apc_context) {
-          auto thread = XThread::GetCurrentThread();
-          thread->EnqueueApc(static_cast<uint32_t>(apc_routine_ptr) & ~1u,
-                             apc_context.guest_address(), io_status_block.guest_address(), 0);
-        }
-      }
-
-      if (!file->is_synchronous()) {
-        result = X_STATUS_PENDING;
-      }
-
-      // Mark that we should signal the event now. We do this after
-      // we have written the info out.
-      signal_event = true;
-    } else {
-      // TODO(benvanik): async.
-
-      // TODO: On Windows it might be worth trying to use Win32 ReadFileScatter
-      // here instead of handling it ourselves
-
-      // X_STATUS_PENDING if not returning immediately.
-      // XFile is waitable and signalled after each async req completes.
-      // reset the input event (->Reset())
-      /*xeNtReadFileState* call_state = new xeNtReadFileState();
-      XAsyncRequest* request = new XAsyncRequest(
-      state, file,
-      (XAsyncRequest::CompletionCallback)xeNtReadFileCompleted,
-      call_state);*/
-      // result = file->Read(buffer.guest_address(), buffer_length, byte_offset,
-      //                     request);
-      if (io_status_block) {
-        io_status_block->status = X_STATUS_PENDING;
-        io_status_block->information = 0;
-      }
-
-      result = X_STATUS_PENDING;
+    if (io_status_block) {
+      io_status_block->status = X_STATUS_INVALID_HANDLE;
+      io_status_block->information = 0;
     }
+    return X_STATUS_INVALID_HANDLE;
+  }
+  auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+  if (event_handle && !ev) {
+    StoreImmediateIoStatus(file, io_status_block.guest_address(), X_STATUS_INVALID_HANDLE, 0);
+    return X_STATUS_INVALID_HANDLE;
   }
 
-  if (XFAILED(result) && io_status_block) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
+  if (io_status_block.guest_address() &&
+      !file->ValidateGuestRange(io_status_block.guest_address(), sizeof(X_IO_STATUS_BLOCK), true)) {
+    return X_STATUS_ACCESS_VIOLATION;
   }
 
-  if (ev && signal_event) {
-    ev->Set(0, false);
+  std::vector<uint32_t> segments;
+  X_STATUS result = file->SnapshotReadScatter(segment_array.guest_address(), length, &segments);
+  if (XFAILED(result)) {
+    StoreImmediateIoStatus(file, io_status_block.guest_address(), result, 0);
+    return result;
   }
 
-  return result;
+  const uint64_t byte_offset =
+      byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : file_io::kUseCurrentPosition;
+  const uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr) & ~1u;
+  FileReadCompletion completion{file,
+                                ev,
+                                retain_object(XThread::GetCurrentThread()),
+                                io_status_block.guest_address(),
+                                apc_routine,
+                                apc_context.guest_address()};
+
+  const bool has_completion_port = file->HasIOCompletionPorts();
+  const bool inline_completion = file_io::IsInlineCompletionEligible(
+      file->is_synchronous(), !!ev, apc_routine != 0, has_completion_port);
+  if (inline_completion) {
+    completion.PrepareWaitObject();
+    uint32_t bytes_read = 0;
+    result = file->ReadScatterTransfer(segments, length, byte_offset, &bytes_read);
+    completion.Complete(result, bytes_read);
+    REXKRNL_IMPORT_RESULT("NtReadFileScatter",
+                          "{:#x} inline=1 synchronous={} completion_port={} wait={} transferred={}",
+                          result, file->is_synchronous(), has_completion_port,
+                          ev ? "event" : "file", bytes_read);
+    return result;
+  }
+
+  HostTaskAdmissionResult admission = HostTaskAdmissionResult::kNoMemory;
+  try {
+    admission = REX_KERNEL_STATE()->QueueHostTask(
+        [completion, segments = std::move(segments), length = static_cast<uint32_t>(length),
+         byte_offset]() {
+          REXKRNL_DEBUG("[AsyncIO] worker start iosb={:08X} kind=scatter",
+                        completion.io_status_block);
+          uint32_t bytes_read = 0;
+          const X_STATUS status =
+              completion.file->ReadScatterTransfer(segments, length, byte_offset, &bytes_read);
+          completion.Complete(status, bytes_read);
+        },
+        [completion]() {
+          completion.PrepareWaitObject();
+          StoreImmediateIoStatus(completion.file, completion.io_status_block, X_STATUS_PENDING, 0);
+          REXKRNL_DEBUG("[AsyncIO] admitted iosb={:08X} wait={} apc={:08X} kind=scatter",
+                        completion.io_status_block, completion.supplied_event ? "event" : "file",
+                        completion.apc_routine);
+        });
+  } catch (const std::bad_alloc&) {
+    admission = HostTaskAdmissionResult::kNoMemory;
+  }
+  if (admission != HostTaskAdmissionResult::kAccepted) {
+    const X_STATUS failure = admission == HostTaskAdmissionResult::kNoMemory
+                                 ? X_STATUS_NO_MEMORY
+                                 : X_STATUS_THREAD_IS_TERMINATING;
+    StoreImmediateIoStatus(file, io_status_block.guest_address(), failure, 0);
+    return failure;
+  }
+
+  REXKRNL_IMPORT_RESULT("NtReadFileScatter", "{:#x} inline=0 wait={} completion_port={}",
+                        X_STATUS_PENDING, ev ? "event" : "file", has_completion_port);
+  return X_STATUS_PENDING;
 }
 
 u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped_void apc_context,

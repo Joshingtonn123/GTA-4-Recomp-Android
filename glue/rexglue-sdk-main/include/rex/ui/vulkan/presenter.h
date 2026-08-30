@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -140,6 +141,25 @@ class VulkanPresenter final : public Presenter {
 
   const VulkanDevice* vulkan_device() const { return vulkan_device_; }
 
+  struct PaintTimingSnapshot {
+    uint64_t acquire_ticks = 0;
+    uint64_t submit_ticks = 0;
+    uint64_t present_ticks = 0;
+    uint64_t total_ticks = 0;
+    uint64_t sequence = 0;
+  };
+
+  bool ConsumeLastPaintTiming(PaintTimingSnapshot& snapshot) {
+    std::lock_guard lock(paint_timing_mutex_);
+    if (!paint_timing_latest_.sequence) {
+      snapshot = {};
+      return false;
+    }
+    snapshot = paint_timing_latest_;
+    paint_timing_latest_.sequence = 0;
+    return true;
+  }
+
   static Surface::TypeFlags GetSurfaceTypesSupportedByInstance(
       const VulkanInstance::Extensions& instance_extensions);
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
@@ -217,6 +237,7 @@ class VulkanPresenter final : public Presenter {
     std::shared_ptr<GuestOutputImage> image;
     uint64_t version = UINT64_MAX;
     uint64_t last_refresher_submission = 0;
+    std::shared_ptr<GuestOutputRefreshContext::Completion> refresher_completion;
     // For choosing the barrier stage and access mask and layout depending on
     // whether the image has previously been written. If an image is active
     // after a refresh, it can be assumed that this is true.
@@ -226,6 +247,7 @@ class VulkanPresenter final : public Presenter {
       image = new_image;
       version = new_version;
       last_refresher_submission = 0;
+      refresher_completion.reset();
       ever_successfully_refreshed = false;
     }
   };
@@ -300,7 +322,6 @@ class VulkanPresenter final : public Presenter {
       ~Submission();
 
       VkSemaphore acquire_semaphore() const { return acquire_semaphore_; }
-      VkSemaphore present_semaphore() const { return present_semaphore_; }
       VkCommandPool draw_command_pool() const { return draw_command_pool_; }
       VkCommandBuffer draw_command_buffer() const { return draw_command_buffer_; }
 
@@ -311,7 +332,6 @@ class VulkanPresenter final : public Presenter {
 
       const VulkanDevice* vulkan_device_;
       VkSemaphore acquire_semaphore_ = VK_NULL_HANDLE;
-      VkSemaphore present_semaphore_ = VK_NULL_HANDLE;
       VkCommandPool draw_command_pool_ = VK_NULL_HANDLE;
       VkCommandBuffer draw_command_buffer_ = VK_NULL_HANDLE;
     };
@@ -352,11 +372,18 @@ class VulkanPresenter final : public Presenter {
     };
 
     struct SwapchainFramebuffer {
-      SwapchainFramebuffer(VkImageView image_view, VkFramebuffer framebuffer)
-          : image_view(image_view), framebuffer(framebuffer) {}
+      SwapchainFramebuffer(VkImageView image_view, VkFramebuffer framebuffer,
+                           VkSemaphore present_semaphore)
+          : image_view(image_view),
+            framebuffer(framebuffer),
+            present_semaphore(present_semaphore) {}
 
       VkImageView image_view;
       VkFramebuffer framebuffer;
+      // Indexed by the acquired swapchain image. Reacquiring that image
+      // guarantees that its previous presentation operation (including its
+      // semaphore wait) has completed, so this binary semaphore is reusable.
+      VkSemaphore present_semaphore;
     };
 
     explicit PaintContext(const VulkanDevice* const vulkan_device)
@@ -455,6 +482,20 @@ class VulkanPresenter final : public Presenter {
 
   bool InitializeSurfaceIndependent();
 
+  void PublishPaintTiming(uint64_t acquire_ticks, uint64_t submit_ticks,
+                          uint64_t present_ticks, uint64_t total_ticks) {
+    std::lock_guard lock(paint_timing_mutex_);
+    paint_timing_latest_.acquire_ticks = acquire_ticks;
+    paint_timing_latest_.submit_ticks = submit_ticks;
+    paint_timing_latest_.present_ticks = present_ticks;
+    paint_timing_latest_.total_ticks = total_ticks;
+    ++paint_timing_publish_sequence_;
+    if (!paint_timing_publish_sequence_) {
+      ++paint_timing_publish_sequence_;
+    }
+    paint_timing_latest_.sequence = paint_timing_publish_sequence_;
+  }
+
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,
                                                           VkRenderPass render_pass);
 
@@ -470,6 +511,9 @@ class VulkanPresenter final : public Presenter {
 
   const VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
+  std::mutex paint_timing_mutex_;
+  PaintTimingSnapshot paint_timing_latest_{};
+  uint64_t paint_timing_publish_sequence_ = 0;
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage

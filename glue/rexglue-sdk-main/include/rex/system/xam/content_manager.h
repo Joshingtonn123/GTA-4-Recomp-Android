@@ -12,8 +12,11 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <rex/math.h>
 #include <rex/memory.h>
@@ -161,6 +164,10 @@ class ContentManager {
       uint32_t device_id, uint64_t xuid, XContentType content_type,
       uint32_t title_id = -1);
 
+  // A value enables server-authorized marketplace filtering. An empty set is
+  // fail-closed; no value preserves the local-only behavior used offline/LAN.
+  void SetMarketplacePackageAllowlist(std::optional<std::unordered_set<std::string>> allowlist);
+
   std::unique_ptr<ContentPackage> ResolvePackage(const std::string_view root_name, uint64_t xuid,
                                                  const XCONTENT_AGGREGATE_DATA& data);
 
@@ -202,6 +209,7 @@ class ContentManager {
   std::filesystem::path ResolvePackageHeaderPath(const std::string_view file_name, uint64_t xuid,
                                                  uint32_t title_id,
                                                  XContentType content_type) const;
+  bool IsMarketplacePackageAuthorized(const XCONTENT_AGGREGATE_DATA& data) const;
 
   std::unordered_map<string::string_key_case, ContentPackage*,
                      string::string_key_case::Hash>::iterator
@@ -213,6 +221,8 @@ class ContentManager {
   std::filesystem::path root_path_;
   std::filesystem::path marketplace_content_root_;
   std::filesystem::path saved_game_root_;
+  mutable std::mutex marketplace_allowlist_mutex_;
+  std::optional<std::unordered_set<std::string>> marketplace_package_allowlist_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;

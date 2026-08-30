@@ -20,6 +20,11 @@ struct PointerMotionSample {
 class PointerMotionAccumulator {
  public:
   void Add(rex::ui::MouseEvent::MotionSource source, double delta_x, double delta_y);
+  // Observe the pending sample without transferring ownership. Repeated
+  // observations return the same sample until it is consumed or reset.
+  PointerMotionSample Peek() const;
+  // Transfer ownership of the pending sample to the caller and begin a new
+  // accumulation interval.
   PointerMotionSample Consume();
   void Reset();
 

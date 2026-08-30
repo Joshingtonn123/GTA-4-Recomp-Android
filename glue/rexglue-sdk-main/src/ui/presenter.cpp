@@ -313,6 +313,34 @@ Presenter::~Presenter() {
   }
 }
 
+GuestOutputTransform Presenter::GetGuestOutputTransform() const {
+  std::lock_guard lock(guest_output_transform_mutex_);
+  return guest_output_transform_;
+}
+
+void Presenter::InvalidateGuestOutputTransform() const {
+  UpdateGuestOutputTransform({});
+}
+
+void Presenter::UpdateGuestOutputTransform(const GuestOutputTransform& transform) const {
+  std::lock_guard lock(guest_output_transform_mutex_);
+  const GuestOutputTransform& current = guest_output_transform_;
+  if (current.surface_width == transform.surface_width &&
+      current.surface_height == transform.surface_height &&
+      current.host_render_target_width == transform.host_render_target_width &&
+      current.host_render_target_height == transform.host_render_target_height &&
+      current.output_x == transform.output_x && current.output_y == transform.output_y &&
+      current.output_width == transform.output_width &&
+      current.output_height == transform.output_height &&
+      current.guest_width == transform.guest_width &&
+      current.guest_height == transform.guest_height) {
+    return;
+  }
+  const uint64_t next_revision = current.revision + 1;
+  guest_output_transform_ = transform;
+  guest_output_transform_.revision = next_revision;
+}
+
 void Presenter::SetWindowSurfaceFromUIThread(Window* new_window, Surface* new_surface) {
   // No intrusive lifetime management must be performed from UI drawers - defer
   // it if needed.
@@ -327,6 +355,8 @@ void Presenter::SetWindowSurfaceFromUIThread(Window* new_window, Surface* new_su
     // SetPresenter > SetWindowSurfaceFromUIThread call).
     return;
   }
+
+  InvalidateGuestOutputTransform();
 
   // Disconnect from the current surface.
   if (surface_) {
@@ -401,6 +431,8 @@ void Presenter::OnSurfaceResizeFromUIThread() {
   if (!surface_) {
     return;
   }
+
+  InvalidateGuestOutputTransform();
 
   // Let the UI thread take ownership of painting (so the connection can be
   // updated) in a smooth way - downgrade to kUIThreadOnRequest rather than
@@ -493,6 +525,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       WaitForUITickFromUIThread();
 
       paint_result = PaintAndPresent(draw_ui);
+      if (paint_result == PaintResult::kNotPresentedRetry) {
+        // Yield to the window event loop before retrying. This is essential on
+        // platforms where presentation progress may depend on that same loop.
+        request_repaint_at_tick = true;
+      }
       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
         // Request another PaintFromUIThread which will try to recover from the
         // outdated connection in the next frame (not immediately, so the
@@ -551,7 +588,9 @@ void Presenter::PaintFromUIThread(bool force_paint) {
     }
   }
   if (request_repaint_at_tick || request_repaint_immediately) {
-    RequestPaintOrConnectionRecoveryViaWindow(request_repaint_immediately);
+    RequestPaintOrConnectionRecoveryViaWindow(
+        request_repaint_immediately,
+        request_repaint_at_tick && !request_repaint_immediately);
   }
 }
 
@@ -661,7 +700,8 @@ bool Presenter::RefreshGuestOutput(
         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
           paint_result = PaintAndPresent(false);
           paint_action = RefreshPaintAction::kGuestThreadPresented;
-          if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+          if (paint_result == PaintResult::kNotPresentedRetry ||
+              surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
             RequestPaintOrConnectionRecoveryViaWindow(true);
           }
         } else {
@@ -742,6 +782,8 @@ bool Presenter::RefreshGuestOutput(
           return "presented_suboptimal";
         case PaintResult::kNotPresented:
           return "not_presented";
+        case PaintResult::kNotPresentedRetry:
+          return "not_presented_retry";
         case PaintResult::kNotPresentedConnectionOutdated:
           return "connection_outdated";
         case PaintResult::kGpuLostExternally:
@@ -995,6 +1037,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   // For safety such as division by zero prevention.
   if (!properties.IsActive() || !host_rt_width || !host_rt_height ||
       !surface_width_in_paint_connection_ || !surface_height_in_paint_connection_) {
+    InvalidateGuestOutputTransform();
     return flow;
   }
 
@@ -1141,6 +1184,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   }
   if (!output_width || !output_height || output_right <= 0 || output_bottom <= 0 ||
       flow.output_x >= int32_t(host_rt_width) || flow.output_y >= int32_t(host_rt_height)) {
+    InvalidateGuestOutputTransform();
     return flow;
   }
 
@@ -1384,6 +1428,19 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     }
   }
 
+  GuestOutputTransform input_transform;
+  input_transform.surface_width = surface_width_in_paint_connection_;
+  input_transform.surface_height = surface_height_in_paint_connection_;
+  input_transform.host_render_target_width = host_rt_width;
+  input_transform.host_render_target_height = host_rt_height;
+  input_transform.output_x = flow.output_x;
+  input_transform.output_y = flow.output_y;
+  input_transform.output_width = output_width;
+  input_transform.output_height = output_height;
+  input_transform.guest_width = properties.frontbuffer_width;
+  input_transform.guest_height = properties.frontbuffer_height;
+  UpdateGuestOutputTransform(input_transform);
+
   return flow;
 }
 
@@ -1544,7 +1601,8 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
   }
 }
 
-bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_paint_tick) {
+bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_paint_tick,
+                                                           bool defer_until_ui_tick) {
   // Can be called from any thread if an existing window_ is available in it,
   // and it's known to have a Surface that will be the same throughout this
   // call - not doing any checks whether this request can be satisfied
@@ -1558,7 +1616,11 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
   if (force_ui_thread_paint_tick) {
     ForceUIThreadPaintTick();
   }
-  window_->RequestPaint();
+  if (defer_until_ui_tick) {
+    window_->RequestPaintAtUITick();
+  } else {
+    window_->RequestPaint();
+  }
   return true;
 }
 
@@ -1699,6 +1761,8 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
           return "presented_suboptimal";
         case PaintResult::kNotPresented:
           return "not_presented";
+        case PaintResult::kNotPresentedRetry:
+          return "not_presented_retry";
         case PaintResult::kNotPresentedConnectionOutdated:
           return "connection_outdated";
         case PaintResult::kGpuLostExternally:

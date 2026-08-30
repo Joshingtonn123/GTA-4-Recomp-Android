@@ -20,6 +20,9 @@
 #include <rex/system/xfile.h>
 #include <rex/thread/mutex.h>
 
+#include <algorithm>
+#include <limits>
+#include <new>
 #include <span>
 
 namespace rex::system {
@@ -119,25 +122,105 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
 
 X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
                      uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion) {
-  std::lock_guard<std::mutex> lock(file_lock_);
-  const uint64_t effective_offset = byte_offset == uint64_t(-1) ? position_ : byte_offset;
+  const uint64_t effective_offset =
+      file_io::UsesCurrentPosition(byte_offset) ? position() : byte_offset;
+  if (notify_completion) {
+    BeginIO();
+  }
   uint32_t traced_bytes_read = 0;
   uint32_t* bytes_read = out_bytes_read ? out_bytes_read : &traced_bytes_read;
-  const X_STATUS result = ReadInternal(buffer_guest_address, buffer_length, byte_offset, bytes_read,
-                                       apc_context, notify_completion);
+  const X_STATUS result =
+      ReadTransfer(buffer_guest_address, buffer_length, byte_offset, bytes_read);
+  if (notify_completion) {
+    CompleteIO(result, *bytes_read, apc_context);
+  }
   if (IsIoTraceEnabled()) {
-    REXSYS_TRACE("[PortableSave] Read file='{}' offset={} requested={} transferred={} status={:08X}",
-                 entry()->absolute_path(), effective_offset, buffer_length, *bytes_read, result);
+    REXSYS_TRACE(
+        "[PortableSave] Read file='{}' offset={} requested={} transferred={} status={:08X}",
+        entry()->absolute_path(), effective_offset, buffer_length, *bytes_read, result);
   }
   return result;
 }
 
-X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
-                             uint64_t byte_offset, uint32_t* out_bytes_read, uint32_t apc_context,
-                             bool notify_completion) {
-  if (byte_offset == uint64_t(-1)) {
-    // Read from current position.
-    byte_offset = position_;
+bool XFile::ValidateGuestRange(uint32_t guest_address, uint32_t length, bool require_write) const {
+  if (!length) {
+    return true;
+  }
+  if (guest_address > std::numeric_limits<uint32_t>::max() - (length - 1)) {
+    return false;
+  }
+  const uint32_t high_address = guest_address + length - 1;
+  rex::memory::BaseHeap* start_heap = memory()->LookupHeap(guest_address);
+  const rex::memory::BaseHeap* end_heap = memory()->LookupHeap(high_address);
+  if (!start_heap || start_heap != end_heap) {
+    return false;
+  }
+  const memory::PageAccess access = start_heap->QueryRangeAccess(guest_address, high_address);
+  if (require_write) {
+    return access == memory::PageAccess::kReadWrite ||
+           access == memory::PageAccess::kExecuteReadWrite;
+  }
+  return access != memory::PageAccess::kNoAccess;
+}
+
+X_STATUS XFile::SnapshotReadScatter(uint32_t segments_guest_address, uint32_t length,
+                                    std::vector<uint32_t>* out_segments) const {
+  if (!out_segments) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  out_segments->clear();
+  const size_t segment_count = file_io::ScatterSegmentCount(length);
+  if (!segment_count) {
+    return X_STATUS_SUCCESS;
+  }
+  const size_t descriptor_bytes = segment_count * sizeof(rex::be<uint32_t>);
+  if (descriptor_bytes > std::numeric_limits<uint32_t>::max() ||
+      !ValidateGuestRange(segments_guest_address, static_cast<uint32_t>(descriptor_bytes), false)) {
+    return X_STATUS_ACCESS_VIOLATION;
+  }
+
+  const auto* descriptors =
+      memory()->TranslateVirtual<const rex::be<uint32_t>*>(segments_guest_address);
+  try {
+    out_segments->reserve(segment_count);
+    uint32_t remaining = length;
+    for (size_t i = 0; i < segment_count; ++i) {
+      const uint32_t destination = static_cast<uint32_t>(descriptors[i]);
+      const uint32_t transfer_length = file_io::ScatterSegmentLength(remaining);
+      if (!ValidateGuestRange(destination, transfer_length, true)) {
+        out_segments->clear();
+        return X_STATUS_ACCESS_VIOLATION;
+      }
+      out_segments->push_back(destination);
+      remaining -= transfer_length;
+    }
+  } catch (const std::bad_alloc&) {
+    out_segments->clear();
+    return X_STATUS_NO_MEMORY;
+  }
+  return X_STATUS_SUCCESS;
+}
+
+X_STATUS XFile::ReadTransfer(uint32_t buffer_guest_address, uint32_t buffer_length,
+                             uint64_t byte_offset, uint32_t* out_bytes_read) {
+  std::lock_guard<std::mutex> lock(file_lock_);
+  return ReadInternalLocked(buffer_guest_address, buffer_length, byte_offset, out_bytes_read);
+}
+
+X_STATUS XFile::ReadInternalLocked(uint32_t buffer_guest_address, uint32_t buffer_length,
+                                   uint64_t byte_offset, uint32_t* out_bytes_read) {
+  if (out_bytes_read) {
+    *out_bytes_read = 0;
+  }
+
+  const bool use_current_position = file_io::UsesCurrentPosition(byte_offset);
+  const uint64_t effective_offset = use_current_position ? position_ : byte_offset;
+  if (effective_offset > std::numeric_limits<size_t>::max()) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (file_io::AdvancesPosition(is_synchronous_, byte_offset) &&
+      file_io::PositionAdvanceOverflows(effective_offset, buffer_length)) {
+    return X_STATUS_INVALID_PARAMETER;
   }
 
   size_t bytes_read = 0;
@@ -145,7 +228,7 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
   // Zero length means success for a valid file object according to Windows
   // tests.
   if (buffer_length) {
-    if (UINT32_MAX - buffer_guest_address < buffer_length) {
+    if (!ValidateGuestRange(buffer_guest_address, buffer_length, true)) {
       result = X_STATUS_ACCESS_VIOLATION;
     } else {
       // Games often read directly to texture/vertex buffer memory - in this
@@ -158,64 +241,39 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
       // during the read, the guest may still access the data around the buffer
       // that is located in the same host pages as the buffer's start and end,
       // on the GPU - and that must not trigger a race condition).
-      uint32_t buffer_guest_high_address = buffer_guest_address + buffer_length - 1;
       rex::memory::BaseHeap* buffer_start_heap = memory()->LookupHeap(buffer_guest_address);
-      const rex::memory::BaseHeap* buffer_end_heap =
-          memory()->LookupHeap(buffer_guest_high_address);
-      if (!buffer_start_heap || !buffer_end_heap ||
-          (buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical) !=
-              (buffer_end_heap->heap_type() == memory::HeapType::kGuestPhysical) ||
-          (buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical &&
-           buffer_start_heap != buffer_end_heap)) {
-        result = X_STATUS_ACCESS_VIOLATION;
-      } else {
-        rex::memory::PhysicalHeap* buffer_physical_heap =
-            buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical
-                ? static_cast<rex::memory::PhysicalHeap*>(buffer_start_heap)
-                : nullptr;
-        if (buffer_physical_heap && buffer_physical_heap->QueryRangeAccess(
-                                        buffer_guest_address, buffer_guest_high_address) !=
-                                        memory::PageAccess::kReadWrite) {
-          result = X_STATUS_ACCESS_VIOLATION;
-        } else {
-          result = file_->ReadSync(
-              std::span<uint8_t>(
-                  buffer_physical_heap
-                      ? memory()->TranslatePhysical(
-                            buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
-                      : memory()->TranslateVirtual(buffer_guest_address),
-                  buffer_length),
-              size_t(byte_offset), &bytes_read);
-          if (XSUCCEEDED(result)) {
-            if (buffer_physical_heap) {
-              buffer_physical_heap->TriggerCallbacks(
-                  rex::thread::global_critical_region::AcquireDirect(), buffer_guest_address,
-                  buffer_length, true, true);
-            }
-
-            if (byte_offset) {
-              position_ = byte_offset;
-            }
-            position_ += bytes_read;
-          }
+      rex::memory::PhysicalHeap* buffer_physical_heap =
+          buffer_start_heap->heap_type() == memory::HeapType::kGuestPhysical
+              ? static_cast<rex::memory::PhysicalHeap*>(buffer_start_heap)
+              : nullptr;
+      result = file_->ReadSync(
+          std::span<uint8_t>(
+              buffer_physical_heap
+                  ? memory()->TranslatePhysical(
+                        buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
+                  : memory()->TranslateVirtual(buffer_guest_address),
+              buffer_length),
+          static_cast<size_t>(effective_offset), &bytes_read);
+      if (XSUCCEEDED(result)) {
+        if (buffer_physical_heap) {
+          buffer_physical_heap->TriggerCallbacks(
+              rex::thread::global_critical_region::AcquireDirect(), buffer_guest_address,
+              buffer_length, true, true);
         }
       }
     }
   }
 
-  if (out_bytes_read) {
-    *out_bytes_read = uint32_t(bytes_read);
+  // Synchronous file objects follow every successful transfer's effective
+  // offset, including explicit offset zero. Asynchronous explicit-offset reads
+  // don't mutate the shared position; current-position reads are serialized by
+  // file_lock_ and advance it here.
+  if (XSUCCEEDED(result) && file_io::AdvancesPosition(is_synchronous_, byte_offset)) {
+    position_ = effective_offset + bytes_read;
   }
 
-  if (notify_completion) {
-    XIOCompletion::IONotification notify;
-    notify.apc_context = apc_context;
-    notify.num_bytes = uint32_t(bytes_read);
-    notify.status = result;
-
-    NotifyIOCompletionPorts(notify);
-
-    async_event_->Set();
+  if (out_bytes_read) {
+    *out_bytes_read = uint32_t(bytes_read);
   }
 
   return result;
@@ -223,64 +281,91 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
 
 X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, uint64_t byte_offset,
                             uint32_t* out_bytes_read, uint32_t apc_context) {
-  std::lock_guard<std::mutex> lock(file_lock_);
-  X_STATUS result = X_STATUS_SUCCESS;
-
-  // segments points to an array of buffer pointers of type
-  // "FILE_SEGMENT_ELEMENT", but they can just be treated as normal pointers
-  rex::be<uint32_t>* segments =
-      reinterpret_cast<rex::be<uint32_t>*>(memory()->TranslateVirtual(segments_guest_address));
-
-  // TODO: not sure if this is meant to change depending on buffer address?
-  // (only game seen using this always seems to use 4096-byte buffers)
-  uint32_t page_size = 4096;
-
+  const uint64_t effective_offset =
+      file_io::UsesCurrentPosition(byte_offset) ? position() : byte_offset;
+  BeginIO();
+  std::vector<uint32_t> segments;
+  X_STATUS result = SnapshotReadScatter(segments_guest_address, length, &segments);
   uint32_t read_total = 0;
-  uint32_t read_remain = length;
-  while (read_remain) {
-    uint32_t read_length = read_remain;
-    uint32_t read_buffer = *segments;
-    if (read_length > page_size) {
-      read_length = page_size;
-      segments++;
-    }
-
-    uint32_t bytes_read = 0;
-    result = ReadInternal(
-        read_buffer, read_length,
-        byte_offset
-            ? ((byte_offset != -1 && byte_offset != -2) ? byte_offset + read_total : byte_offset)
-            : -1,
-        &bytes_read, apc_context, false);
-
-    if (result != X_STATUS_SUCCESS) {
-      break;
-    }
-
-    read_total += bytes_read;
-    read_remain -= read_length;
+  if (XSUCCEEDED(result)) {
+    result = ReadScatterTransfer(segments, length, byte_offset, &read_total);
   }
-
   if (out_bytes_read) {
-    *out_bytes_read = uint32_t(read_total);
+    *out_bytes_read = read_total;
   }
-
-  XIOCompletion::IONotification notify;
-  notify.apc_context = apc_context;
-  notify.num_bytes = uint32_t(read_total);
-  notify.status = result;
-
-  NotifyIOCompletionPorts(notify);
-
-  async_event_->Set();
+  CompleteIO(result, read_total, apc_context);
 
   if (IsIoTraceEnabled()) {
     REXSYS_TRACE(
         "[PortableSave] ReadScatter file='{}' offset={} requested={} transferred={} status={:08X}",
-        entry()->absolute_path(), byte_offset, length, read_total, result);
+        entry()->absolute_path(), effective_offset, length, read_total, result);
   }
 
   return result;
+}
+
+X_STATUS XFile::ReadScatterTransfer(std::span<const uint32_t> segments, uint32_t length,
+                                    uint64_t byte_offset, uint32_t* out_bytes_read) {
+  if (out_bytes_read) {
+    *out_bytes_read = 0;
+  }
+  if (segments.size() != file_io::ScatterSegmentCount(length)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  std::lock_guard<std::mutex> lock(file_lock_);
+  X_STATUS result = X_STATUS_SUCCESS;
+  uint32_t read_total = 0;
+  uint32_t remaining = length;
+  for (uint32_t destination : segments) {
+    const uint32_t read_length = file_io::ScatterSegmentLength(remaining);
+    uint64_t transfer_offset = byte_offset;
+    if (!file_io::UsesCurrentPosition(byte_offset)) {
+      if (file_io::ScatterOffsetOverflows(byte_offset, read_total)) {
+        result = X_STATUS_INVALID_PARAMETER;
+        break;
+      }
+      transfer_offset = file_io::ScatterExplicitOffset(byte_offset, read_total);
+    }
+
+    uint32_t bytes_read = 0;
+    result = ReadInternalLocked(destination, read_length, transfer_offset, &bytes_read);
+    read_total += bytes_read;
+    if (!file_io::ContinueScatter(result, read_length, bytes_read)) {
+      break;
+    }
+    remaining -= read_length;
+  }
+
+  if (out_bytes_read) {
+    *out_bytes_read = read_total;
+  }
+  return result;
+}
+
+void XFile::BeginIO() {
+  ResetWaitEvent();
+}
+
+void XFile::CompleteIO(X_STATUS status, uint32_t num_bytes, uint32_t apc_context) {
+  NotifyIOCompletion(status, num_bytes, apc_context);
+  SignalWaitEvent();
+}
+
+void XFile::ResetWaitEvent() {
+  async_event_->Reset();
+}
+
+void XFile::SignalWaitEvent() {
+  async_event_->Set();
+}
+
+void XFile::NotifyIOCompletion(X_STATUS status, uint32_t num_bytes, uint32_t apc_context) {
+  XIOCompletion::IONotification notification;
+  notification.apc_context = apc_context;
+  notification.num_bytes = num_bytes;
+  notification.status = status;
+  NotifyIOCompletionPorts(notification);
 }
 
 X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
@@ -355,6 +440,11 @@ void XFile::RemoveIOCompletionPort(uint32_t key) {
       break;
     }
   }
+}
+
+bool XFile::HasIOCompletionPorts() {
+  std::lock_guard<std::mutex> lock(completion_port_lock_);
+  return !completion_ports_.empty();
 }
 
 bool XFile::Save(stream::ByteStream* stream) {

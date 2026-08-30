@@ -100,6 +100,20 @@ ContentManager::ContentManager(KernelState* kernel_state, const std::filesystem:
 
 ContentManager::~ContentManager() = default;
 
+void ContentManager::SetMarketplacePackageAllowlist(
+    std::optional<std::unordered_set<std::string>> allowlist) {
+  std::lock_guard lock(marketplace_allowlist_mutex_);
+  marketplace_package_allowlist_ = std::move(allowlist);
+}
+
+bool ContentManager::IsMarketplacePackageAuthorized(
+    const XCONTENT_AGGREGATE_DATA& data) const {
+  if (data.content_type != XContentType::kMarketplaceContent) return true;
+  std::lock_guard lock(marketplace_allowlist_mutex_);
+  return !marketplace_package_allowlist_ ||
+         marketplace_package_allowlist_->contains(data.file_name());
+}
+
 std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                                          uint32_t title_id) {
   const auto& content_root =
@@ -184,7 +198,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     XCONTENT_AGGREGATE_DATA content_data{};
     if (ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id, content_type,
                               content_data) == X_ERROR_SUCCESS) {
-      result.emplace_back(std::move(content_data));
+      if (IsMarketplacePackageAuthorized(content_data)) {
+        result.emplace_back(std::move(content_data));
+      }
     } else {
       content_data.device_id = device_id;
       content_data.content_type = content_type;
@@ -192,7 +208,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
       content_data.set_file_name(rex::path_to_utf8(file_info.name));
       content_data.title_id = title_id;
       content_data.xuid = xuid;
-      result.emplace_back(std::move(content_data));
+      if (IsMarketplacePackageAuthorized(content_data)) {
+        result.emplace_back(std::move(content_data));
+      }
     }
   }
 
@@ -232,6 +250,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContentForUser(
 
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  if (!IsMarketplacePackageAuthorized(data)) return nullptr;
   auto package_path = ResolvePackagePath(xuid, data);
   if (!std::filesystem::exists(package_path)) {
     return nullptr;
@@ -241,6 +260,7 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
 }
 
 bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  if (!IsMarketplacePackageAuthorized(data)) return false;
   auto path = ResolvePackagePath(xuid, data);
   const bool exists = std::filesystem::exists(path);
   if (data.content_type == XContentType::kSavedGame) {
@@ -325,6 +345,7 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
 
 X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
                                        const XCONTENT_AGGREGATE_DATA& data) {
+  if (!IsMarketplacePackageAuthorized(data)) return X_ERROR_ACCESS_DENIED;
   {
     auto global_lock = global_critical_region_.Acquire();
     if (open_packages_.count(string::string_key_case(root_name))) {
@@ -362,6 +383,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
 X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t xuid,
                                      const XCONTENT_AGGREGATE_DATA& data,
                                      uint32_t& content_license) {
+  if (!IsMarketplacePackageAuthorized(data)) return X_ERROR_ACCESS_DENIED;
   {
     auto global_lock = global_critical_region_.Acquire();
     if (open_packages_.count(string::string_key_case(root_name))) {

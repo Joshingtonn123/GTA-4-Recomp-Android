@@ -38,5 +38,7 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Liberty Recompiled uses the microphone for GTA IV multiplayer voice chat.</string>
 </dict>
 </plist>

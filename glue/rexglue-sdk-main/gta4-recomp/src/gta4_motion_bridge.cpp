@@ -184,6 +184,23 @@ void GTA4MotionBridge::ResetDeviceLocked() {
 }
 
 void GTA4MotionBridge::UpdateLocked(uint32_t user_index) {
+  const bool master_enabled = REXCVAR_GET(gta4_motion_enabled);
+  if (!master_enabled_known_ || master_enabled_ != master_enabled) {
+    const bool was_known = master_enabled_known_;
+    const bool previous_enabled = master_enabled_;
+    ResetDeviceLocked();
+    master_enabled_known_ = true;
+    master_enabled_ = master_enabled;
+    REXLOG_INFO(
+        "gta4-motion: master-toggle previous={} enabled={} effect={}",
+        was_known ? (previous_enabled ? "on" : "off") : "unknown",
+        master_enabled ? "on" : "off",
+        master_enabled ? "state-reset-reacquire" : "state-reset-suppressed");
+  }
+  if (!master_enabled) {
+    return;
+  }
+
   auto* runtime = rex::Runtime::instance();
   auto* input_system =
       runtime ? static_cast<rex::input::InputSystem*>(runtime->input_system()) : nullptr;
@@ -213,7 +230,7 @@ void GTA4MotionBridge::UpdateLocked(uint32_t user_index) {
     }
     snapshot_.fresh = last_sample_seen_ != std::chrono::steady_clock::time_point{} &&
                       now - last_sample_seen_ <= stale_timeout;
-    snapshot_.controls_enabled = snapshot_.fresh && REXCVAR_GET(gta4_motion_enabled);
+    snapshot_.controls_enabled = snapshot_.fresh;
     if (!snapshot_.fresh) {
       snapshot_.pitch_axis = 0.0f;
       snapshot_.roll_axis = 0.0f;
@@ -278,7 +295,7 @@ void GTA4MotionBridge::UpdateLocked(uint32_t user_index) {
 
   snapshot_.sensor_available = true;
   snapshot_.fresh = true;
-  snapshot_.controls_enabled = REXCVAR_GET(gta4_motion_enabled);
+  snapshot_.controls_enabled = true;
   snapshot_.sequence = motion.sequence;
   snapshot_.acceleration_m_s2 = acceleration;
   if (motion.valid_samples & rex::input::kMotionSensorGyroscope) {

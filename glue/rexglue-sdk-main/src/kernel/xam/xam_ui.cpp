@@ -14,6 +14,7 @@
 #include <rex/string.h>
 #include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xam/content_manager.h>
 
 #include <imgui.h>
 
@@ -550,6 +551,84 @@ u32 XamShowCommunitySessionsUI_entry(u32 r3, u32 r4) {
   return X_ERROR_FUNCTION_FAILED;
 }
 
+std::string MarketplaceStatusText() {
+  auto* kernel_state = REX_KERNEL_STATE();
+  const auto packages = kernel_state->content_manager()->ListContentForUser(
+      0, kernel_state->user_profile()->xuid(), XContentType::kMarketplaceContent);
+  std::string text =
+      "LibertyRecomp does not purchase or download GTA IV episodes. Install episode data "
+      "from media you own; complete local installations are available to the game.\n\n"
+      "Installed episode packages:";
+  if (packages.empty()) {
+    text += " none";
+  } else {
+    for (const auto& package : packages) {
+      text += "\n- ";
+      text += package.file_name();
+    }
+  }
+  return text;
+}
+
+X_RESULT DispatchMarketplaceNotice(std::string text, mapped_u32 result_ptr,
+                                   mapped_void overlapped) {
+  const auto complete = [result_ptr]() -> X_RESULT {
+    if (result_ptr) *result_ptr = X_HRESULT_FROM_WIN32(X_ERROR_CANCELLED);
+    return X_ERROR_CANCELLED;
+  };
+  if (REXCVAR_GET(headless)) {
+    return xeXamDispatchHeadless(complete, overlapped.guest_address());
+  }
+  const Runtime* emulator = REX_KERNEL_STATE()->emulator();
+  ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
+  if (!imgui_drawer) {
+    return xeXamDispatchHeadless(complete, overlapped.guest_address());
+  }
+  auto close = [result_ptr](MessageBoxDialog*) -> X_RESULT {
+    if (result_ptr) *result_ptr = X_HRESULT_FROM_WIN32(X_ERROR_CANCELLED);
+    return X_ERROR_CANCELLED;
+  };
+  return xeXamDispatchDialog<MessageBoxDialog>(
+      new MessageBoxDialog(imgui_drawer, "GTA IV Marketplace", std::move(text), {"Close"}, 0),
+      close, overlapped.guest_address());
+}
+
+u32 XamShowMarketplaceUI_entry(u32 user_index, u32 entry_point, u64 offer_id,
+                               u32 content_categories, mapped_void overlapped) {
+  REXKRNL_INFO(
+      "XamShowMarketplaceUI(user={}, entry={}, offer={:016X}, categories={:08X}, "
+      "overlapped={:08X})",
+      user_index, entry_point, offer_id, content_categories, overlapped.guest_address());
+  if (user_index != 0) return X_ERROR_NO_SUCH_USER;
+  if (entry_point > 3) return X_ERROR_INVALID_PARAMETER;
+  if (!REX_KERNEL_STATE()->user_profile()->signin_state()) return X_ERROR_NOT_LOGGED_ON;
+  return DispatchMarketplaceNotice(MarketplaceStatusText(), {}, overlapped);
+}
+
+u32 XamShowMarketplaceDownloadItemsUI_entry(
+    u32 user_index, u32 entry_point, mapped_u64 offer_ids, u32 offer_id_count,
+    mapped_u32 result_ptr, mapped_void overlapped, u32 callback, u32 callback_context) {
+  REXKRNL_INFO(
+      "XamShowMarketplaceDownloadItemsUI(user={}, entry={}, offers={:08X}, count={}, "
+      "result={:08X}, overlapped={:08X}, callback={:08X}, context={:08X})",
+      user_index, entry_point, offer_ids.guest_address(), offer_id_count,
+      result_ptr.guest_address(), overlapped.guest_address(), callback, callback_context);
+  if (user_index != 0) return X_ERROR_NO_SUCH_USER;
+  if ((entry_point != 1000 && entry_point != 1001) || !offer_ids || offer_id_count == 0 ||
+      offer_id_count > 6) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!REX_KERNEL_STATE()->user_profile()->signin_state()) return X_ERROR_NOT_LOGGED_ON;
+  for (u32 index = 0; index < offer_id_count; ++index) {
+    REXKRNL_INFO("  GTA IV marketplace requested offer {:016X}", uint64_t(offer_ids[index]));
+  }
+  std::string text = MarketplaceStatusText();
+  text +=
+      "\n\nThe requested Xbox Marketplace offer IDs cannot be mapped to an installed episode "
+      "by the retail executable, so this request was cancelled without downloading data.";
+  return DispatchMarketplaceNotice(std::move(text), result_ptr, overlapped);
+}
+
 uint32_t XamShowMessageBoxUIEx_entry() {
   // TODO(tomc): implement properly
   static bool warned = false;
@@ -571,6 +650,9 @@ REX_EXPORT(__imp__XamShowDeviceSelectorUI, rex::kernel::xam::XamShowDeviceSelect
 REX_EXPORT(__imp__XamShowDirtyDiscErrorUI, rex::kernel::xam::XamShowDirtyDiscErrorUI_entry)
 REX_EXPORT(__imp__XamShowPartyUI, rex::kernel::xam::XamShowPartyUI_entry)
 REX_EXPORT(__imp__XamShowCommunitySessionsUI, rex::kernel::xam::XamShowCommunitySessionsUI_entry)
+REX_EXPORT(__imp__XamShowMarketplaceUI, rex::kernel::xam::XamShowMarketplaceUI_entry)
+REX_EXPORT(__imp__XamShowMarketplaceDownloadItemsUI,
+           rex::kernel::xam::XamShowMarketplaceDownloadItemsUI_entry)
 REX_EXPORT(__imp__XamShowMessageBoxUIEx, rex::kernel::xam::XamShowMessageBoxUIEx_entry)
 
 REX_EXPORT_STUB(__imp__XamIsGuideDisabled);
@@ -628,11 +710,9 @@ REX_EXPORT_STUB(__imp__XamShowKeyboardUIMessenger);
 REX_EXPORT_STUB(__imp__XamShowLiveSignupUI);
 REX_EXPORT_STUB(__imp__XamShowLiveUpsellUI);
 REX_EXPORT_STUB(__imp__XamShowLiveUpsellUIEx);
-REX_EXPORT_STUB(__imp__XamShowMarketplaceDownloadItemsUI);
 REX_EXPORT_STUB(__imp__XamShowMarketplaceGetOrderReceipts);
 REX_EXPORT_STUB(__imp__XamShowMarketplacePurchaseOrderUI);
 REX_EXPORT_STUB(__imp__XamShowMarketplacePurchaseOrderUIEx);
-REX_EXPORT_STUB(__imp__XamShowMarketplaceUI);
 REX_EXPORT_STUB(__imp__XamShowMarketplaceUIEx);
 REX_EXPORT_STUB(__imp__XamShowMessageBox);
 REX_EXPORT_STUB(__imp__XamShowMessageComposeUI);

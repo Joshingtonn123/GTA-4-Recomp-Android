@@ -207,7 +207,9 @@ static_assert_size(XGI_SESSION_SEARCH_EX, 0x24);
 
 struct XGI_SESSION_DETAILS {
   rex::be<uint32_t> object_ptr;
-  rex::be<uint32_t> details_buffer_size;
+  // XSessionGetDetails passes a guest pointer to the caller-owned DWORD size,
+  // not the size value itself. The runtime reads and updates that DWORD.
+  rex::be<uint32_t> details_buffer_size_ptr;
   rex::be<uint32_t> details_ptr;
   rex::be<uint32_t> reserved1;
   rex::be<uint32_t> reserved2;
@@ -224,6 +226,57 @@ struct XGI_SESSION_MIGRATE {
   rex::be<uint32_t> reserved3;
 };
 static_assert_size(XGI_SESSION_MIGRATE, 0x18);
+
+// XSessionArbitrationRegister is marshalled through XGI message 0x000B001A.
+// The title-facing wrapper performs the pointer-to-size query before issuing
+// the message, so this request contains the resolved size value.
+struct XGI_SESSION_ARBITRATION_REGISTER {
+  rex::be<uint32_t> object_ptr;
+  rex::be<uint32_t> flags;
+  rex::be<uint64_t> nonce;
+  rex::be<uint32_t> registration_duration_seconds;
+  rex::be<uint32_t> results_buffer_size;
+  rex::be<uint32_t> results_ptr;
+  rex::be<uint32_t> reserved;
+};
+static_assert_size(XGI_SESSION_ARBITRATION_REGISTER, 0x20);
+
+// Immutable validation snapshot captured on the ordered host dispatcher. The
+// HTTP worker never touches XSession or guest memory; completion revalidates
+// this tuple before committing the terminal roster.
+struct XSESSION_ARBITRATION_CONTEXT {
+  uint64_t session_id = 0;
+  uint64_t nonce = 0;
+  uint32_t registration_duration_seconds = 0;
+  uint32_t flags = 0;
+  uint32_t results_buffer_size = 0;
+  uint32_t results_ptr = 0;
+};
+
+struct XSESSION_REGISTRATION_RESULTS {
+  rex::be<uint32_t> registrant_count;
+  rex::be<uint32_t> registrants_ptr;
+};
+static_assert_size(XSESSION_REGISTRATION_RESULTS, 0x8);
+
+struct alignas(8) XSESSION_REGISTRANT {
+  rex::be<uint64_t> machine_id;
+  rex::be<uint32_t> trustworthy;
+  rex::be<uint32_t> user_count;
+  rex::be<uint32_t> users_ptr;
+};
+static_assert_size(XSESSION_REGISTRANT, 0x18);
+
+// The generated Xbox wrapper reports this fixed capacity: one header, up to
+// 64 machine records, and four local users per machine.
+inline constexpr uint32_t kMaximumArbitrationUsersPerMachine = 4;
+inline constexpr uint32_t kSessionArbitrationResultsSize = 3592;
+inline constexpr uint32_t kMaximumSessionArbitrationDurationSeconds = 300;
+static_assert(kSessionArbitrationResultsSize ==
+              sizeof(XSESSION_REGISTRATION_RESULTS) +
+                  kMaximumSessionMembers * sizeof(XSESSION_REGISTRANT) +
+                  kMaximumSessionMembers * kMaximumArbitrationUsersPerMachine *
+                      sizeof(rex::be<uint64_t>));
 
 struct XGI_SESSION_SEARCH_BY_ID {
   rex::be<uint32_t> user_index;
@@ -268,6 +321,13 @@ class XSession final : public XObject {
   X_RESULT Modify(const XGI_SESSION_MODIFY& request);
   X_RESULT GetDetails(const XGI_SESSION_DETAILS& request);
   X_RESULT Migrate(const XGI_SESSION_MIGRATE& request);
+  X_RESULT ArbitrationRegister(const XGI_SESSION_ARBITRATION_REGISTER& request);
+  X_RESULT PrepareArbitrationRegister(
+      const XGI_SESSION_ARBITRATION_REGISTER& request,
+      XSESSION_ARBITRATION_CONTEXT& context) const;
+  X_RESULT CompleteArbitrationRegister(
+      const XSESSION_ARBITRATION_CONTEXT& context,
+      std::optional<SessionRecord> registered);
 
   static X_RESULT Search(KernelState* kernel_state, XGI_SESSION_SEARCH& request);
   static X_RESULT SearchById(KernelState* kernel_state, XGI_SESSION_SEARCH_BY_ID& request);

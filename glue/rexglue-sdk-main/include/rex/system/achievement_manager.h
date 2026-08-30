@@ -62,6 +62,10 @@ class AchievementManager {
   // explicitly when title-specific timing is required.
   AchievementUnlockResult UnlockAchievement(
       uint32_t id, AchievementNotification notification = AchievementNotification::kSuppress);
+  // Merges a remotely known unlock without a title-facing unlock callback or
+  // notification. The local store records the time of this import; no remote
+  // timestamp is inferred.
+  AchievementUnlockResult ImportUnlockedAchievement(uint32_t id);
   bool ShowAchievementNotification(uint32_t id);
   bool IsUnlocked(uint32_t id) const;
   uint64_t GetUnlockTime(uint32_t id) const;

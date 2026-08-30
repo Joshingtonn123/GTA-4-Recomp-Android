@@ -74,5 +74,51 @@ TEST_CASE("GTA IV native reflection lookup validates role and logical extent") {
                                     target.logical_height) == nullptr);
 }
 
+TEST_CASE("GTA IV native reflection registration identity includes host contract") {
+  const NativeReflectionTarget original = MakeWaterColorRegistration();
+
+  NativeReflectionTarget resized = original;
+  resized.physical_width = 1280;
+  CHECK_FALSE(SameNativeReflectionRegistration(original, resized));
+
+  NativeReflectionTarget resampled = original;
+  resampled.sample_count_override = 4;
+  CHECK_FALSE(SameNativeReflectionRegistration(original, resampled));
+
+  NativeReflectionTarget identical = original;
+  CHECK(SameNativeReflectionRegistration(original, identical));
+}
+
+TEST_CASE("GTA IV native reflection capture content is frame local") {
+  NativeReflectionCaptureState state{};
+  CHECK_FALSE(HasCurrentNativeReflectionCaptureContent(state, 40));
+
+  ClaimNativeReflectionCaptureContent(state, 7, 19, 40, 81, 5, 3);
+  CHECK(HasCurrentNativeReflectionCaptureContent(state, 40));
+  CHECK_FALSE(HasCurrentNativeReflectionCaptureContent(state, 41));
+  CHECK(state.epoch == 7);
+  CHECK(state.write_serial == 19);
+  CHECK(state.command_index == 81);
+  CHECK(state.render_phase == 5);
+  CHECK(state.write_kind == 3);
+
+  ClaimNativeReflectionCaptureContent(state, 8, 23, 41, 4, 6, 2);
+  CHECK_FALSE(HasCurrentNativeReflectionCaptureContent(state, 40));
+  CHECK(HasCurrentNativeReflectionCaptureContent(state, 41));
+  CHECK(state.epoch == 8);
+  CHECK(state.write_serial == 23);
+}
+
+TEST_CASE("GTA IV native reflection storage preserves the guest mip count") {
+  NativeReflectionTarget environment = MakeWaterColorRegistration();
+  environment.family = ReflectionFamily::kEnvironment;
+  environment.logical_width = 256;
+  environment.logical_height = 256;
+  environment.physical_width = 1024;
+  environment.physical_height = 1024;
+
+  CHECK(GetNativeReflectionStorageMipLevelCount(environment, 4) == 4);
+}
+
 }  // namespace
 }  // namespace rex::graphics::gta4_native

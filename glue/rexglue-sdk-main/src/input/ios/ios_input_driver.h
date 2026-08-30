@@ -46,6 +46,7 @@ class IOSInputDriver final : public InputDriver {
  private:
   struct Slot {
     IOSController* ios = nullptr;
+    uint64_t inventory_id = 0;
     X_INPUT_STATE state{};
     uint16_t last_buttons = 0;
     bool state_changed = false;

@@ -22,6 +22,45 @@ struct NativeReflectionTarget {
   uint32_t sample_count_override = 0;
 };
 
+// Reflection render attachments are transient capture workspaces. Their
+// contents are valid only for the native frame in which the title rendered or
+// cleared them. This is deliberately separate from the resolved reflection
+// texture, whose last completed contents may be sampled by later frames.
+struct NativeReflectionCaptureState {
+  uint64_t epoch = 0;
+  uint64_t write_serial = 0;
+  uint32_t frame = 0;
+  size_t command_index = SIZE_MAX;
+  uint32_t render_phase = 0;
+  uint8_t write_kind = 0;
+};
+
+inline bool HasCurrentNativeReflectionCaptureContent(
+    const NativeReflectionCaptureState& state, uint32_t frame) {
+  return state.epoch != 0 && state.write_serial != 0 &&
+         state.frame == frame;
+}
+
+inline void ClaimNativeReflectionCaptureContent(
+    NativeReflectionCaptureState& state, uint64_t epoch,
+    uint64_t write_serial, uint32_t frame, size_t command_index,
+    uint32_t render_phase, uint8_t write_kind) {
+  state.epoch = epoch;
+  state.write_serial = write_serial;
+  state.frame = frame;
+  state.command_index = command_index;
+  state.render_phase = render_phase;
+  state.write_kind = write_kind;
+}
+
+// Raising reflection resolution must not widen the title-visible LOD range.
+// GTA authors and resolves the complete mip contract; native storage mirrors
+// that count exactly at the higher physical resolution.
+inline uint32_t GetNativeReflectionStorageMipLevelCount(
+    const NativeReflectionTarget&, uint32_t guest_mip_levels) {
+  return guest_mip_levels;
+}
+
 using NativeReflectionRegistry =
     std::unordered_map<uint32_t, NativeReflectionTarget>;
 
@@ -30,7 +69,12 @@ inline bool SameNativeReflectionRegistration(
     const NativeReflectionTarget& right) {
   return left.family == right.family && left.role == right.role &&
          left.wrapper == right.wrapper && left.surface == right.surface &&
-         left.texture == right.texture;
+         left.texture == right.texture &&
+         left.logical_width == right.logical_width &&
+         left.logical_height == right.logical_height &&
+         left.physical_width == right.physical_width &&
+         left.physical_height == right.physical_height &&
+         left.sample_count_override == right.sample_count_override;
 }
 
 // A color reflection is exposed through an attachment surface and a sampled

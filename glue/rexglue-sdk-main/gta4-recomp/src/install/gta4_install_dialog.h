@@ -48,12 +48,14 @@ class InstallDialog final : public rex::ui::ImGuiDialog {
     std::filesystem::path tlad;
     std::filesystem::path tbogt;
     std::string error;
+    GameSourceInspectionWorker inspection_worker;
   };
 
   void ShowFilePicker(PickerTarget target);
   void ShowFolderPicker(PickerTarget target);
   void StartInstall();
   void FinishInstallIfNeeded();
+  void DrawBaseInspection();
   void DrawSourceRow(const char* label, PickerTarget target, const std::filesystem::path& value,
                      bool required);
   void AssignPickedPath(PickerTarget target, std::filesystem::path path);

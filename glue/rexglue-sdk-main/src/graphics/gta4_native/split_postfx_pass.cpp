@@ -292,7 +292,8 @@ bool SplitPostFxPass::Record(VkCommandBuffer command_buffer, const ui::vulkan::V
                              VkImageView depth_view, VkImageView stipple_mask_view,
                              VkFormat color_format, PostFxExtent extent,
                              const SplitPostFxParameters& parameters,
-                             PostFxResourcePool& resources) {
+                             PostFxResourcePool& resources,
+                             const NativeGpuTimingSink* timing) {
   if (!destination_image || !destination_view || !depth_view || !stipple_mask_view ||
       !resources.scene_snapshot().view ||
       !resources.EnsureSplitPostFxImages(device, color_format, extent)) {
@@ -307,21 +308,42 @@ bool SplitPostFxPass::Record(VkCommandBuffer command_buffer, const ui::vulkan::V
   auto& half_pong = resources.split_half_pong();
   auto& full_output = resources.split_full_output();
   const VkImageView snapshot = resources.scene_snapshot().view;
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kPostFxStipple);
+  }
   if (!RecordPass(command_buffer, device, descriptor_pool, pipeline,
                   {snapshot, snapshot, depth_view, stipple_mask_view}, full_ping, 0, extent,
-                  parameters) ||
-      !RecordPass(command_buffer, device, descriptor_pool, pipeline,
+                  parameters)) {
+    return false;
+  }
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kPostFxBokeh);
+  }
+  if (!RecordPass(command_buffer, device, descriptor_pool, pipeline,
                   {full_ping.view, full_ping.view, depth_view, stipple_mask_view}, half_ping, 1,
-                  extent, parameters) ||
-      !RecordPass(command_buffer, device, descriptor_pool, pipeline,
+                  extent, parameters)) {
+    return false;
+  }
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kPostFxBlur);
+  }
+  if (!RecordPass(command_buffer, device, descriptor_pool, pipeline,
                   {half_ping.view, half_ping.view, depth_view, stipple_mask_view}, half_pong, 2,
-                  half_ping.extent, parameters) ||
-      !RecordPass(command_buffer, device, descriptor_pool, pipeline,
+                  half_ping.extent, parameters)) {
+    return false;
+  }
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kPostFxDofCombine);
+  }
+  if (!RecordPass(command_buffer, device, descriptor_pool, pipeline,
                   {full_ping.view, half_pong.view, depth_view, stipple_mask_view}, full_output, 3,
                   extent, parameters)) {
     return false;
   }
 
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kPostFxCopyBack);
+  }
   const auto& dfn = device->functions();
   std::array<VkImageMemoryBarrier, 2> barriers{};
   for (VkImageMemoryBarrier& barrier : barriers) {

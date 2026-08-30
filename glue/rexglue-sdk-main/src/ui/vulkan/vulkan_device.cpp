@@ -324,6 +324,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceVulkan12Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>
       features_1_2;
+  VkPhysicalDeviceVulkan12Properties properties_1_2 = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
   VulkanFeatures<VkPhysicalDeviceVulkan13Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES>
       features_1_3;
@@ -358,6 +360,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
       features_1_2.Link(supported_features_2, device_create_info);
+      properties_1_2.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_1_2;
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
       features_1_3.Link(supported_features_2, device_create_info);
@@ -645,6 +649,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorStorageBuffers)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorSampledImages)
   XE_UI_VULKAN_LIMIT(maxPerStageResources)
+  XE_UI_VULKAN_LIMIT(maxDescriptorSetSamplers)
+  XE_UI_VULKAN_LIMIT(maxDescriptorSetSampledImages)
+  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxUpdateAfterBindDescriptorsInAllPools)
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxPerStageDescriptorUpdateAfterBindSamplers)
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxPerStageDescriptorUpdateAfterBindSampledImages)
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxPerStageUpdateAfterBindResources)
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxDescriptorSetUpdateAfterBindSamplers)
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxDescriptorSetUpdateAfterBindSampledImages)
+  }
   XE_UI_VULKAN_LIMIT(maxVertexOutputComponents)
   XE_UI_VULKAN_LIMIT(maxTessellationEvaluationOutputComponents)
   XE_UI_VULKAN_LIMIT(maxGeometryInputComponents)
@@ -711,6 +725,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (with_native_shader_support) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, runtimeDescriptorArray);
       XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingPartiallyBound);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingSampledImageUpdateAfterBind);
+      // Vulkan uses descriptorBindingSampledImageUpdateAfterBind for sampler,
+      // combined-image-sampler and sampled-image descriptors; there is no
+      // separate VkPhysicalDeviceVulkan12Features sampler member.
+      device->properties_.descriptorBindingSamplerUpdateAfterBind =
+          features_1_2.supported.descriptorBindingSampledImageUpdateAfterBind;
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingVariableDescriptorCount);
       XE_UI_VULKAN_FEATURE_2(features_1_2, bufferDeviceAddress);
     }
   } else {

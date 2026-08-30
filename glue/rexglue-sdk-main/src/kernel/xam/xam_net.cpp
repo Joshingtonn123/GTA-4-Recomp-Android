@@ -19,6 +19,8 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <ranges>
+#include <vector>
 
 #if REX_PLATFORM_MAC
 #include <sys/select.h>
@@ -39,6 +41,9 @@
 #include <rex/system/xsocket.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+
+#include "../../system/xam/live_compatibility_internal.h"
+#include "xam_qos_internal.h"
 
 #if REX_PLATFORM_WIN32
 // NOTE: must be included last as it expects windows.h to already be included.
@@ -141,7 +146,9 @@ enum XNetQosInfoFlags : uint8_t {
   XNET_QOS_INFO_TARGET_CONTACTED = 0x02,
 };
 
-constexpr uint32_t kMaximumQosTargets = 64;
+static_assert(detail::kXnqosHeaderBytes == offsetof(XNQOS, info));
+static_assert(detail::kXnqosInfoBytes == sizeof(XNQOSINFO));
+static_assert(detail::kXnqosTitleDataBytes == rex::system::xam::kQosTitleDataSize);
 
 struct Xsockaddr_t {
   rex::be<uint16_t> sa_family;
@@ -518,20 +525,35 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   }
   addr_ptr.Zero();
   const auto* live = REX_KERNEL_STATE()->live_compatibility();
-  if (!live || !live->available()) {
+  if (!live || !live->signed_in()) {
     return XnAddrStatus::XNET_GET_XNADDR_NONE;
   }
 
   addr_ptr->ina.s_addr = live->local_ipv4();
-  addr_ptr->inaOnline.s_addr = live->local_ipv4();
-  addr_ptr->wPortOnline = live->online_port();
   std::memcpy(addr_ptr->abEnet, live->identity().ethernet_address.data(),
               live->identity().ethernet_address.size());
-  rex::be<uint64_t> machine_id = live->identity().machine_id;
-  std::memcpy(addr_ptr->abOnline, &machine_id, sizeof(machine_id));
 
-  return XnAddrStatus::XNET_GET_XNADDR_STATIC | XnAddrStatus::XNET_GET_XNADDR_GATEWAY |
-         XnAddrStatus::XNET_GET_XNADDR_DNS | XnAddrStatus::XNET_GET_XNADDR_ONLINE;
+  uint32_t status = XnAddrStatus::XNET_GET_XNADDR_STATIC |
+                    XnAddrStatus::XNET_GET_XNADDR_GATEWAY |
+                    XnAddrStatus::XNET_GET_XNADDR_DNS;
+  if (live->available()) {
+    const auto local_member =
+        live->FindLocalSessionMember(live->active_session_id());
+    // Community peers exchange inaOnline through GTA's normal XNet
+    // handshake. It must be the directory-assigned relay address, while ina
+    // above remains the machine's actual local address. LAN/in-memory keep
+    // advertising the machine endpoint even if a session record contains a
+    // directory route.
+    const auto online_endpoint = rex::system::xam::detail::SelectTitleOnlineEndpoint(
+        live->config().backend, live->local_ipv4(), live->online_port(),
+        local_member);
+    addr_ptr->inaOnline.s_addr = online_endpoint.ipv4;
+    addr_ptr->wPortOnline = online_endpoint.port;
+    rex::be<uint64_t> machine_id = live->identity().machine_id;
+    std::memcpy(addr_ptr->abOnline, &machine_id, sizeof(machine_id));
+    status |= XnAddrStatus::XNET_GET_XNADDR_ONLINE;
+  }
+  return status;
 }
 
 u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
@@ -752,7 +774,7 @@ struct XEthernetStatus {
 
 u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
   const auto* live = REX_KERNEL_STATE()->live_compatibility();
-  if (!live || !live->available()) {
+  if (!live || !live->signed_in()) {
     return 0;
   }
   return XEthernetStatus::XNET_ETHERNET_LINK_ACTIVE | XEthernetStatus::XNET_ETHERNET_LINK_100MBPS |
@@ -841,10 +863,30 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
   return 0;
 }
 
-u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
-                               u32 flags) {
-  const auto* live = REX_KERNEL_STATE()->live_compatibility();
-  return live && live->available() ? X_ERROR_SUCCESS : 0x276D;  // WSANOTINITIALISED
+u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size,
+                               u32 bits_per_second, u32 flags) {
+  auto* live = REX_KERNEL_STATE()->live_compatibility();
+  if (!live || !live->available() || !live->qos_service()) {
+    return 0x276D;  // WSANOTINITIALISED
+  }
+  if (!id) return 0x2726;  // WSAEINVAL
+  auto* key_id = id.as<XNET_KEY_ID*>();
+  if (!key_id) return 0x2726;
+  const uint64_t session_id = ReadKeyId(*key_id);
+  const auto exchange_key = live->RegisteredKey(session_id);
+  if (!session_id || !exchange_key) return 0x2726;
+
+  const auto command = detail::DecodeQosListenCommand(
+      flags, data ? data.as<const uint8_t*>() : nullptr, data_size,
+      bits_per_second);
+  if (!command) return 0x2726;
+  if (command->release) {
+    return live->qos_service()->Close(session_id, *exchange_key) ? X_ERROR_SUCCESS : 0x274C;
+  }
+  return live->qos_service()->UpdateListener(session_id, *exchange_key,
+                                              command->update)
+             ? X_ERROR_SUCCESS
+             : 0x274C;
 }
 
 u32 NetDll_XNetQosLookup_entry(u32 caller, u32 remote_console_count,
@@ -862,21 +904,23 @@ u32 NetDll_XNetQosLookup_entry(u32 caller, u32 remote_console_count,
     return 0x276D;  // WSANOTINITIALISED
   }
 
-  const uint64_t total_count_wide = static_cast<uint64_t>(remote_console_count) + gateway_count;
-  if (total_count_wide > kMaximumQosTargets) {
+  // GTA IV's only generated caller deliberately passes zero here. The title
+  // uses the service-selected/default probe policy rather than requesting a
+  // fixed probe count, so zero is not an invalid parameter for this title.
+  if (gateway_count || gateways || service_ids || !remote_console_count ||
+      remote_console_count > rex::system::xam::kMaximumQosTargets) {
     return 0x2726;  // WSAEINVAL
   }
-  const uint32_t total_count = static_cast<uint32_t>(total_count_wide);
+  const uint32_t total_count = remote_console_count;
   if (remote_console_count && (!remote_address_ptrs || !session_id_ptrs || !remote_key_ptrs)) {
-    return 0x2726;  // WSAEINVAL
-  }
-  if (gateway_count && (!gateways || !service_ids)) {
     return 0x2726;  // WSAEINVAL
   }
 
   auto* remote_addresses = remote_address_ptrs.as<rex::be<uint32_t>*>();
   auto* session_ids = session_id_ptrs.as<rex::be<uint32_t>*>();
   auto* remote_keys = remote_key_ptrs.as<rex::be<uint32_t>*>();
+  std::vector<rex::system::xam::QosTarget> targets;
+  targets.reserve(remote_console_count);
   for (uint32_t index = 0; index < remote_console_count; ++index) {
     auto* address = REX_KERNEL_MEMORY()->TranslateVirtual<XNADDR*>(remote_addresses[index]);
     auto* session_id = REX_KERNEL_MEMORY()->TranslateVirtual<XNET_KEY_ID*>(session_ids[index]);
@@ -903,35 +947,25 @@ u32 NetDll_XNetQosLookup_entry(u32 caller, u32 remote_console_count,
     if (route.session_id) {
       live->RegisterKey(route.session_id, remote_key->value);
     }
+    targets.push_back({.session_id = route.session_id, .exchange_key = remote_key->value});
   }
 
-  const size_t allocation_size =
-      offsetof(XNQOS, info) + sizeof(XNQOSINFO) * static_cast<size_t>(total_count);
-  if (allocation_size > std::numeric_limits<uint32_t>::max()) {
-    return 0x2747;  // WSAENOBUFS
-  }
+  auto* qos_service = live->qos_service();
+  if (!qos_service) return 0x276D;
+  const std::vector<rex::system::xam::QosResult> results = qos_service->Lookup(targets);
+  if (results.size() != targets.size()) return 0x274C;
+  const auto allocation_size = detail::QosGuestAllocationSize(results);
+  if (!allocation_size) return 0x2747;
   const uint32_t qos_address =
-      REX_KERNEL_MEMORY()->SystemHeapAlloc(static_cast<uint32_t>(allocation_size));
+      REX_KERNEL_MEMORY()->SystemHeapAlloc(*allocation_size);
   if (!qos_address) {
     return 0x2747;  // WSAENOBUFS
   }
-  auto* qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_address);
-  std::memset(qos, 0, allocation_size);
-  qos->count = total_count;
-  qos->count_pending = 0;
-
-  const uint16_t completed_probes = static_cast<uint16_t>(
-      std::min(probe_count, static_cast<uint32_t>(std::numeric_limits<uint16_t>::max())));
-  const uint32_t reported_bandwidth = bits_per_second ? bits_per_second : 1000000;
-  for (uint32_t index = 0; index < total_count; ++index) {
-    auto& info = qos->info[index];
-    info.flags = XNET_QOS_INFO_COMPLETE | XNET_QOS_INFO_TARGET_CONTACTED;
-    info.probes_xmit = completed_probes;
-    info.probes_recv = completed_probes;
-    info.rtt_min_in_msecs = 10;
-    info.rtt_med_in_msecs = 10;
-    info.up_bits_per_sec = reported_bandwidth;
-    info.down_bits_per_sec = reported_bandwidth;
+  auto* qos = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(qos_address);
+  if (!qos || !detail::WriteQosGuestAllocation(
+                  std::span<uint8_t>(qos, *allocation_size), qos_address, results)) {
+    REX_KERNEL_MEMORY()->SystemHeapFree(qos_address);
+    return 0x2747;
   }
   *qos_out = qos_address;
 
@@ -1065,6 +1099,33 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
     live->ObserveBoundPort(socket->bound_port());
   }
 
+  return 0;
+}
+
+i32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> name,
+                             mapped_u32 name_len) {
+  if (!name || !name_len || *name_len < sizeof(XSOCKADDR)) {
+    XThread::SetLastError(0x271E);  // WSAEFAULT
+    return -1;
+  }
+
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    XThread::SetLastError(0x2736);  // WSAENOTSOCK
+    return -1;
+  }
+
+  N_XSOCKADDR native_name{};
+  int native_name_len = static_cast<int>(*name_len);
+  const int ret = socket->GetSockName(&native_name, &native_name_len);
+  if (ret < 0) {
+    XThread::SetLastError(rex::net::socket_last_error());
+    return -1;
+  }
+
+  name->address_family = native_name.address_family;
+  std::memcpy(name->sa_data, native_name.sa_data, sizeof(name->sa_data));
+  *name_len = static_cast<uint32_t>(native_name_len);
   return 0;
 }
 
@@ -1496,6 +1557,7 @@ REX_EXPORT(__imp__NetDll_shutdown, rex::kernel::xam::NetDll_shutdown_entry)
 REX_EXPORT(__imp__NetDll_setsockopt, rex::kernel::xam::NetDll_setsockopt_entry)
 REX_EXPORT(__imp__NetDll_ioctlsocket, rex::kernel::xam::NetDll_ioctlsocket_entry)
 REX_EXPORT(__imp__NetDll_bind, rex::kernel::xam::NetDll_bind_entry)
+REX_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry)
 REX_EXPORT(__imp__NetDll_connect, rex::kernel::xam::NetDll_connect_entry)
 REX_EXPORT(__imp__NetDll_listen, rex::kernel::xam::NetDll_listen_entry)
 REX_EXPORT(__imp__NetDll_accept, rex::kernel::xam::NetDll_accept_entry)
@@ -1610,5 +1672,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
 REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
 REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
 REX_EXPORT_STUB(__imp__NetDll_getpeername);
-REX_EXPORT_STUB(__imp__NetDll_getsockname);
 REX_EXPORT_STUB(__imp__NetDll_getsockopt);

@@ -477,9 +477,9 @@ void ImGuiDrawer::OnKeyUp(KeyEvent& e) {
 
 void ImGuiDrawer::OnKeyChar(KeyEvent& e) {
   auto& io = GetIO();
-  // TODO(Triang3l): Accept the Unicode character.
   unsigned int character = static_cast<unsigned int>(e.virtual_key());
-  if (character > 0 && character < 0x10000) {
+  const bool surrogate = character >= 0xD800 && character <= 0xDFFF;
+  if (character > 0 && character <= 0x10FFFF && !surrogate) {
     io.AddInputCharacter(character);
     e.set_handled(true);
   }
@@ -554,8 +554,14 @@ void ImGuiDrawer::OnMouseWheel(MouseEvent& e) {
 void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
   auto& io = GetIO();
   TouchEvent::Action action = e.action();
-  uint32_t pointer_id = e.pointer_id();
+  uint64_t pointer_id = e.pointer_id();
   if (action == TouchEvent::Action::kDown) {
+    // Pointer ownership is decided only on Down. This prevents ImGui capture
+    // changing mid-gesture from swallowing the terminal event of a pointer
+    // that was already passed through to the title.
+    if (!io.WantCaptureMouse) {
+      return;
+    }
     // The latest pointer needs to be controlling the ImGui mouse.
     if (touch_pointer_id_ == TouchEvent::kPointerIDNone) {
       // Switching from the mouse to touch input.
@@ -570,6 +576,7 @@ void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
       return;
     }
   }
+  e.set_handled(true);
   UpdateMousePosition(e.x(), e.y());
   if (action == TouchEvent::Action::kUp || action == TouchEvent::Action::kCancel) {
     io.MouseDown[0] = false;

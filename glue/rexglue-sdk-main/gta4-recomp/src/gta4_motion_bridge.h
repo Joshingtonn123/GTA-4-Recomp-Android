@@ -72,6 +72,8 @@ class GTA4MotionBridge {
   bool filter_initialized_ = false;
   bool calibrated_ = false;
   bool calibration_pending_ = false;
+  bool master_enabled_known_ = false;
+  bool master_enabled_ = false;
   float neutral_pitch_radians_ = 0.0f;
   float neutral_roll_radians_ = 0.0f;
 

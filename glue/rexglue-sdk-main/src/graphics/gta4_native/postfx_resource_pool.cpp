@@ -8,6 +8,11 @@
 
 namespace rex::graphics::gta4_native {
 
+bool PostFxResourcePool::RequiresImageRecreation(VkFormat format, PostFxExtent extent,
+                                                 const Image& image) {
+  return image.image && (image.format != format || image.extent != extent);
+}
+
 void PostFxResourcePool::DestroyImage(const ui::vulkan::VulkanDevice* device, Image& image) {
   if (!device) {
     return;
@@ -61,7 +66,7 @@ bool PostFxResourcePool::EnsureImage(const ui::vulkan::VulkanDevice* device, VkF
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(
           device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image.image,
-          image.memory)) {
+          image.memory, &image.memory_type, &image.allocation_size)) {
     image = {};
     return false;
   }
@@ -83,9 +88,35 @@ bool PostFxResourcePool::EnsureImage(const ui::vulkan::VulkanDevice* device, VkF
   return true;
 }
 
+PostFxResourcePool::MemoryUsage PostFxResourcePool::QueryMemoryUsage() const {
+  MemoryUsage usage;
+  const auto add = [](const Image& image, VkDeviceSize& bytes, uint32_t& count) {
+    if (!image.memory) {
+      return;
+    }
+    bytes += image.allocation_size;
+    ++count;
+  };
+  add(scene_snapshot_, usage.scene_bytes, usage.scene_images);
+  for (const Image* image :
+       {&split_full_ping_, &split_half_ping_, &split_half_pong_, &split_full_output_}) {
+    add(*image, usage.split_bytes, usage.split_images);
+  }
+  for (const Image* image :
+       {&sun_half_prepass_, &sun_half_ping_, &sun_half_pong_, &sun_full_output_}) {
+    add(*image, usage.sun_bytes, usage.sun_images);
+  }
+  return usage;
+}
+
 bool PostFxResourcePool::EnsureSceneSnapshot(const ui::vulkan::VulkanDevice* device,
                                              VkFormat format, PostFxExtent extent) {
   return EnsureImage(device, format, extent, scene_snapshot_);
+}
+
+bool PostFxResourcePool::RequiresSceneSnapshotRecreation(VkFormat format,
+                                                         PostFxExtent extent) const {
+  return RequiresImageRecreation(format, extent, scene_snapshot_);
 }
 
 bool PostFxResourcePool::EnsureSplitPostFxImages(const ui::vulkan::VulkanDevice* device,
@@ -97,6 +128,15 @@ bool PostFxResourcePool::EnsureSplitPostFxImages(const ui::vulkan::VulkanDevice*
          EnsureImage(device, format, extent, split_full_output_);
 }
 
+bool PostFxResourcePool::RequiresSplitPostFxRecreation(VkFormat format,
+                                                       PostFxExtent extent) const {
+  const PostFxExtent half_extent = CalculatePostFxExtent(extent.width, extent.height, 2);
+  return RequiresImageRecreation(format, extent, split_full_ping_) ||
+         RequiresImageRecreation(format, half_extent, split_half_ping_) ||
+         RequiresImageRecreation(format, half_extent, split_half_pong_) ||
+         RequiresImageRecreation(format, extent, split_full_output_);
+}
+
 bool PostFxResourcePool::EnsureSunShaftImages(const ui::vulkan::VulkanDevice* device,
                                               VkFormat format, PostFxExtent extent) {
   const PostFxExtent half_extent = CalculatePostFxExtent(extent.width, extent.height, 2);
@@ -104,6 +144,15 @@ bool PostFxResourcePool::EnsureSunShaftImages(const ui::vulkan::VulkanDevice* de
          EnsureImage(device, format, half_extent, sun_half_ping_) &&
          EnsureImage(device, format, half_extent, sun_half_pong_) &&
          EnsureImage(device, format, extent, sun_full_output_);
+}
+
+bool PostFxResourcePool::RequiresSunShaftRecreation(VkFormat format,
+                                                    PostFxExtent extent) const {
+  const PostFxExtent half_extent = CalculatePostFxExtent(extent.width, extent.height, 2);
+  return RequiresImageRecreation(format, half_extent, sun_half_prepass_) ||
+         RequiresImageRecreation(format, half_extent, sun_half_ping_) ||
+         RequiresImageRecreation(format, half_extent, sun_half_pong_) ||
+         RequiresImageRecreation(format, extent, sun_full_output_);
 }
 
 bool PostFxResourcePool::RecordSceneSnapshot(VkCommandBuffer command_buffer,

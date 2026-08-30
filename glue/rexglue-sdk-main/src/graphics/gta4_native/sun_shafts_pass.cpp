@@ -359,7 +359,8 @@ bool SunShaftsPass::Record(VkCommandBuffer command_buffer,
                            VkDescriptorPool descriptor_pool, VkPipelineCache pipeline_cache,
                            VkImage destination_image, VkImageView destination_view,
                            VkImageView depth_view, VkFormat color_format, PostFxExtent extent,
-                           const SunShaftParameters& parameters, PostFxResourcePool& resources) {
+                           const SunShaftParameters& parameters, PostFxResourcePool& resources,
+                           const NativeGpuTimingSink* timing) {
   if (!parameters.valid) {
     return true;
   }
@@ -375,19 +376,40 @@ bool SunShaftsPass::Record(VkCommandBuffer command_buffer,
   auto& ping = resources.sun_half_ping();
   auto& pong = resources.sun_half_pong();
   auto& output = resources.sun_full_output();
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kSunShaftPrepass);
+  }
   if (!RecordPass(command_buffer, device, descriptor_pool, pipeline,
                   {destination_view, destination_view, depth_view}, prepass, 0, extent,
-                  parameters) ||
-      !RecordPass(command_buffer, device, descriptor_pool, pipeline,
+                  parameters)) {
+    return false;
+  }
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kSunShaftRadialFirst);
+  }
+  if (!RecordPass(command_buffer, device, descriptor_pool, pipeline,
                   {destination_view, prepass.view, depth_view}, ping, 1, prepass.extent,
-                  parameters) ||
-      !RecordPass(command_buffer, device, descriptor_pool, pipeline,
-                  {destination_view, ping.view, depth_view}, pong, 2, ping.extent, parameters) ||
-      !RecordPass(command_buffer, device, descriptor_pool, pipeline,
+                  parameters)) {
+    return false;
+  }
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kSunShaftRadialSecond);
+  }
+  if (!RecordPass(command_buffer, device, descriptor_pool, pipeline,
+                  {destination_view, ping.view, depth_view}, pong, 2, ping.extent, parameters)) {
+    return false;
+  }
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kSunShaftComposite);
+  }
+  if (!RecordPass(command_buffer, device, descriptor_pool, pipeline,
                   {destination_view, pong.view, depth_view}, output, 3, pong.extent, parameters)) {
     return false;
   }
 
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kSunShaftCopyBack);
+  }
   const auto& dfn = device->functions();
   std::array<VkImageMemoryBarrier, 2> barriers{};
   for (VkImageMemoryBarrier& barrier : barriers) {

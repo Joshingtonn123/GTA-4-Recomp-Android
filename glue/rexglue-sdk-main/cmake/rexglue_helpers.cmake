@@ -101,17 +101,29 @@ function(_rexglue_copy_macos_vulkan_runtime target_name runtime_root)
         return()
     endif()
 
+    get_target_property(_rexglue_is_macos_bundle ${target_name} MACOSX_BUNDLE)
+    if(_rexglue_is_macos_bundle)
+        set(_rexglue_runtime_destination
+            "$<TARGET_BUNDLE_CONTENT_DIR:${target_name}>/Resources/vulkan")
+    else()
+        set(_rexglue_runtime_destination
+            "$<TARGET_FILE_DIR:${target_name}>/vulkan")
+    endif()
+
     set(_rexglue_runtime_commands
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target_name}>/vulkan/lib"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target_name}>/vulkan/share/vulkan/icd.d"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${_rexglue_runtime_destination}/lib"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${_rexglue_runtime_destination}/share/vulkan/icd.d"
     )
     foreach(_rexglue_runtime_file IN LISTS _rexglue_runtime_files)
         get_filename_component(_rexglue_runtime_dir "${_rexglue_runtime_file}" DIRECTORY)
         list(APPEND _rexglue_runtime_commands
-            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target_name}>/vulkan/${_rexglue_runtime_dir}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "${_rexglue_runtime_destination}/${_rexglue_runtime_dir}"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${runtime_root}/${_rexglue_runtime_file}"
-                "$<TARGET_FILE_DIR:${target_name}>/vulkan/${_rexglue_runtime_dir}"
+                "${_rexglue_runtime_destination}/${_rexglue_runtime_dir}"
         )
     endforeach()
 

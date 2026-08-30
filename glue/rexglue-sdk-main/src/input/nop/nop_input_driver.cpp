@@ -47,8 +47,8 @@ X_RESULT NopInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
     out_caps->gamepad.thumb_ly = static_cast<int16_t>(0x7FFF);
     out_caps->gamepad.thumb_rx = static_cast<int16_t>(0x7FFF);
     out_caps->gamepad.thumb_ry = static_cast<int16_t>(0x7FFF);
-    out_caps->vibration.left_motor_speed = 0xFFFF;
-    out_caps->vibration.right_motor_speed = 0xFFFF;
+    out_caps->vibration.left_motor_speed = 0;
+    out_caps->vibration.right_motor_speed = 0;
   }
   return X_ERROR_SUCCESS;
 }
@@ -64,12 +64,13 @@ X_RESULT NopInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   return X_ERROR_SUCCESS;
 }
 
-X_RESULT NopInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+X_RESULT NopInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* /*vibration*/) {
   if (user_index != 0) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-  // Accept vibration but do nothing
-  return X_ERROR_SUCCESS;
+  // This virtual fallback has no physical force-feedback output. Returning
+  // success would hide a failure from a real controller driver.
+  return X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
 X_RESULT NopInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,

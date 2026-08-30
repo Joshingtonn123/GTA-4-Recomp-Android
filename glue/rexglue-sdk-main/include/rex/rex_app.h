@@ -114,6 +114,14 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called before cleanup begins. Release custom resources here.
   virtual void OnShutdown() {}
 
+  // Title-owned text editors (for example GTA IV team/all chat) use this to
+  // suspend guest keyboard and pointer polling while ImGui owns text input.
+  // The flag is atomic because the input driver queries it from its poll
+  // thread while title dialogs are opened and closed on the UI thread.
+  void SetTitleInputCaptured(bool captured) {
+    title_input_captured_.store(captured, std::memory_order_release);
+  }
+
   /// Called after path defaults are computed, before Runtime is constructed.
   /// Override to adjust game/user/update data paths programmatically.
   virtual void OnConfigurePaths(PathConfig& paths) { (void)paths; }
@@ -304,6 +312,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::Window> window_;
   std::thread module_thread_;
   std::atomic<bool> shutting_down_{false};
+  std::atomic<bool> title_input_captured_{false};
+  std::atomic<int32_t> input_trace_last_active_state_{-1};
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
 

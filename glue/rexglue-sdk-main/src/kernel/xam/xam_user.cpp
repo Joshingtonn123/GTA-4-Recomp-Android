@@ -13,6 +13,8 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cstring>
+#include <limits>
+#include <ranges>
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
@@ -30,13 +32,30 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+#include <rex/kernel/xam/xgi_stats_abi.h>
+
+#include "xam_user_identity_policy.h"
+
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+REXCVAR_DECLARE(uint32_t, user_country);
 
 namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+namespace {
+
+bool IsGuestRangeValid(uint32_t address, size_t size) {
+  if (!address || !size || size > std::numeric_limits<uint32_t>::max()) return false;
+  const uint64_t end = static_cast<uint64_t>(address) + size - 1;
+  return end <= std::numeric_limits<uint32_t>::max() &&
+         REX_KERNEL_MEMORY()->LookupHeap(address) &&
+         REX_KERNEL_MEMORY()->LookupHeap(static_cast<uint32_t>(end));
+}
+
+}  // namespace
 
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
@@ -233,8 +252,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   bool any_missing = false;
   for (uint32_t i = 0; i < setting_count; ++i) {
     auto setting_id = static_cast<uint32_t>(setting_ids[i]);
-    auto setting = user_profile->GetSetting(setting_id);
-    if (!setting) {
+    if (!user_profile->HasSetting(setting_id)) {
       any_missing = true;
       REXKRNL_ERROR(
           "xeXamUserReadProfileSettingsEx requested unimplemented setting "
@@ -261,10 +279,8 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
                                             buffer_size, needed_header_size);
   for (uint32_t n = 0; n < setting_count; ++n) {
     uint32_t setting_id = setting_ids[n];
-    auto setting = user_profile->GetSetting(setting_id);
 
     std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
-    out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
     if (xuids) {
       out_setting->xuid = user_profile->xuid();
     } else {
@@ -272,8 +288,11 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     }
     out_setting->setting_id = setting_id;
 
-    if (setting && setting->is_set) {
-      setting->Append(&out_setting->data, &out_stream);
+    const auto setting = user_profile->AppendSetting(setting_id, &out_setting->data, &out_stream);
+    if (!setting) {
+      out_setting->from = 0;
+    } else {
+      out_setting->from = !setting->is_set ? 0 : setting->is_title_specific ? 2 : 1;
     }
     ++out_setting;
   }
@@ -309,6 +328,12 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
   if (!setting_count || !settings) {
     return X_ERROR_INVALID_PARAMETER;
   }
+  const uint64_t settings_size =
+      static_cast<uint64_t>(setting_count) * sizeof(X_USER_PROFILE_SETTING);
+  if (settings_size > std::numeric_limits<uint32_t>::max() ||
+      !IsGuestRangeValid(settings.guest_address(), static_cast<size_t>(settings_size))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
 
   if (user_index) {
     // Only support user 0.
@@ -320,8 +345,18 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_NO_SUCH_USER;
   }
 
-  // Update and save settings.
+  // Validate and copy guest-owned buffers before mutating the local profile so
+  // malformed batches never partially update the durable setting set.
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  const uint32_t effective_title_id = title_id ? title_id : REX_KERNEL_STATE()->title_id();
+  struct PendingWrite {
+    uint32_t setting_id;
+    bool is_binary;
+    std::vector<uint8_t> bytes;
+    std::unique_ptr<UserProfile::Setting> scalar;
+  };
+  std::vector<PendingWrite> pending_writes;
+  pending_writes.reserve(setting_count);
 
   for (uint32_t n = 0; n < setting_count; ++n) {
     const X_USER_PROFILE_SETTING& setting = settings[n];
@@ -339,30 +374,122 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     switch (setting_type) {
       case UserProfile::Setting::Type::CONTENT:
       case UserProfile::Setting::Type::BINARY: {
-        uint8_t* binary_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(setting.data.binary.ptr);
-        size_t binary_size = setting.data.binary.size;
+        const uint32_t setting_id = setting.setting_id;
+        const size_t binary_size = setting.data.binary.size;
+        const bool is_gta4_profile = effective_title_id == UserProfile::kGta4TitleId &&
+                                     setting_id == UserProfile::kGta4TitleProfileSettingId;
+        if (is_gta4_profile && setting_type != UserProfile::Setting::Type::BINARY) {
+          return X_ERROR_INVALID_PARAMETER;
+        }
+        if (is_gta4_profile &&
+            binary_size > UserProfile::kGta4TitleProfileMaximumSize) {
+          return X_ERROR_INVALID_PARAMETER;
+        }
         std::vector<uint8_t> bytes;
         if (setting.data.binary.ptr) {
-          // Copy provided data
+          if (binary_size &&
+              !IsGuestRangeValid(setting.data.binary.ptr, binary_size)) {
+            return X_ERROR_INVALID_PARAMETER;
+          }
           bytes.resize(binary_size);
-          std::memcpy(bytes.data(), binary_ptr, binary_size);
+          if (binary_size) {
+            const auto* binary_ptr = REX_KERNEL_MEMORY()->TranslateVirtual<const uint8_t*>(
+                setting.data.binary.ptr);
+            std::memcpy(bytes.data(), binary_ptr, binary_size);
+          }
         } else {
           // Data pointer was NULL, so just fill with zeroes
           bytes.resize(binary_size, 0);
         }
-        user_profile->AddSetting(
-            std::make_unique<xam::UserProfile::BinarySetting>(setting.setting_id, bytes));
+        if (is_gta4_profile && !UserProfile::ValidateGta4TitleProfileBlob(bytes)) {
+          return X_ERROR_INVALID_PARAMETER;
+        }
+        pending_writes.push_back({.setting_id = setting_id,
+                                  .is_binary = true,
+                                  .bytes = std::move(bytes)});
       } break;
-      case UserProfile::Setting::Type::WSTRING:
-      case UserProfile::Setting::Type::DOUBLE:
-      case UserProfile::Setting::Type::FLOAT:
       case UserProfile::Setting::Type::INT32:
+        pending_writes.push_back(
+            {.setting_id = setting.setting_id,
+             .is_binary = false,
+             .scalar = std::make_unique<UserProfile::Int32Setting>(setting.setting_id,
+                                                                    setting.data.s32)});
+        break;
       case UserProfile::Setting::Type::INT64:
+        pending_writes.push_back(
+            {.setting_id = setting.setting_id,
+             .is_binary = false,
+             .scalar = std::make_unique<UserProfile::Int64Setting>(setting.setting_id,
+                                                                    setting.data.s64)});
+        break;
+      case UserProfile::Setting::Type::DOUBLE:
+        pending_writes.push_back(
+            {.setting_id = setting.setting_id,
+             .is_binary = false,
+             .scalar = std::make_unique<UserProfile::DoubleSetting>(setting.setting_id,
+                                                                     setting.data.f64)});
+        break;
+      case UserProfile::Setting::Type::FLOAT:
+        pending_writes.push_back(
+            {.setting_id = setting.setting_id,
+             .is_binary = false,
+             .scalar = std::make_unique<UserProfile::FloatSetting>(setting.setting_id,
+                                                                    setting.data.f32)});
+        break;
       case UserProfile::Setting::Type::DATETIME:
-      default: {
-        REXKRNL_ERROR("XamUserWriteProfileSettings: Unimplemented data type {}", setting_type);
+        pending_writes.push_back(
+            {.setting_id = setting.setting_id,
+             .is_binary = false,
+             .scalar = std::make_unique<UserProfile::DateTimeSetting>(
+                 setting.setting_id, static_cast<int64_t>(setting.data.filetime))});
+        break;
+      case UserProfile::Setting::Type::WSTRING: {
+        const uint32_t byte_count = setting.data.unicode.size;
+        const uint32_t string_ptr = setting.data.unicode.ptr;
+        if (!byte_count) {
+          pending_writes.push_back(
+              {.setting_id = setting.setting_id,
+               .is_binary = false,
+               .scalar = std::make_unique<UserProfile::UnicodeSetting>(setting.setting_id,
+                                                                        std::u16string())});
+          break;
+        }
+        if (!string_ptr || byte_count % sizeof(char16_t) != 0 ||
+            !IsGuestRangeValid(string_ptr, byte_count)) {
+          return X_ERROR_INVALID_PARAMETER;
+        }
+        const size_t unit_count = byte_count / sizeof(char16_t);
+        const auto* source = REX_KERNEL_MEMORY()->TranslateVirtual<const uint8_t*>(string_ptr);
+        std::u16string value;
+        value.reserve(unit_count);
+        for (size_t index = 0; index < unit_count; ++index) {
+          const char16_t unit = static_cast<char16_t>(memory::load_and_swap<uint16_t>(
+              source + index * sizeof(char16_t)));
+          if (!unit) break;
+          value.push_back(unit);
+        }
+        pending_writes.push_back(
+            {.setting_id = setting.setting_id,
+             .is_binary = false,
+             .scalar = std::make_unique<UserProfile::UnicodeSetting>(setting.setting_id,
+                                                                      value)});
       } break;
+      default: {
+        REXKRNL_ERROR("XamUserWriteProfileSettings: invalid data type {}", setting_type);
+        return X_ERROR_INVALID_PARAMETER;
+      }
     };
+  }
+
+  for (auto& write : pending_writes) {
+    if (write.is_binary) {
+      if (!user_profile->WriteGuestBinarySetting(effective_title_id, write.setting_id,
+                                                 std::move(write.bytes))) {
+        return X_ERROR_INVALID_PARAMETER;
+      }
+    } else {
+      user_profile->AddSetting(std::move(write.scalar));
+    }
   }
 
   if (overlapped) {
@@ -434,7 +561,7 @@ u32 XamUserIsOnlineEnabled_entry(u32 user_index) {
     return 0;
   }
   const auto* live = REX_KERNEL_STATE()->live_compatibility();
-  return live && live->available() ? 1 : 0;
+  return live && live->signed_in() ? 1 : 0;
 }
 
 u32 XamUserGetMembershipTier_entry(u32 user_index) {
@@ -444,46 +571,65 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
   if (user_index) {
     return X_ERROR_NO_SUCH_USER;
   }
-  return 6 /* 6 appears to be Gold */;
+  return detail::kGoldMembershipTier;
 }
 
-u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 out_value,
+u32 XamUserGetMembershipTierFromXUID_entry(u64 xuid) {
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  return detail::MembershipTierFromXuid(xuid, user_profile->xuid());
+}
+
+u32 XamUserGetOnlineCountryFromXUID_entry(u64 xuid) {
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  return detail::OnlineCountryFromXuid(xuid, user_profile->xuid(),
+                                       REXCVAR_GET(user_country));
+}
+
+u32 XamUserAreUsersFriends_entry(u32 user_index, u32 xuids_ptr, u32 xuid_count, mapped_u32 out_value,
                                  u32 overlapped_ptr) {
   uint32_t are_friends = 0;
-  X_RESULT result;
+  X_RESULT result = X_ERROR_SUCCESS;
 
-  if (user_index >= 4) {
+  if (user_index >= 4 || !xuids_ptr || !xuid_count || xuid_count > 100 || !out_value) {
     result = X_ERROR_INVALID_PARAMETER;
+  } else if (user_index != 0) {
+    result = X_ERROR_NO_SUCH_USER;
+  } else if (REX_KERNEL_STATE()->user_profile()->signin_state() == 0) {
+    result = X_ERROR_NOT_LOGGED_ON;
   } else {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      if (user_profile->signin_state() == 0) {
-        result = X_ERROR_NOT_LOGGED_ON;
-      } else {
-        // No friends!
-        are_friends = 0;
-        result = X_ERROR_SUCCESS;
-      }
+    auto* live = REX_KERNEL_STATE()->live_compatibility();
+    auto* social = live ? live->social_service() : nullptr;
+    const uint64_t byte_count = static_cast<uint64_t>(xuid_count) * sizeof(rex::be<uint64_t>);
+    const uint64_t end = static_cast<uint64_t>(xuids_ptr) + byte_count - 1;
+    if (!social || end > std::numeric_limits<uint32_t>::max() ||
+        !REX_KERNEL_MEMORY()->LookupHeap(xuids_ptr) ||
+        !REX_KERNEL_MEMORY()->LookupHeap(static_cast<uint32_t>(end))) {
+      result = social ? X_ERROR_INVALID_PARAMETER : X_ERROR_NOT_LOGGED_ON;
     } else {
-      // Only support user 0.
-      result = X_ERROR_NO_SUCH_USER;  // if user is local -> X_ERROR_NOT_LOGGED_ON
+      const auto* guest_xuids =
+          REX_KERNEL_MEMORY()->TranslateVirtual<const rex::be<uint64_t>*>(xuids_ptr);
+      std::vector<uint64_t> xuids;
+      xuids.reserve(xuid_count);
+      for (uint32_t index = 0; index < xuid_count; ++index) xuids.push_back(guest_xuids[index]);
+      const auto relationships = social->AreFriends(xuids);
+      if (relationships.size() != xuids.size()) {
+        result = X_ERROR_FUNCTION_FAILED;
+      } else {
+        are_friends = std::ranges::all_of(relationships, [](bool value) { return value; }) ? 1 : 0;
+      }
     }
   }
 
   if (out_value) {
-    assert_true(!overlapped_ptr);
     *out_value = result == X_ERROR_SUCCESS ? are_friends : 0;
-    return result;
-  } else if (overlapped_ptr) {
-    assert_true(!out_value);
+  }
+  if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
         overlapped_ptr, result == X_ERROR_SUCCESS ? X_ERROR_SUCCESS : X_ERROR_FUNCTION_FAILED,
-        X_HRESULT_FROM_WIN32(result), result == X_ERROR_SUCCESS ? are_friends : 0);
+        X_HRESULT_FROM_WIN32(result), 0);
     return X_ERROR_IO_PENDING;
-  } else {
-    assert_always();
-    return X_ERROR_INVALID_PARAMETER;
   }
+  return result;
 }
 
 u32 XamShowSigninUI_entry(u32 unk, u32 unk_mask) {
@@ -606,7 +752,127 @@ class XStaticAchievementEnumerator : public XEnumerator {
   size_t current_item_ = 0;
 };
 
-u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
+struct XUSER_STATS_SPEC {
+  rex::be<uint32_t> view_id;
+  rex::be<uint32_t> column_count;
+  std::array<rex::be<uint16_t>, 64> column_ids;
+};
+static_assert_size(XUSER_STATS_SPEC, 136);
+
+class XStatsEnumerator final : public XEnumerator {
+ public:
+  XStatsEnumerator(KernelState* kernel_state, std::vector<StatView> views, size_t buffer_size)
+      : XEnumerator(kernel_state, 1, buffer_size),
+        views_(std::move(views)),
+        buffer_size_(buffer_size) {}
+
+  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data,
+                      uint32_t* written_count) override {
+    if (consumed_) return X_ERROR_NO_MORE_FILES;
+    if (!buffer_data) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    if (!detail::WriteGtaStatsResults(std::span<uint8_t>(buffer_data, buffer_size_), buffer_ptr,
+                                      views_)) {
+      REXKRNL_WARN(
+          "gta4-stats-op operation=enumerator-read views={} hresult={:08X}",
+          views_.size(), X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER));
+      return X_ERROR_INSUFFICIENT_BUFFER;
+    }
+    consumed_ = true;
+    if (written_count) *written_count = 1;
+    for (const auto& view : views_) {
+      REXKRNL_INFO(
+          "gta4-stats-op operation=enumerator-read view={:08X} total={} page={} "
+          "hresult={:08X}",
+          view.id, view.total_rows.value_or(static_cast<uint32_t>(view.rows.size())),
+          view.rows.size(), X_E_SUCCESS);
+    }
+    return X_ERROR_SUCCESS;
+  }
+
+ private:
+  std::vector<StatView> views_;
+  size_t buffer_size_;
+  bool consumed_ = false;
+};
+
+u32 XamUserCreateStatsEnumerator_entry(u32 title_id, u32 enumerator_type, u64 pivot,
+                                       u32 row_count, u32 spec_count, u32 specs_ptr,
+                                       mapped_u32 buffer_size_ptr, mapped_u32 handle_ptr) {
+  if (title_id && title_id != REX_KERNEL_STATE()->title_id()) return X_ERROR_INVALID_PARAMETER;
+  if (enumerator_type > 1 || !pivot || !row_count || row_count > 100 || !spec_count ||
+      spec_count > 16 || !specs_ptr || !buffer_size_ptr || !handle_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  const uint64_t specs_bytes = static_cast<uint64_t>(spec_count) * sizeof(XUSER_STATS_SPEC);
+  const uint64_t specs_end = static_cast<uint64_t>(specs_ptr) + specs_bytes - 1;
+  if (specs_end > std::numeric_limits<uint32_t>::max() ||
+      !REX_KERNEL_MEMORY()->LookupHeap(specs_ptr) ||
+      !REX_KERNEL_MEMORY()->LookupHeap(static_cast<uint32_t>(specs_end))) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  auto* live = REX_KERNEL_STATE()->live_compatibility();
+  auto* stats = live ? live->stats_service() : nullptr;
+  const X_RESULT stats_result = detail::GtaStatsServiceResult(
+      live && live->signed_in(), stats != nullptr, stats && stats->ready());
+  if (stats_result != X_ERROR_SUCCESS) return stats_result;
+  const auto* specs = REX_KERNEL_MEMORY()->TranslateVirtual<const XUSER_STATS_SPEC*>(specs_ptr);
+  std::vector<StatView> views;
+  views.reserve(spec_count);
+  for (uint32_t spec_index = 0; spec_index < spec_count; ++spec_index) {
+    const uint32_t view_id = specs[spec_index].view_id;
+    const uint32_t column_count = specs[spec_index].column_count;
+    if (!view_id || column_count > specs[spec_index].column_ids.size()) {
+      return X_ERROR_INVALID_PARAMETER;
+    }
+    std::vector<uint32_t> columns;
+    columns.reserve(column_count);
+    for (uint32_t column_index = 0; column_index < column_count; ++column_index) {
+      columns.push_back(specs[spec_index].column_ids[column_index]);
+    }
+    if (enumerator_type == 0) {
+      const std::array<uint64_t, 1> xuids = {pivot};
+      const std::array<uint32_t, 1> view_ids = {view_id};
+      auto read = stats->Read(xuids, view_ids, columns);
+      if (read.size() != 1) return X_ERROR_FUNCTION_FAILED;
+      views.push_back(std::move(read.front()));
+    } else {
+      if (pivot > std::numeric_limits<uint32_t>::max()) {
+        return X_ERROR_INVALID_PARAMETER;
+      }
+      auto result = stats->Leaderboard(view_id, columns,
+                                       static_cast<uint32_t>(pivot) - 1, row_count, false);
+      if (!result.succeeded()) return X_ERROR_FUNCTION_FAILED;
+      views.push_back({.id = view_id,
+                       .rows = std::move(result.page.rows),
+                       .total_rows = result.page.total});
+    }
+  }
+
+  for (size_t view_index = 0; view_index < views.size(); ++view_index) {
+    REXKRNL_INFO(
+        "gta4-stats-op operation=enumerator-create type={} view={:08X} attributes={} "
+        "total={} page={} hresult={:08X}",
+        enumerator_type, views[view_index].id,
+        static_cast<uint32_t>(specs[view_index].column_count),
+        views[view_index].total_rows.value_or(
+            static_cast<uint32_t>(views[view_index].rows.size())),
+        views[view_index].rows.size(), X_E_SUCCESS);
+  }
+
+  const auto result_size = detail::GtaStatsResultSize(views);
+  if (!result_size) return X_ERROR_INSUFFICIENT_BUFFER;
+  auto enumerator = object_ref<XStatsEnumerator>(
+      new XStatsEnumerator(REX_KERNEL_STATE(), std::move(views), *result_size));
+  const X_STATUS status = enumerator->Initialize(0, 0xFB, 0xB0021, 0, 0);
+  if (XFAILED(status)) return status;
+  *buffer_size_ptr = static_cast<uint32_t>(*result_size);
+  *handle_ptr = enumerator->handle();
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u64 xuid, u32 flags,
                                              u32 offset, u32 count, mapped_u32 buffer_size_ptr,
                                              mapped_u32 handle_ptr) {
   if (!count || !buffer_size_ptr || !handle_ptr) {
@@ -775,10 +1041,16 @@ REX_EXPORT(__imp__XamUserContentRestrictionCheckAccess,
            rex::kernel::xam::XamUserContentRestrictionCheckAccess_entry)
 REX_EXPORT(__imp__XamUserIsOnlineEnabled, rex::kernel::xam::XamUserIsOnlineEnabled_entry)
 REX_EXPORT(__imp__XamUserGetMembershipTier, rex::kernel::xam::XamUserGetMembershipTier_entry)
+REX_EXPORT(__imp__XamUserGetMembershipTierFromXUID,
+           rex::kernel::xam::XamUserGetMembershipTierFromXUID_entry)
+REX_EXPORT(__imp__XamUserGetOnlineCountryFromXUID,
+           rex::kernel::xam::XamUserGetOnlineCountryFromXUID_entry)
 REX_EXPORT(__imp__XamUserAreUsersFriends, rex::kernel::xam::XamUserAreUsersFriends_entry)
 REX_EXPORT(__imp__XamShowSigninUI, rex::kernel::xam::XamShowSigninUI_entry)
 REX_EXPORT(__imp__XamUserCreateAchievementEnumerator,
            rex::kernel::xam::XamUserCreateAchievementEnumerator_entry)
+REX_EXPORT(__imp__XamUserCreateStatsEnumerator,
+           rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
 REX_EXPORT(__imp__XamParseGamerTileKey, rex::kernel::xam::XamParseGamerTileKey_entry)
 REX_EXPORT(__imp__XamReadTileToTexture, rex::kernel::xam::XamReadTileToTexture_entry)
 REX_EXPORT(__imp__XamWriteGamerTile, rex::kernel::xam::XamWriteGamerTile_entry)
@@ -789,7 +1061,6 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
-REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);
@@ -797,8 +1068,6 @@ REX_EXPORT_STUB(__imp__XamUserGetAgeGroup);
 REX_EXPORT_STUB(__imp__XamUserGetCachedUserFlags);
 REX_EXPORT_STUB(__imp__XamUserGetDeviceId);
 REX_EXPORT_STUB(__imp__XamUserGetIndexFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetMembershipTierFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetOnlineCountryFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineLanguageFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineXUIDFromOfflineXUID);
 REX_EXPORT_STUB(__imp__XamUserGetReportingInfo);

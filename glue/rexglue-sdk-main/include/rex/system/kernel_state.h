@@ -89,6 +89,22 @@ struct PPCContext;
 
 namespace rex::system {
 
+namespace host_task_policy {
+
+constexpr X_RESULT kAdmissionFailureResult = X_ERROR_CANCELLED;
+
+constexpr bool CanAdmit(bool accepting, bool running, bool terminating_title) {
+  return accepting && running && !terminating_title;
+}
+
+}  // namespace host_task_policy
+
+enum class HostTaskAdmissionResult {
+  kAccepted,
+  kRejected,
+  kNoMemory,
+};
+
 constexpr memory::fourcc_t kKernelSaveSignature = memory::make_fourcc("KRNL");
 
 class Dispatcher;
@@ -98,6 +114,9 @@ class XModule;
 class XNotifyListener;
 class XThread;
 class UserModule;
+namespace xam {
+class ArbitrationAsyncManager;
+}
 
 // (?), used by KeGetCurrentProcessType
 constexpr uint32_t X_PROCTYPE_IDLE = 0;
@@ -325,6 +344,16 @@ class KernelState {
       std::function<X_RESULT(uint32_t&, uint32_t&)> completion_callback, uint32_t overlapped_ptr,
       std::function<void()> pre_callback = nullptr, std::function<void()> post_callback = nullptr);
 
+  // Runs blocking host work on a bound XHostThread. Accepted work holds up
+  // title/kernel teardown until it has completed, so callbacks may safely use
+  // the worker's PPC context and retained kernel objects.
+  HostTaskAdmissionResult QueueHostTask(std::function<void()> task,
+                                        std::function<void()> admitted_callback = nullptr);
+  void WaitForHostTasks();
+  xam::ArbitrationAsyncManager* arbitration_async_manager() const {
+    return arbitration_async_manager_.get();
+  }
+
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 
@@ -349,6 +378,8 @@ class KernelState {
   void SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uint32_t tls_data_size,
                          uint32_t tls_raw_data_address);
   void LoadAchievementsData();
+  void StartHostTaskWorker();
+  void StopHostTaskWorker();
 
   Runtime* emulator_;
   memory::Memory* memory_;
@@ -393,13 +424,23 @@ class KernelState {
 
   AchievementManager achievement_manager_;
 
+  // Retail arbitration polling is isolated from the sole ordered host-task
+  // dispatcher so unrelated overlapped work can continue.
+  std::unique_ptr<xam::ArbitrationAsyncManager> arbitration_async_manager_;
+
   std::atomic<bool> dispatch_thread_running_;
   std::atomic<bool> terminating_title_{false};
   object_ref<XHostThread> dispatch_thread_;
   // Must be guarded by the global critical region.
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
+  std::condition_variable_any dispatch_idle_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+  size_t dispatch_active_count_ = 0;
+  bool dispatch_accepting_ = false;
+  std::atomic<uint64_t> host_tasks_accepted_{0};
+  std::atomic<uint64_t> host_tasks_completed_{0};
+  std::atomic<uint64_t> host_tasks_rejected_{0};
 
   friend class XObject;
 };

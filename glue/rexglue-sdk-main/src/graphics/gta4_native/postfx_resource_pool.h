@@ -70,18 +70,33 @@ class PostFxResourcePool {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     PostFxExtent extent{};
+    VkDeviceSize allocation_size = 0;
+    uint32_t memory_type = UINT32_MAX;
+  };
+
+  struct MemoryUsage {
+    VkDeviceSize scene_bytes = 0;
+    VkDeviceSize split_bytes = 0;
+    VkDeviceSize sun_bytes = 0;
+    uint32_t scene_images = 0;
+    uint32_t split_images = 0;
+    uint32_t sun_images = 0;
   };
 
   bool EnsureSceneSnapshot(const ui::vulkan::VulkanDevice* device, VkFormat format,
                            PostFxExtent extent);
+  bool RequiresSceneSnapshotRecreation(VkFormat format, PostFxExtent extent) const;
   bool RecordSceneSnapshot(VkCommandBuffer command_buffer, const ui::vulkan::VulkanDevice* device,
                            VkImage source, VkFormat format, VkImageLayout source_layout,
                            PostFxExtent extent);
   bool EnsureSplitPostFxImages(const ui::vulkan::VulkanDevice* device, VkFormat format,
                                PostFxExtent extent);
+  bool RequiresSplitPostFxRecreation(VkFormat format, PostFxExtent extent) const;
   bool EnsureSunShaftImages(const ui::vulkan::VulkanDevice* device, VkFormat format,
                             PostFxExtent extent);
+  bool RequiresSunShaftRecreation(VkFormat format, PostFxExtent extent) const;
   void Destroy(const ui::vulkan::VulkanDevice* device);
+  MemoryUsage QueryMemoryUsage() const;
 
   Image& scene_snapshot() { return scene_snapshot_; }
   const Image& scene_snapshot() const { return scene_snapshot_; }
@@ -97,6 +112,8 @@ class PostFxResourcePool {
  private:
   static bool EnsureImage(const ui::vulkan::VulkanDevice* device, VkFormat format,
                           PostFxExtent extent, Image& image);
+  static bool RequiresImageRecreation(VkFormat format, PostFxExtent extent,
+                                      const Image& image);
   static void DestroyImage(const ui::vulkan::VulkanDevice* device, Image& image);
   Image scene_snapshot_;
   Image split_full_ping_;

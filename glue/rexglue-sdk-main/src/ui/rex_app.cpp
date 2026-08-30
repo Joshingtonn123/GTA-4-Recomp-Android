@@ -32,6 +32,7 @@
 #include <rex/audio/sdl/sdl_audio_system.h>
 #endif
 #include <rex/input/input_system.h>
+#include <rex/input/input_trace.h>
 #include <rex/kernel/init.h>
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
@@ -187,7 +188,15 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
+#if REX_PLATFORM_MAC
+    // A macOS bundle's Contents/MacOS directory is code-signing territory.
+    // Runtime logs placed there make a subsequent incremental build fail to
+    // seal the bundle.  Keep mutable diagnostics with the rest of the title's
+    // user data instead.
+    log_config.log_dir = (user_dir / "logs").string();
+#else
     log_config.log_dir = (exe_dir / "logs").string();
+#endif
   }
 
   rex::InitLogging(log_config);
@@ -279,9 +288,30 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
-          return true;
-        return !imgui_drawer_->GetIO().WantCaptureMouse;
+        const bool title_captured = title_input_captured_.load(std::memory_order_acquire);
+        bool active = !title_captured;
+        bool overlay_present = false;
+        bool imgui_captured = false;
+        if (active &&
+            (debug_overlay_ || console_overlay_ || settings_overlay_ || achievements_overlay_)) {
+          overlay_present = true;
+          const ImGuiIO& io = imgui_drawer_->GetIO();
+          imgui_captured = io.WantCaptureMouse || io.WantCaptureKeyboard || io.WantTextInput;
+          active = !imgui_captured;
+        }
+        if (rex::input::IsInputTraceEnabled()) {
+          const int32_t state = active ? 1 : 0;
+          const int32_t previous = input_trace_last_active_state_.exchange(
+              state, std::memory_order_acq_rel);
+          if (previous != state) {
+            REXLOG_INFO(
+                "input-e2e: seq={} stage=focus-capture owner=app active={} title-captured={} "
+                "overlay-present={} imgui-captured={}",
+                rex::input::NextInputTraceSequence(), active, title_captured, overlay_present,
+                imgui_captured);
+          }
+        }
+        return active;
       });
     }
   }
@@ -525,6 +555,17 @@ std::function<void(PathConfig)> ReXApp::MakeResumeCallback() {
 }
 
 void ReXApp::OnKeyDown(ui::KeyEvent& e) {
+  if (title_input_captured_.load(std::memory_order_acquire)) {
+    if (rex::input::IsInputTraceEnabled()) {
+      REXLOG_INFO("input-e2e: seq={} stage=focus-capture owner=app key=down result=title-captured",
+                  e.input_trace_sequence());
+    }
+    return;
+  }
+  if (rex::input::IsInputTraceEnabled()) {
+    REXLOG_INFO("input-e2e: seq={} stage=focus-capture owner=app key=down result=forwarded",
+                e.input_trace_sequence());
+  }
   rex::ui::ProcessKeyEvent(e);
 }
 

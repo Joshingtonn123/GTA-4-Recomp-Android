@@ -38,17 +38,12 @@ void FrameBuilder::Cancel() {
   active_ = false;
 }
 
-GpuSpanToken FrameBuilder::BeginGpuRange(GpuRange range,
-                                         uint32_t command_index,
-                                         uint32_t begin_query,
-                                         uint32_t end_query) {
-  if (!active_ || EnumIndex(range) >= kGpuRangeCount ||
-      span_count_ >= spans_.size() || begin_query == UINT32_MAX ||
-      end_query == UINT32_MAX ||
-      begin_query >= kMaximumGpuQueriesPerFrame ||
-      end_query >= kMaximumGpuQueriesPerFrame ||
-      begin_query == end_query || query_in_use_[begin_query] ||
-      query_in_use_[end_query] ||
+GpuSpanToken FrameBuilder::BeginGpuRange(GpuRange range, uint32_t command_index,
+                                         uint32_t begin_query, uint32_t end_query) {
+  if (!active_ || EnumIndex(range) >= kGpuRangeCount || span_count_ >= spans_.size() ||
+      begin_query == UINT32_MAX || end_query == UINT32_MAX ||
+      begin_query >= kMaximumGpuQueriesPerFrame || end_query >= kMaximumGpuQueriesPerFrame ||
+      begin_query == end_query || query_in_use_[begin_query] || query_in_use_[end_query] ||
       open_span_count_ >= open_span_slots_.size()) {
     if (active_) {
       AddCounter(Counter::kDroppedGpuRanges);
@@ -72,12 +67,10 @@ GpuSpanToken FrameBuilder::BeginGpuRange(GpuRange range,
 }
 
 bool FrameBuilder::EndGpuRange(GpuSpanToken token) {
-  if (!active_ || !token || token.generation != generation_ ||
-      size_t(token.slot) >= span_count_) {
+  if (!active_ || !token || token.generation != generation_ || size_t(token.slot) >= span_count_) {
     return false;
   }
-  if (!open_span_count_ ||
-      open_span_slots_[open_span_count_ - 1] != token.slot) {
+  if (!open_span_count_ || open_span_slots_[open_span_count_ - 1] != token.slot) {
     return false;
   }
   GpuSpan& span = spans_[token.slot];
@@ -89,11 +82,8 @@ bool FrameBuilder::EndGpuRange(GpuSpanToken token) {
   return true;
 }
 
-bool FrameBuilder::ResolveGpuRange(GpuSpanToken token,
-                                   uint64_t elapsed_ticks,
-                                   bool available) {
-  if (!active_ || !token || token.generation != generation_ ||
-      size_t(token.slot) >= span_count_) {
+bool FrameBuilder::ResolveGpuRange(GpuSpanToken token, uint64_t elapsed_ticks, bool available) {
+  if (!active_ || !token || token.generation != generation_ || size_t(token.slot) >= span_count_) {
     return false;
   }
   GpuSpan& span = spans_[token.slot];
@@ -109,6 +99,19 @@ bool FrameBuilder::ResolveGpuRange(GpuSpanToken token,
   sample_.gpu_ticks[index] += elapsed_ticks;
   ++sample_.gpu_range_counts[index];
   return true;
+}
+
+void FrameBuilder::AddGpuRange(GpuRange range, uint64_t elapsed_ticks, bool available) {
+  if (!active_ || EnumIndex(range) >= kGpuRangeCount) {
+    return;
+  }
+  if (!available) {
+    AddCounter(Counter::kUnavailableGpuRanges);
+    return;
+  }
+  const size_t index = EnumIndex(range);
+  sample_.gpu_ticks[index] += elapsed_ticks;
+  ++sample_.gpu_range_counts[index];
 }
 
 const FrameSample& FrameBuilder::Finish() {
@@ -141,8 +144,20 @@ void FrameBuilder::AddCounter(Counter counter, uint64_t value) {
   sample_.counters[EnumIndex(counter)] += value;
 }
 
+void FrameBuilder::SetCounter(Counter counter, uint64_t value) {
+  if (!active_ || EnumIndex(counter) >= kCounterCount) {
+    return;
+  }
+  sample_.counters[EnumIndex(counter)] = value;
+}
+
 void FrameSampleRing::Clear() {
-  samples_ = {};
+  // Clearing the logical contents is sufficient: CopyOldest/CopyNewest reject
+  // every slot while size_ is zero, and Push overwrites a slot before exposing
+  // it again. Assigning an empty std::array here makes Clang materialize a
+  // roughly 574 KiB zero-filled temporary on the render worker stack. The
+  // worker's guard page can be reached while zeroing that temporary, which made
+  // manually arming a capture fault in __bzero before the first sampled frame.
   head_ = 0;
   size_ = 0;
 }
@@ -174,24 +189,46 @@ bool FrameSampleRing::CopyNewest(size_t offset, FrameSample* sample) const {
 const char* GpuRangeName(GpuRange range) {
   static constexpr std::array<const char*, kGpuRangeCount> kNames = {
       "frame",
+      "frame-setup",
       "texture-preparation",
       "opaque-control",
       "mirror-reflections",
       "water-reflections",
       "environment-reflections",
+      "resolve",
       "depth-resolve",
       "stencil-save",
       "depth-copy",
       "stencil-restore",
+      "light-setup",
       "deferred-light-volumes",
+      "radar",
       "translucent-water-surface",
       "translucent-water-texture",
       "translucent-vehicle-glass",
       "translucent-general-glass",
       "translucent-vehicle-lights",
       "translucent-light-sprites",
+      "translucent-other",
       "composite",
+      "scene-snapshot",
+      "postfx-stipple",
+      "postfx-bokeh",
+      "postfx-blur",
+      "postfx-dof-combine",
+      "postfx-copy-back",
+      "sun-shaft-prepass",
+      "sun-shaft-radial-first",
+      "sun-shaft-radial-second",
+      "sun-shaft-composite",
+      "sun-shaft-copy-back",
+      "smaa-lookup-upload",
+      "smaa-edges",
+      "smaa-weights",
+      "smaa-neighborhood",
       "present",
+      "frame-release",
+      "unattributed",
   };
   const size_t index = EnumIndex(range);
   return index < kNames.size() ? kNames[index] : "unknown";
@@ -199,11 +236,10 @@ const char* GpuRangeName(GpuRange range) {
 
 const char* CpuRangeName(CpuRange range) {
   static constexpr std::array<const char*, kCpuRangeCount> kNames = {
-      "fence-wait",
-      "texture-preparation",
-      "command-recording",
-      "queue-submit",
-      "render-callback",
+      "frame-interval",   "fence-wait",       "housekeeping",    "upload-capacity",
+      "command-setup",   "texture-preparation", "command-recording", "command-finalize",
+      "queue-submit",      "render-callback", "publish",       "presenter-acquire",
+      "presenter-submit",  "presenter-present", "presenter-total", "outside-renderer",
   };
   const size_t index = EnumIndex(range);
   return index < kNames.size() ? kNames[index] : "unknown";
@@ -212,6 +248,43 @@ const char* CpuRangeName(CpuRange range) {
 const char* CounterName(Counter counter) {
   static constexpr std::array<const char*, kCounterCount> kNames = {
       "upload-bytes",
+      "texture-upload-bytes",
+      "vertex-upload-bytes",
+      "index-upload-bytes",
+      "persistent-buffer-upload-bytes",
+      "persistent-buffer-hits",
+      "persistent-buffer-misses",
+      "persistent-buffer-resident-bytes",
+      "persistent-buffer-live-allocations",
+      "vertex-constant-upload-bytes",
+      "pixel-constant-upload-bytes",
+      "shared-constant-upload-bytes",
+      "draw-up-upload-bytes",
+      "descriptor-sets-allocated",
+      "descriptor-entries-written",
+      "pipeline-lookups",
+      "pipeline-misses",
+      "pipeline-creates",
+      "surface-images-live",
+      "surface-image-bytes",
+      "texture-images-live",
+      "texture-image-bytes",
+      "buffer-capture-reuses",
+      "buffer-shadow-validations",
+      "buffer-shadow-mismatches",
+      "buffer-fast-path-disables",
+      "texture-image-evictions",
+      "texture-image-evicted-bytes",
+      "texture-allocation-retries",
+      "texture-allocation-failures",
+      "texture-heap-usage",
+      "texture-heap-budget",
+      "process-physical-footprint-bytes",
+      "process-resident-bytes",
+      "upload-buffer-capacity-bytes",
+      "upload-buffer-allocation-bytes",
+      "pending-texture-releases",
+      "pipelines-live",
       "unavailable-gpu-ranges",
       "dropped-gpu-ranges",
   };
@@ -219,13 +292,11 @@ const char* CounterName(Counter counter) {
   return index < kNames.size() ? kNames[index] : "unknown";
 }
 
-bool CalculateTimestampDelta(uint64_t begin, uint64_t end,
-                             uint32_t valid_bits, uint64_t* delta) {
+bool CalculateTimestampDelta(uint64_t begin, uint64_t end, uint32_t valid_bits, uint64_t* delta) {
   if (!delta || !valid_bits || valid_bits > 64) {
     return false;
   }
-  const uint64_t mask =
-      valid_bits == 64 ? UINT64_MAX : (uint64_t(1) << valid_bits) - 1;
+  const uint64_t mask = valid_bits == 64 ? UINT64_MAX : (uint64_t(1) << valid_bits) - 1;
   *delta = ((end & mask) - (begin & mask)) & mask;
   return true;
 }

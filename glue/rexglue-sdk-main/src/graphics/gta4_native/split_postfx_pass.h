@@ -6,6 +6,7 @@
 #include <rex/ui/vulkan/api.h>
 
 #include "postfx_resource_pool.h"
+#include "native_gpu_timing.h"
 
 namespace rex::ui::vulkan {
 class VulkanDevice;
@@ -31,7 +32,8 @@ class SplitPostFxPass {
               VkDescriptorPool descriptor_pool, VkPipelineCache pipeline_cache,
               VkImage destination_image, VkImageView destination_view, VkImageView depth_view,
               VkImageView stipple_mask_view, VkFormat color_format, PostFxExtent extent,
-              const SplitPostFxParameters& parameters, PostFxResourcePool& resources);
+              const SplitPostFxParameters& parameters, PostFxResourcePool& resources,
+              const NativeGpuTimingSink* timing = nullptr);
   void Destroy(const ui::vulkan::VulkanDevice* device);
 
  private:

@@ -98,6 +98,12 @@ class VulkanSubmissionTracker {
 
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t UpdateAndGetCompletedSubmission();
+  // Queries submission completion without blocking the calling thread. This
+  // is the required form of backpressure for UI-thread presentation, where a
+  // blocking fence wait may prevent the window system from making progress.
+  bool IsSubmissionComplete(uint64_t submission_index) {
+    return UpdateAndGetCompletedSubmission() >= submission_index;
+  }
 
   // Returns whether the expected GPU signal has actually been reached (rather
   // than some fallback condition) for cases when stronger completeness

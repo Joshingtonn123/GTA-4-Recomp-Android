@@ -12,6 +12,7 @@
 #include <cstdint>
 
 #include <rex/assert.h>
+#include <rex/logging.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -40,9 +41,23 @@ VulkanSubmissionTracker::FenceAcquisition::~FenceAcquisition() {
 }
 
 void VulkanSubmissionTracker::Shutdown() {
-  AwaitAllSubmissionsCompletion();
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+  if (!AwaitAllSubmissionsCompletion()) {
+    const VkResult idle_result = dfn.vkDeviceWaitIdle(device);
+    if (idle_result != VK_SUCCESS && idle_result != VK_ERROR_DEVICE_LOST) {
+      // Destroying pending fences is invalid. Leave them to vkDestroyDevice,
+      // which is the enclosing lifetime owner during fatal shutdown.
+      REXLOG_ERROR(
+          "VulkanSubmissionTracker: cannot prove queue completion result={}; retaining {} "
+          "pending fences for device teardown",
+          int32_t(idle_result), fences_pending_.size());
+      fences_reclaimed_.clear();
+      fences_pending_.clear();
+      fence_acquired_ = VK_NULL_HANDLE;
+      return;
+    }
+  }
   for (VkFence fence : fences_reclaimed_) {
     dfn.vkDestroyFence(device, fence, nullptr);
   }

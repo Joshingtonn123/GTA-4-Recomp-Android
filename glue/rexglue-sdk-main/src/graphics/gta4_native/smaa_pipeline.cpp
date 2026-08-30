@@ -67,7 +67,7 @@ bool CreateImage(const ui::vulkan::VulkanDevice* device, VkFormat format, PostFx
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(
           device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image.image,
-          image.memory)) {
+          image.memory, &image.memory_type, &image.allocation_size)) {
     return false;
   }
 
@@ -315,11 +315,10 @@ bool SmaaPipeline::EnsureStaticResources(const ui::vulkan::VulkanDevice* device,
   }
   const auto create_staging = [&](const void* bytes, VkDeviceSize size,
                                   StagingBuffer& staging) {
-    uint32_t memory_type = 0;
     if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
             device, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             ui::vulkan::util::MemoryPurpose::kUpload, staging.buffer, staging.memory,
-            &memory_type)) {
+            &staging.memory_type, &staging.allocation_size)) {
       return false;
     }
     void* mapping = nullptr;
@@ -327,7 +326,7 @@ bool SmaaPipeline::EnsureStaticResources(const ui::vulkan::VulkanDevice* device,
       return false;
     }
     std::memcpy(mapping, bytes, size_t(size));
-    ui::vulkan::util::FlushMappedMemoryRange(device, staging.memory, memory_type);
+    ui::vulkan::util::FlushMappedMemoryRange(device, staging.memory, staging.memory_type);
     dfn.vkUnmapMemory(vk_device, staging.memory);
     return true;
   };
@@ -337,6 +336,37 @@ bool SmaaPipeline::EnsureStaticResources(const ui::vulkan::VulkanDevice* device,
     return false;
   }
   return true;
+}
+
+SmaaPipeline::MemoryUsage SmaaPipeline::QueryMemoryUsage() const {
+  MemoryUsage usage;
+  const auto add_image = [](const Image& image, VkDeviceSize& bytes, uint32_t& count) {
+    if (!image.memory) {
+      return;
+    }
+    bytes += image.allocation_size;
+    ++count;
+  };
+  for (const Image* image : {&edges_, &weights_, &output_}) {
+    add_image(*image, usage.extent_bytes, usage.extent_images);
+  }
+  for (const Image* image : {&area_, &search_}) {
+    add_image(*image, usage.lookup_bytes, usage.lookup_images);
+  }
+  for (const StagingBuffer* staging : {&area_staging_, &search_staging_}) {
+    if (!staging->memory) {
+      continue;
+    }
+    usage.staging_bytes += staging->allocation_size;
+    ++usage.staging_buffers;
+  }
+  return usage;
+}
+
+bool SmaaPipeline::RequiresExtentResourceRecreation(PostFxExtent extent) const {
+  return (edges_.image && edges_.extent != extent) ||
+         (weights_.image && weights_.extent != extent) ||
+         (output_.image && output_.extent != extent);
 }
 
 bool SmaaPipeline::EnsureExtentResources(const ui::vulkan::VulkanDevice* device,
@@ -404,7 +434,7 @@ bool SmaaPipeline::Record(VkCommandBuffer command_buffer, const ui::vulkan::Vulk
                           VkDescriptorPool frame_descriptor_pool, VkPipelineCache pipeline_cache,
                           VkImage source_image, VkImageView source_view,
                           VkImageLayout& source_layout, PostFxExtent extent, SmaaQuality quality,
-                          Output& result) {
+                          Output& result, const NativeGpuTimingSink* timing) {
   result = {};
   if (!command_buffer || !device || !frame_descriptor_pool || !source_image || !source_view ||
       !extent.width || !extent.height || quality >= SmaaQuality::kCount ||
@@ -438,6 +468,9 @@ bool SmaaPipeline::Record(VkCommandBuffer command_buffer, const ui::vulkan::Vulk
   allocation.pSetLayouts = descriptor_set_layouts_.data();
   if (dfn.vkAllocateDescriptorSets(vk_device, &allocation, sets.data()) != VK_SUCCESS) {
     return false;
+  }
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kSmaaLookupUpload);
   }
   if (!RecordLookupUpload(command_buffer, device)) {
     return false;
@@ -525,8 +558,17 @@ bool SmaaPipeline::Record(VkCommandBuffer command_buffer, const ui::vulkan::Vulk
   };
 
   const size_t quality_index = size_t(quality);
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kSmaaEdges);
+  }
   record_pass(edges_, edge_pipelines_[quality_index], pipeline_layouts_[0], sets[0]);
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kSmaaWeights);
+  }
   record_pass(weights_, weight_pipelines_[quality_index], pipeline_layouts_[1], sets[1]);
+  if (timing) {
+    timing->Switch(command_buffer, performance::GpuRange::kSmaaNeighborhood);
+  }
   record_pass(output_, neighborhood_pipeline_, pipeline_layouts_[2], sets[2]);
   result = {output_.image, output_.view, output_.layout, output_.format, output_.extent};
   return true;

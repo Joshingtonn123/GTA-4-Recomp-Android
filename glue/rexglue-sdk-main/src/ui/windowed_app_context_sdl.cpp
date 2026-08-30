@@ -32,12 +32,34 @@ SDLWindowedAppContext::~SDLWindowedAppContext() {
 }
 
 bool SDLWindowedAppContext::Initialize() {
+  // Touch is routed as a distinct multi-pointer stream. Disable both SDL
+  // compatibility synthesis directions; WindowSDL also filters their reserved
+  // IDs defensively in case a platform backend still produces one.
+  if (!SDL_SetHintWithPriority(SDL_HINT_TOUCH_MOUSE_EVENTS, "0", SDL_HINT_OVERRIDE) ||
+      !SDL_SetHintWithPriority(SDL_HINT_MOUSE_TOUCH_EVENTS, "0", SDL_HINT_OVERRIDE)) {
+    REXLOG_WARN("Failed to disable SDL touch/mouse compatibility synthesis: {}", SDL_GetError());
+  }
 #if REX_PLATFORM_MAC
   // Games need held keys to repeat. SDL's macOS default enables the system
   // accent/character chooser while text input is active, so override it before
   // initializing video (when SDL registers its Cocoa application defaults).
   if (!SDL_SetHintWithPriority(SDL_HINT_MAC_PRESS_AND_HOLD, "0", SDL_HINT_OVERRIDE)) {
     REXLOG_ERROR("Failed to disable the macOS press-and-hold character chooser: {}",
+                 SDL_GetError());
+    return false;
+  }
+
+  // AppKit's system fullscreen Space intentionally constrains a window to the
+  // display safe area on Macs with a camera housing. LibertyRecomp renders its
+  // own fullscreen UI and receives SDL's safe-area rectangle separately, so
+  // use SDL's supported non-Space fullscreen path. On Cocoa this creates a
+  // borderless window from the complete display bounds, allowing the Metal
+  // drawable to cover the auxiliary regions beside the camera housing.
+  // NSPrefersDisplaySafeAreaCompatibilityMode=false in the app bundle prevents
+  // macOS from shrinking those display bounds back to compatibility mode.
+  if (!SDL_SetHintWithPriority(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0",
+                               SDL_HINT_OVERRIDE)) {
+    REXLOG_ERROR("Failed to select full-display macOS fullscreen: {}",
                  SDL_GetError());
     return false;
   }
@@ -154,6 +176,25 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
     case SDL_EVENT_MOUSE_WHEEL: {
       if (WindowSDL* window = GetWindow(event.wheel.windowID)) {
         window->HandleMouseEvent(event);
+      }
+      break;
+    }
+    case SDL_EVENT_FINGER_DOWN:
+    case SDL_EVENT_FINGER_MOTION:
+    case SDL_EVENT_FINGER_UP:
+    case SDL_EVENT_FINGER_CANCELED: {
+      if (WindowSDL* window = GetWindow(event.tfinger.windowID)) {
+        window->HandleTouchEvent(event);
+      } else if (event.type == SDL_EVENT_FINGER_CANCELED) {
+        // Some backends cancel a device after its window association has been
+        // cleared. Give every live window the terminal edge; only the owner
+        // will recognize the device/finger pair.
+        for (const auto& [window_id, window] : windows_) {
+          (void)window_id;
+          if (window) {
+            window->HandleTouchEvent(event);
+          }
+        }
       }
       break;
     }

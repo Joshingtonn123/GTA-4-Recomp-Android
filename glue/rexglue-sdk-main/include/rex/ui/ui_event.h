@@ -73,7 +73,8 @@ class KeyEvent : public UIEvent {
  public:
   explicit KeyEvent(Window* target, VirtualKey virtual_key, int repeat_count, bool prev_state,
                     bool modifier_shift_pressed, bool modifier_ctrl_pressed,
-                    bool modifier_alt_pressed, bool modifier_super_pressed)
+                    bool modifier_alt_pressed, bool modifier_super_pressed,
+                    uint64_t input_trace_sequence = 0)
       : UIEvent(target),
         virtual_key_(virtual_key),
         repeat_count_(repeat_count),
@@ -81,7 +82,8 @@ class KeyEvent : public UIEvent {
         modifier_shift_pressed_(modifier_shift_pressed),
         modifier_ctrl_pressed_(modifier_ctrl_pressed),
         modifier_alt_pressed_(modifier_alt_pressed),
-        modifier_super_pressed_(modifier_super_pressed) {}
+        modifier_super_pressed_(modifier_super_pressed),
+        input_trace_sequence_(input_trace_sequence) {}
   ~KeyEvent() override = default;
 
   bool is_handled() const { return handled_; }
@@ -96,6 +98,7 @@ class KeyEvent : public UIEvent {
   bool is_ctrl_pressed() const { return modifier_ctrl_pressed_; }
   bool is_alt_pressed() const { return modifier_alt_pressed_; }
   bool is_super_pressed() const { return modifier_super_pressed_; }
+  uint64_t input_trace_sequence() const { return input_trace_sequence_; }
 
  private:
   bool handled_ = false;
@@ -108,6 +111,7 @@ class KeyEvent : public UIEvent {
   bool modifier_ctrl_pressed_ = false;
   bool modifier_alt_pressed_ = false;
   bool modifier_super_pressed_ = false;
+  uint64_t input_trace_sequence_ = 0;
 };
 
 class MouseEvent : public UIEvent {
@@ -187,26 +191,40 @@ class TouchEvent : public UIEvent {
 
   // Can be used by event listeners as the value for when there's no current
   // pointer, for example.
-  static constexpr uint32_t kPointerIDNone = UINT32_MAX;
+  static constexpr uint64_t kPointerIDNone = UINT64_MAX;
 
-  explicit TouchEvent(Window* target, uint32_t pointer_id, Action action, float x, float y)
-      : UIEvent(target), pointer_id_(pointer_id), action_(action), x_(x), y_(y) {}
+  explicit TouchEvent(Window* target, uint64_t device_id, uint64_t pointer_id, Action action,
+                      float x, float y, float pressure, uint64_t timestamp_ns)
+      : UIEvent(target),
+        device_id_(device_id),
+        pointer_id_(pointer_id),
+        action_(action),
+        x_(x),
+        y_(y),
+        pressure_(pressure),
+        timestamp_ns_(timestamp_ns) {}
 
   bool is_handled() const { return handled_; }
   void set_handled(bool value) { handled_ = value; }
 
-  uint32_t pointer_id() { return pointer_id_; }
+  uint64_t device_id() const { return device_id_; }
+  uint64_t pointer_id() const { return pointer_id_; }
   Action action() const { return action_; }
   // Can be outside the boundaries of the surface.
   float x() const { return x_; }
   float y() const { return y_; }
+  float pressure() const { return pressure_; }
+  uint64_t timestamp_ns() const { return timestamp_ns_; }
 
  private:
   bool handled_ = false;
-  uint32_t pointer_id_;
+  uint64_t device_id_;
+  uint64_t pointer_id_;
   Action action_;
   float x_;
   float y_;
+  float pressure_;
+  uint64_t timestamp_ns_;
 };
 
 }  // namespace ui

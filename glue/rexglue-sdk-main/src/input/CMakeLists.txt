@@ -2,6 +2,7 @@
 # Input system and drivers for Xbox 360 controller emulation
 
 add_library(rexinput OBJECT
+    absolute_pointer.cpp
     input_system.cpp
     mnk/mnk_input_driver.cpp
     mnk/pointer_motion.cpp

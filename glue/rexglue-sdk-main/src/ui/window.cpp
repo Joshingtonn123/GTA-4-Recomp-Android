@@ -14,6 +14,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/input/input_trace.h>
 #include <rex/logging.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/presenter.h>
@@ -607,24 +608,40 @@ void Window::OnFileDrop(FileDropEvent& e, WindowDestructionReceiver& destruction
 }
 
 void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {
+  if (rex::input::IsInputTraceEnabled()) {
+    REXLOG_INFO("input-e2e: seq={} stage=window-dispatch phase=enter direction=down vk={}",
+                e.input_trace_sequence(), static_cast<uint32_t>(e.virtual_key()));
+  }
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
         listener->OnKeyDown(e);
         return e.is_handled();
       },
       destruction_receiver);
+  if (!destruction_receiver.IsWindowDestroyed() && rex::input::IsInputTraceEnabled()) {
+    REXLOG_INFO("input-e2e: seq={} stage=window-dispatch phase=exit direction=down handled={}",
+                e.input_trace_sequence(), e.is_handled());
+  }
   if (destruction_receiver.IsWindowDestroyed()) {
     return;
   }
 }
 
 void Window::OnKeyUp(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {
+  if (rex::input::IsInputTraceEnabled()) {
+    REXLOG_INFO("input-e2e: seq={} stage=window-dispatch phase=enter direction=up vk={}",
+                e.input_trace_sequence(), static_cast<uint32_t>(e.virtual_key()));
+  }
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
         listener->OnKeyUp(e);
         return e.is_handled();
       },
       destruction_receiver);
+  if (!destruction_receiver.IsWindowDestroyed() && rex::input::IsInputTraceEnabled()) {
+    REXLOG_INFO("input-e2e: seq={} stage=window-dispatch phase=exit direction=up handled={}",
+                e.input_trace_sequence(), e.is_handled());
+  }
   if (destruction_receiver.IsWindowDestroyed()) {
     return;
   }

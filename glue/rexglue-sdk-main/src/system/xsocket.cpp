@@ -33,6 +33,37 @@
 
 namespace rex::system {
 
+namespace {
+
+bool ToNativeIpv4(const N_XSOCKADDR_IN& xbox_address, int xbox_address_length,
+                  sockaddr_in& native_address) {
+  if (xbox_address_length < static_cast<int>(sizeof(N_XSOCKADDR_IN)) ||
+      xbox_address.sin_family != XSocket::X_AF_INET) {
+    return false;
+  }
+  native_address = {};
+#if REX_PLATFORM_MAC
+  native_address.sin_len = sizeof(native_address);
+#endif
+  native_address.sin_family = AF_INET;
+  native_address.sin_port = htons(static_cast<uint16_t>(xbox_address.sin_port));
+  native_address.sin_addr.s_addr =
+      htonl(static_cast<uint32_t>(xbox_address.sin_addr));
+  return true;
+}
+
+bool FromNativeIpv4(const sockaddr_in& native_address,
+                    N_XSOCKADDR_IN& xbox_address) {
+  if (native_address.sin_family != AF_INET) return false;
+  xbox_address.sin_family = XSocket::X_AF_INET;
+  xbox_address.sin_port = ntohs(native_address.sin_port);
+  xbox_address.sin_addr = ntohl(native_address.sin_addr.s_addr);
+  std::memset(xbox_address.x_sin_zero, 0, sizeof(xbox_address.x_sin_zero));
+  return true;
+}
+
+}  // namespace
+
 XSocket::XSocket(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
 
 XSocket::XSocket(KernelState* kernel_state, uint64_t native_handle)
@@ -109,7 +140,16 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
 }
 
 X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
-  int ret = connect(native_handle_, (sockaddr*)name, name_len);
+  if (!name) return X_STATUS_INVALID_PARAMETER;
+  N_XSOCKADDR_IN xbox_address{};
+  std::memcpy(&xbox_address, name, sizeof(xbox_address));
+  sockaddr_in native_address{};
+  if (!ToNativeIpv4(xbox_address, name_len, native_address)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const int ret =
+      connect(native_handle_, reinterpret_cast<const sockaddr*>(&native_address),
+              sizeof(native_address));
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
@@ -118,15 +158,57 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
-  int ret = bind(native_handle_, (sockaddr*)name, name_len);
+  if (!name) return X_STATUS_INVALID_PARAMETER;
+  sockaddr_in native_address{};
+  if (!ToNativeIpv4(*name, name_len, native_address)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const int ret =
+      bind(native_handle_, reinterpret_cast<const sockaddr*>(&native_address),
+           sizeof(native_address));
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
 
   bound_ = true;
-  bound_port_ = name->sin_port;
+  N_XSOCKADDR_IN bound_name{};
+  int bound_name_len = sizeof(bound_name);
+  if (GetSockName(reinterpret_cast<N_XSOCKADDR*>(&bound_name), &bound_name_len) == 0 &&
+      bound_name_len >= static_cast<int>(sizeof(bound_name))) {
+    // A zero-port bind asks the host OS to select an ephemeral port. Peer
+    // datagram routing must use that selected port, not the zero in the bind
+    // request. The wrapper keeps the bytes in Xbox network order while its
+    // value conversion yields the numeric port used by peer routing.
+    bound_port_ = static_cast<uint16_t>(bound_name.sin_port);
+  } else {
+    bound_port_ = static_cast<uint16_t>(name->sin_port);
+  }
 
   return X_STATUS_SUCCESS;
+}
+
+int XSocket::GetSockName(N_XSOCKADDR* name, int* name_len) {
+  if (!name || !name_len ||
+      *name_len < static_cast<int>(sizeof(N_XSOCKADDR_IN))) {
+    return -1;
+  }
+
+  sockaddr_in native_name{};
+  socklen_t native_name_len = sizeof(native_name);
+  const int ret = getsockname(native_handle_, reinterpret_cast<sockaddr*>(&native_name),
+                              &native_name_len);
+  if (ret < 0) {
+    return ret;
+  }
+  if (native_name_len < sizeof(native_name)) {
+    return -1;
+  }
+
+  N_XSOCKADDR_IN xbox_name{};
+  if (!FromNativeIpv4(native_name, xbox_name)) return -1;
+  std::memcpy(name, &xbox_name, sizeof(xbox_name));
+  *name_len = sizeof(xbox_name);
+  return 0;
 }
 
 X_STATUS XSocket::Listen(int backlog) {
@@ -139,17 +221,33 @@ X_STATUS XSocket::Listen(int backlog) {
 }
 
 object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
-  sockaddr n_sockaddr;
-  socklen_t n_name_len = sizeof(sockaddr);
-  uintptr_t ret = accept(native_handle_, &n_sockaddr, &n_name_len);
-  if (ret == -1) {
-    std::memset(name, 0, *name_len);
-    *name_len = 0;
+  if ((name && (!name_len ||
+                *name_len < static_cast<int>(sizeof(N_XSOCKADDR_IN)))) ||
+      (!name && name_len)) {
+    return nullptr;
+  }
+  sockaddr_in native_name{};
+  socklen_t native_name_len = sizeof(native_name);
+  const uintptr_t ret = accept(
+      native_handle_, name ? reinterpret_cast<sockaddr*>(&native_name) : nullptr,
+      name ? &native_name_len : nullptr);
+  if (ret == static_cast<uintptr_t>(rex::net::kInvalidSocket)) {
+    if (name) std::memset(name, 0, *name_len);
+    if (name_len) *name_len = 0;
     return nullptr;
   }
 
-  std::memcpy(name, &n_sockaddr, n_name_len);
-  *name_len = n_name_len;
+  if (name) {
+    N_XSOCKADDR_IN xbox_name{};
+    if (!FromNativeIpv4(native_name, xbox_name)) {
+      rex::net::socket_close(ret);
+      std::memset(name, 0, *name_len);
+      *name_len = 0;
+      return nullptr;
+    }
+    std::memcpy(name, &xbox_name, sizeof(xbox_name));
+    *name_len = sizeof(xbox_name);
+  }
 
   // Create a kernel object to represent the new socket, and copy parameters
   // over.
@@ -219,14 +317,11 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
   int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
                      (sockaddr*)&nfrom, &nfromlen);
   if (ret >= 0 && from) {
-    from->sin_family = nfrom.sin_family;
-    from->sin_addr = ntohl(nfrom.sin_addr.s_addr);  // BE <- BE
-    from->sin_port = ntohs(nfrom.sin_port);
-    std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
+    if (!FromNativeIpv4(nfrom, *from)) return -1;
   }
 
   if (ret >= 0 && from_len) {
-    *from_len = nfromlen;
+    *from_len = sizeof(N_XSOCKADDR_IN);
   }
 
   return ret;
@@ -271,14 +366,15 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
   }
 
   sockaddr_in nto{};
-  if (to) {
-    nto.sin_addr.s_addr = htonl(static_cast<uint32_t>(to->sin_addr));
-    nto.sin_family = to->sin_family;
-    nto.sin_port = htons(static_cast<uint16_t>(to->sin_port));
+  if (to &&
+      (to_len < sizeof(N_XSOCKADDR_IN) ||
+       !ToNativeIpv4(*to, sizeof(N_XSOCKADDR_IN), nto))) {
+    return -1;
   }
 
   return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
-                to ? (sockaddr*)&nto : nullptr, to_len);
+                to ? reinterpret_cast<sockaddr*>(&nto) : nullptr,
+                to ? sizeof(nto) : 0);
 }
 
 bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len) {

@@ -25,6 +25,7 @@ constexpr std::array kCategories = {
     CategoryEntry{"native-probes", Category::kNativeProbes},
     CategoryEntry{"native-translucency", Category::kNativeTranslucency},
     CategoryEntry{"native-profiler", Category::kNativeProfiler},
+    CategoryEntry{"native-memory-profiler", Category::kNativeMemoryProfiler},
     CategoryEntry{"presenter", Category::kPresenter},
     CategoryEntry{"guest-hooks", Category::kGuestHooks},
     CategoryEntry{"physics", Category::kPhysics},

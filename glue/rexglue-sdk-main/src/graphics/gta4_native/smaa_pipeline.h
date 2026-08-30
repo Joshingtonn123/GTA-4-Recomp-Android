@@ -8,6 +8,7 @@
 #include <rex/ui/vulkan/api.h>
 
 #include "postfx_resource_pool.h"
+#include "native_gpu_timing.h"
 
 namespace rex::ui::vulkan {
 class VulkanDevice;
@@ -47,18 +48,34 @@ class SmaaPipeline {
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     PostFxExtent extent{};
+    VkDeviceSize allocation_size = 0;
+    uint32_t memory_type = UINT32_MAX;
+  };
+
+  struct MemoryUsage {
+    VkDeviceSize extent_bytes = 0;
+    VkDeviceSize lookup_bytes = 0;
+    VkDeviceSize staging_bytes = 0;
+    uint32_t extent_images = 0;
+    uint32_t lookup_images = 0;
+    uint32_t staging_buffers = 0;
   };
 
   bool Record(VkCommandBuffer command_buffer, const ui::vulkan::VulkanDevice* device,
               VkDescriptorPool frame_descriptor_pool, VkPipelineCache pipeline_cache,
               VkImage source_image, VkImageView source_view, VkImageLayout& source_layout,
-              PostFxExtent extent, SmaaQuality quality, Output& output);
+              PostFxExtent extent, SmaaQuality quality, Output& output,
+              const NativeGpuTimingSink* timing = nullptr);
+  bool RequiresExtentResourceRecreation(PostFxExtent extent) const;
   void Destroy(const ui::vulkan::VulkanDevice* device);
+  MemoryUsage QueryMemoryUsage() const;
 
  private:
   struct StagingBuffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize allocation_size = 0;
+    uint32_t memory_type = UINT32_MAX;
   };
 
   bool EnsureStaticResources(const ui::vulkan::VulkanDevice* device,

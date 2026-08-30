@@ -33,12 +33,15 @@ class WindowSDL final : public Window {
 
   void* GetNativeWindowHandle() const override;
   bool SetRelativeMouseMode(bool enabled) override;
+  bool GetPhysicalSafeArea(int32_t& x_out, int32_t& y_out, int32_t& width_out,
+                           int32_t& height_out) const override;
 
   // Called by SDLWindowedAppContext on the UI thread.
   void HandleWindowEvent(SDL_Event& event);
   void HandleKeyEvent(SDL_Event& event);
   void HandleTextInputEvent(SDL_Event& event);
   void HandleMouseEvent(SDL_Event& event);
+  void HandleTouchEvent(SDL_Event& event);
 #if REX_PLATFORM_MAC
   void HandleAcceleratedPointerMotion(float delta_x, float delta_y);
 #endif
@@ -64,6 +67,7 @@ class WindowSDL final : public Window {
 
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
   void RequestPaintImpl() override;
+  void RequestPaintAtUITickImpl() override;
 
  private:
   SDLWindowedAppContext& sdl_app_context() const {
@@ -84,9 +88,11 @@ class WindowSDL final : public Window {
 
   void ApplyCursorVisibilityNow();
   void RearmCursorAutoHideTimer();
+  void RefreshPhysicalSafeArea();
 
   SDL_Window* sdl_window_ = nullptr;
   SDL_WindowID sdl_window_id_ = 0;
+  SDL_Rect physical_safe_area_{};
   std::atomic<bool> paint_pending_{false};
 #if REX_PLATFORM_MAC
   void* sdl_metal_view_ = nullptr;

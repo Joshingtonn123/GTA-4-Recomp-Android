@@ -28,6 +28,11 @@
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
 
+#if REX_PLATFORM_MAC
+REXCVAR_DEFINE_BOOL(vulkan_moltenvk_synchronous_queue_submits, false, "UI/Vulkan",
+                    "Process Vulkan queue submissions synchronously in MoltenVK");
+#endif
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -124,6 +129,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   // Name pointers from `requested_extensions` will be used in the enabled
   // extensions vector.
   std::unordered_map<std::string, bool*> requested_extensions;
+#if REX_PLATFORM_MAC && defined(VK_EXT_layer_settings)
+  bool extension_ext_layer_settings = false;
+  requested_extensions.emplace(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME,
+                               &extension_ext_layer_settings);
+#endif
   if (vulkan_instance->api_version_ >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     vulkan_instance->extensions_.ext_1_1_KHR_get_physical_device_properties2 = true;
   } else {
@@ -349,6 +359,25 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   VkInstanceCreateInfo instance_create_info;
   instance_create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   instance_create_info.pNext = nullptr;
+#if REX_PLATFORM_MAC && defined(VK_EXT_layer_settings)
+  VkBool32 moltenvk_synchronous_queue_submits =
+      REXCVAR_GET(vulkan_moltenvk_synchronous_queue_submits) ? VK_TRUE : VK_FALSE;
+  VkLayerSettingEXT moltenvk_queue_setting{};
+  moltenvk_queue_setting.pLayerName = "MoltenVK";
+  moltenvk_queue_setting.pSettingName = "MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS";
+  moltenvk_queue_setting.type = VK_LAYER_SETTING_TYPE_BOOL32_EXT;
+  moltenvk_queue_setting.valueCount = 1;
+  moltenvk_queue_setting.pValues = &moltenvk_synchronous_queue_submits;
+  VkLayerSettingsCreateInfoEXT layer_settings_info{};
+  layer_settings_info.sType = VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT;
+  layer_settings_info.settingCount = 1;
+  layer_settings_info.pSettings = &moltenvk_queue_setting;
+  if (extension_ext_layer_settings) {
+    instance_create_info.pNext = &layer_settings_info;
+    REXLOG_INFO("MoltenVK synchronous queue submissions: {}",
+                moltenvk_synchronous_queue_submits == VK_TRUE);
+  }
+#endif
   instance_create_info.flags = 0;
   // VK_KHR_get_physical_device_properties2 is needed to get the portability
   // subset features.

@@ -57,6 +57,7 @@ InstallDialog::InstallDialog(rex::ui::ImGuiDrawer* drawer, std::filesystem::path
       picker_state_(std::make_shared<PickerState>()) {}
 
 void InstallDialog::OnClose() {
+  picker_state_->inspection_worker.Stop();
   progress_.cancel_requested = true;
   if (install_thread_.joinable()) {
     install_thread_.join();
@@ -68,6 +69,11 @@ void InstallDialog::AssignPickedPath(PickerTarget target, std::filesystem::path 
   switch (target) {
     case PickerTarget::kGame:
       picker_state_->game = std::move(path);
+      if (picker_state_->game.empty()) {
+        picker_state_->inspection_worker.Clear();
+      } else {
+        picker_state_->inspection_worker.Request(picker_state_->game);
+      }
       break;
     case PickerTarget::kUpdate:
       picker_state_->update = std::move(path);
@@ -116,6 +122,7 @@ void InstallDialog::ShowFilePicker(PickerTarget target) {
         switch (target) {
           case PickerTarget::kGame:
             state->game = std::move(path);
+            state->inspection_worker.Request(state->game);
             break;
           case PickerTarget::kUpdate:
             state->update = std::move(path);
@@ -161,6 +168,7 @@ void InstallDialog::ShowFolderPicker(PickerTarget target) {
         switch (target) {
           case PickerTarget::kGame:
             state->game = std::move(path);
+            state->inspection_worker.Request(state->game);
             break;
           case PickerTarget::kUpdate:
             state->update = std::move(path);
@@ -204,15 +212,25 @@ void InstallDialog::StartInstall() {
   }
 
   Selection selection;
-  if (!dlc_only_) {
-    selection.game_source = PathFor(PickerTarget::kGame);
-    selection.update_source = PathFor(PickerTarget::kUpdate);
-  }
-  if (auto path = PathFor(PickerTarget::kTlad); !path.empty()) {
-    selection.dlc_sources.push_back({Episode::kTlad, std::move(path)});
-  }
-  if (auto path = PathFor(PickerTarget::kTbogt); !path.empty()) {
-    selection.dlc_sources.push_back({Episode::kTbogt, std::move(path)});
+  {
+    std::lock_guard lock(picker_state_->mutex);
+    if (!dlc_only_) {
+      const GameSourceInspectionSnapshot inspection = picker_state_->inspection_worker.Snapshot();
+      if (!inspection.result || !inspection.result->supported() || picker_state_->update.empty()) {
+        return;
+      }
+      selection.game_source = picker_state_->game;
+      selection.update_source = picker_state_->update;
+    }
+    if (!picker_state_->tlad.empty()) {
+      selection.dlc_sources.push_back({Episode::kTlad, picker_state_->tlad});
+    }
+    if (!picker_state_->tbogt.empty()) {
+      selection.dlc_sources.push_back({Episode::kTbogt, picker_state_->tbogt});
+    }
+    if (dlc_only_ && selection.dlc_sources.empty()) {
+      return;
+    }
   }
 
   progress_.copied_bytes = 0;
@@ -235,6 +253,31 @@ void InstallDialog::FinishInstallIfNeeded() {
     install_thread_.join();
   }
   state_ = result_.success ? State::kInstalled : State::kFailed;
+}
+
+void InstallDialog::DrawBaseInspection() {
+  const GameSourceInspectionSnapshot snapshot = picker_state_->inspection_worker.Snapshot();
+  if (snapshot.checking) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.78f, 0.25f, 1.0f));
+    ImGui::TextUnformatted("Checking…");
+    ImGui::PopStyleColor();
+    return;
+  }
+  if (!snapshot.result) {
+    return;
+  }
+
+  const ImVec4 color = snapshot.result->supported() ? ImVec4(0.35f, 0.90f, 0.45f, 1.0f)
+                                                    : ImVec4(1.0f, 0.35f, 0.35f, 1.0f);
+  const std::string summary = FormatGameSourceInspection(*snapshot.result);
+  ImGui::PushStyleColor(ImGuiCol_Text, color);
+  ImGui::TextWrapped("%s", summary.c_str());
+  ImGui::PopStyleColor();
+
+  const std::string diagnostics = FormatGameSourceDiagnostics(*snapshot.result);
+  if (!diagnostics.empty()) {
+    ImGui::TextDisabled("%s", diagnostics.c_str());
+  }
 }
 
 void InstallDialog::OnDraw(ImGuiIO& io) {
@@ -278,6 +321,7 @@ void InstallDialog::OnDraw(ImGuiIO& io) {
           "title update. The update may be an STFS package or raw default.xexp.");
       ImGui::Spacing();
       DrawSourceRow("Base game", PickerTarget::kGame, PathFor(PickerTarget::kGame), true);
+      DrawBaseInspection();
       ImGui::Spacing();
       DrawSourceRow("Title update v8", PickerTarget::kUpdate, PathFor(PickerTarget::kUpdate), true);
       ImGui::Spacing();
@@ -311,11 +355,17 @@ void InstallDialog::OnDraw(ImGuiIO& io) {
       ImGui::PopStyleColor();
     }
 
-    const bool has_game = dlc_only_ || !PathFor(PickerTarget::kGame).empty();
-    const bool has_update = dlc_only_ || !PathFor(PickerTarget::kUpdate).empty();
-    const bool has_dlc =
-        !PathFor(PickerTarget::kTlad).empty() || !PathFor(PickerTarget::kTbogt).empty();
-    const bool may_install = has_game && has_update && (!dlc_only_ || has_dlc);
+    bool has_supported_game = dlc_only_;
+    bool has_update = dlc_only_;
+    bool has_dlc = false;
+    {
+      std::lock_guard lock(picker_state_->mutex);
+      const GameSourceInspectionSnapshot inspection = picker_state_->inspection_worker.Snapshot();
+      has_supported_game = dlc_only_ || (inspection.result && inspection.result->supported());
+      has_update = dlc_only_ || !picker_state_->update.empty();
+      has_dlc = !picker_state_->tlad.empty() || !picker_state_->tbogt.empty();
+    }
+    const bool may_install = has_supported_game && has_update && (!dlc_only_ || has_dlc);
     ImGui::Spacing();
     ImGui::BeginDisabled(!may_install);
     if (ImGui::Button(state_ == State::kFailed ? "Retry Installation" : "Install",

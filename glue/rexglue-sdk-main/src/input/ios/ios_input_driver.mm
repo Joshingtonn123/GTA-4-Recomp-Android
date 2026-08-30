@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstring>
 
+#include <rex/input/absolute_pointer.h>
 #include <rex/logging.h>
 
 // ---------------------------------------------------------------------------
@@ -179,6 +180,9 @@ IOSInputDriver::~IOSInputDriver() {
     observer_ = nullptr;
   }
   for (auto& slot : slots_) {
+    if (slot.inventory_id) {
+      GetAbsolutePointerService().RemoveGameController(slot.inventory_id);
+    }
     if (slot.ios) {
       if (slot.ios->bridge_retained) {
         LRIOSControllerBridge* b =
@@ -225,8 +229,15 @@ void IOSInputDriver::OnWindowAvailable(rex::ui::Window* /*window*/) {
 void IOSInputDriver::HandleConnect(void* gc_raw) {
   GCController* controller = (__bridge GCController*)gc_raw;
   if (!controller || !controller.extendedGamepad) return;
+  const uint64_t inventory_id = uint64_t(reinterpret_cast<uintptr_t>(gc_raw));
+  GetAbsolutePointerService().AddGameController(inventory_id);
 
   std::lock_guard<std::mutex> g(mutex_);
+  for (const auto& slot : slots_) {
+    if (slot.inventory_id == inventory_id) {
+      return;
+    }
+  }
   // Find a free slot.
   for (size_t i = 0; i < slots_.size(); ++i) {
     if (!slots_[i].ios) {
@@ -241,6 +252,7 @@ void IOSInputDriver::HandleConnect(void* gc_raw) {
       }
       controller.playerIndex = static_cast<GCControllerPlayerIndex>(i);
       slots_[i].ios = ios;
+      slots_[i].inventory_id = inventory_id;
       slots_[i].state = {};
       slots_[i].state_changed = true;
       REXLOG_INFO("iOS GameController connected at user index {}", i);
@@ -252,9 +264,17 @@ void IOSInputDriver::HandleConnect(void* gc_raw) {
 
 void IOSInputDriver::HandleDisconnect(void* gc_raw) {
   GCController* controller = (__bridge GCController*)gc_raw;
+  const uint64_t inventory_id = uint64_t(reinterpret_cast<uintptr_t>(gc_raw));
+  GetAbsolutePointerService().RemoveGameController(inventory_id);
   std::lock_guard<std::mutex> g(mutex_);
   for (size_t i = 0; i < slots_.size(); ++i) {
-    if (!slots_[i].ios || !slots_[i].ios->bridge_retained) continue;
+    if (!slots_[i].ios || slots_[i].inventory_id != inventory_id) continue;
+    if (!slots_[i].ios->bridge_retained) {
+      delete slots_[i].ios;
+      slots_[i] = {};
+      REXLOG_INFO("iOS GameController disconnected at user index {}", i);
+      return;
+    }
     LRIOSControllerBridge* b =
         (__bridge LRIOSControllerBridge*)slots_[i].ios->bridge_retained;
     if (b.controller == controller) {

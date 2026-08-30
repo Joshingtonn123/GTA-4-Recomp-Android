@@ -12,6 +12,7 @@
 
 #include <rex/cvar.h>
 #include <rex/input/input.h>
+#include <rex/input/input_trace.h>
 #include <rex/logging.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
@@ -30,8 +31,7 @@ REXCVAR_DEFINE_BOOL(mnk_mode, true, "Input", "Enable native keyboard/mouse input
 REXCVAR_DEFINE_BOOL(mnk_controller_emulation, false, "Input",
                     "Use legacy Xbox controller translation instead of native input");
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
-REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Native mouse sensitivity")
-    .range(0.01, 10.0);
+REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Native mouse sensitivity").range(0.01, 10.0);
 REXCVAR_DEFINE_DOUBLE(mnk_trackpad_sensitivity, 1.0, "Input", "Native trackpad sensitivity")
     .range(0.01, 10.0);
 REXCVAR_DEFINE_BOOL(mnk_invert_y, false, "Input", "Invert native mouse Y axis");
@@ -120,8 +120,7 @@ void MnkInputDriver::OnClosing(rex::ui::UIEvent&) {
   }
 
   bool release_capture = false;
-  rex::ui::Window::CursorVisibility cursor_visibility =
-      rex::ui::Window::CursorVisibility::kVisible;
+  rex::ui::Window::CursorVisibility cursor_visibility = rex::ui::Window::CursorVisibility::kVisible;
   {
     std::lock_guard lock(state_mutex_);
     release_capture = mouse_captured_;
@@ -204,12 +203,16 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   if (!IsEnabled() || user_index != UserIndex()) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
+  if (!out_state) {
+    // A null output is a connectivity observation, not a motion sampling
+    // boundary. In particular, do not consume the pending relative motion.
+    return X_ERROR_SUCCESS;
+  }
 
   std::lock_guard lock(state_mutex_);
 
   X_INPUT_GAMEPAD gamepad = {};
-  if (is_active() && has_focus_ &&
-      REXCVAR_GET(mnk_controller_emulation)) {
+  if (is_active() && has_focus_ && REXCVAR_GET(mnk_controller_emulation)) {
     uint16_t buttons = 0;
     if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
       buttons |= X_INPUT_GAMEPAD_A;
@@ -243,10 +246,8 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
       buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
 
     gamepad.buttons = buttons;
-    gamepad.left_trigger =
-        IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
-    gamepad.right_trigger =
-        IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+    gamepad.left_trigger = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+    gamepad.right_trigger = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
 
     int32_t lx = 0;
     int32_t ly = 0;
@@ -259,21 +260,22 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
       ly -= INT16_MAX;
 
+    // A non-null legacy-controller poll is the sampling boundary. The native
+    // consumer is disabled in this mode, so it cannot steal this interval.
+    // Without a caller-provided frame token, retaining this relative delta for
+    // another non-null XInput poll would turn it into a held analog stick.
     const PointerMotionSample motion = pointer_motion_.Consume();
     const double sensitivity =
         motion.source == rex::ui::MouseEvent::MotionSource::kSystemAccelerated
             ? REXCVAR_GET(mnk_trackpad_sensitivity)
             : REXCVAR_GET(mnk_sensitivity);
     constexpr double kBaseScale = 200.0;
-    const int32_t rx =
-        static_cast<int32_t>(motion.delta_x * sensitivity * kBaseScale);
-    const int32_t ry =
-        static_cast<int32_t>(-motion.delta_y * sensitivity * kBaseScale);
+    const int32_t rx = static_cast<int32_t>(motion.delta_x * sensitivity * kBaseScale);
+    const int32_t ry = static_cast<int32_t>(-motion.delta_y * sensitivity * kBaseScale);
 
     auto clamp16 = [](int32_t value) -> int16_t {
       return static_cast<int16_t>(
-          std::clamp(value, static_cast<int32_t>(INT16_MIN),
-                     static_cast<int32_t>(INT16_MAX)));
+          std::clamp(value, static_cast<int32_t>(INT16_MIN), static_cast<int32_t>(INT16_MAX)));
     };
     gamepad.thumb_lx = clamp16(lx);
     gamepad.thumb_ly = clamp16(ly);
@@ -286,19 +288,19 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     last_emulated_gamepad_ = gamepad;
   }
 
-  if (out_state) {
-    std::memset(out_state, 0, sizeof(*out_state));
-    out_state->packet_number = packet_number_;
-    out_state->gamepad = gamepad;
-  }
+  std::memset(out_state, 0, sizeof(*out_state));
+  out_state->packet_number = packet_number_;
+  out_state->gamepad = gamepad;
   return X_ERROR_SUCCESS;
 }
 
-X_RESULT MnkInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+X_RESULT MnkInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* /*vibration*/) {
   if (!IsEnabled() || user_index != UserIndex()) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-  return X_ERROR_SUCCESS;
+  // Mouse and keyboard input has no physical force-feedback output. Don't
+  // claim success and mask a real controller driver's rumble failure.
+  return X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
 X_RESULT MnkInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
@@ -391,6 +393,13 @@ void MnkInputDriver::UpdateMouseCapture() {
           std::lock_guard lock(state_mutex_);
           mouse_captured_ = should_capture && applied;
           ResetPointerMotionLocked();
+          if (rex::input::IsInputTraceEnabled()) {
+            REXLOG_INFO(
+                "input-e2e: seq={} stage=focus-capture owner=mnk mouse-capture={} "
+                "requested={} applied={} reset-generation={}",
+                rex::input::NextInputTraceSequence(), mouse_captured_, should_capture,
+                applied, mouse_reset_generation_);
+          }
         })) {
       REXLOG_ERROR("Unable to dispatch mouse capture transition to the UI thread");
     }
@@ -414,28 +423,71 @@ void MnkInputDriver::ResetPointerMotionLocked() {
   ++mouse_reset_generation_;
 }
 
-void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+bool MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
   if (vk < 256) {
+    if (key_down_[vk] == down) {
+      return false;
+    }
     key_down_[vk] = down;
+    ++key_state_generation_;
+    return true;
   }
+  return false;
 }
 
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
-  if (!IsEnabled())
+  if (!IsEnabled()) {
+    if (rex::input::IsInputTraceEnabled()) {
+      REXLOG_INFO("input-e2e: seq={} stage=mnk-key direction=down result=disabled vk={}",
+                  e.input_trace_sequence(), static_cast<uint32_t>(e.virtual_key()));
+    }
     return;
+  }
   std::lock_guard lock(state_mutex_);
-  if (!has_focus_)
+  if (!has_focus_) {
+    if (rex::input::IsInputTraceEnabled()) {
+      REXLOG_INFO("input-e2e: seq={} stage=mnk-key direction=down result=no-focus vk={}",
+                  e.input_trace_sequence(), static_cast<uint32_t>(e.virtual_key()));
+    }
     return;
+  }
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
-  SetKeyState(vk, true);
+  const bool changed = SetKeyState(vk, true);
+  last_key_event_sequence_ = e.input_trace_sequence();
+  if (vk < key_event_sequences_.size()) {
+    key_event_sequences_[vk] = e.input_trace_sequence();
+  }
+  if (rex::input::IsInputTraceEnabled()) {
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=mnk-key key={} vk={} direction=down "
+        "result=accepted changed={} generation={} focus={}",
+        e.input_trace_sequence(), rex::input::InputTraceVirtualKeyName(vk), vk,
+        changed, key_state_generation_, has_focus_);
+  }
 }
 
 void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
-  if (!IsEnabled())
+  if (!IsEnabled()) {
+    if (rex::input::IsInputTraceEnabled()) {
+      REXLOG_INFO("input-e2e: seq={} stage=mnk-key direction=up result=disabled vk={}",
+                  e.input_trace_sequence(), static_cast<uint32_t>(e.virtual_key()));
+    }
     return;
+  }
   std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
-  SetKeyState(vk, false);
+  const bool changed = SetKeyState(vk, false);
+  last_key_event_sequence_ = e.input_trace_sequence();
+  if (vk < key_event_sequences_.size()) {
+    key_event_sequences_[vk] = e.input_trace_sequence();
+  }
+  if (rex::input::IsInputTraceEnabled()) {
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=mnk-key key={} vk={} direction=up "
+        "result=accepted changed={} generation={} focus={}",
+        e.input_trace_sequence(), rex::input::InputTraceVirtualKeyName(vk), vk,
+        changed, key_state_generation_, has_focus_);
+  }
 }
 
 void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
@@ -510,15 +562,30 @@ bool MnkInputDriver::ConsumeNativeState(NativeInputState* out_state) {
   // is called while the global active-driver lifetime lock is held; waiting on
   // the UI thread there could deadlock against driver destruction. GetState
   // owns capture transitions before the guest consumes this snapshot.
-  if (!out_state || !IsEnabled() || REXCVAR_GET(mnk_controller_emulation) || !is_active()) {
-    return false;
-  }
-
+  const bool enabled = IsEnabled();
+  const bool emulated = REXCVAR_GET(mnk_controller_emulation);
+  const bool active = is_active();
   std::lock_guard lock(state_mutex_);
-  if (!has_focus_) {
+  const bool allowed = out_state && enabled && !emulated && active && has_focus_;
+  if (rex::input::IsInputTraceEnabled() &&
+      last_traced_consume_status_ != static_cast<int32_t>(allowed)) {
+    const uint64_t trace_sequence = last_key_event_sequence_ != 0
+                                        ? last_key_event_sequence_
+                                        : rex::input::NextInputTraceSequence();
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=mnk-snapshot result={} enabled={} emulated={} active={} "
+        "focus={} generation={}",
+        trace_sequence, allowed ? "accepted" : "rejected", enabled, emulated, active,
+        has_focus_, key_state_generation_);
+    last_traced_consume_status_ = static_cast<int32_t>(allowed);
+  }
+  if (!allowed) {
     return false;
   }
   std::copy(std::begin(key_down_), std::end(key_down_), out_state->keys.begin());
+  out_state->user_index = UserIndex();
+  // A successful native gameplay read owns exactly one accumulated interval.
+  // GetState cannot consume it because controller emulation is disabled here.
   const PointerMotionSample motion = pointer_motion_.Consume();
   out_state->mouse_dx = motion.delta_x;
   out_state->mouse_dy = motion.delta_y;
@@ -531,23 +598,69 @@ bool MnkInputDriver::ConsumeNativeState(NativeInputState* out_state) {
           : REXCVAR_GET(mnk_sensitivity);
   out_state->mouse_reset_generation = mouse_reset_generation_;
   out_state->invert_mouse_y = REXCVAR_GET(mnk_invert_y);
+  out_state->last_key_event_sequence = last_key_event_sequence_;
+  out_state->key_state_generation = key_state_generation_;
+  out_state->key_event_sequences = key_event_sequences_;
   mouse_wheel_ = 0;
+  if (rex::input::IsInputTraceEnabled() &&
+      (!trace_snapshot_initialized_ ||
+       last_traced_snapshot_generation_ != key_state_generation_ || motion.has_motion ||
+       out_state->mouse_wheel != 0)) {
+    const uint64_t trace_sequence = last_key_event_sequence_ != 0
+                                        ? last_key_event_sequence_
+                                        : rex::input::NextInputTraceSequence();
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=mnk-snapshot result=published user={} generation={} "
+        "w={} a={} s={} d={} return={} space={} back={} delete={} escape={} "
+        "arrows={}/{}/{}/{} key-sequences=escape:{}:up:{}:down:{} mouse={}/{} wheel={}",
+        trace_sequence, out_state->user_index, key_state_generation_,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kW)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kA)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kS)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kD)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kReturn)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kSpace)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kBack)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kDelete)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kEscape)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kUp)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kDown)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kLeft)] != 0,
+        out_state->keys[static_cast<uint16_t>(VirtualKey::kRight)] != 0,
+        out_state->key_event_sequences[static_cast<uint16_t>(VirtualKey::kEscape)],
+        out_state->key_event_sequences[static_cast<uint16_t>(VirtualKey::kUp)],
+        out_state->key_event_sequences[static_cast<uint16_t>(VirtualKey::kDown)],
+        out_state->mouse_dx, out_state->mouse_dy, out_state->mouse_wheel);
+    last_traced_snapshot_generation_ = key_state_generation_;
+    trace_snapshot_initialized_ = true;
+  }
   return true;
 }
 
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   bool release_capture = false;
-  rex::ui::Window::CursorVisibility cursor_visibility =
-      rex::ui::Window::CursorVisibility::kVisible;
+  uint64_t trace_sequence = 0;
+  uint64_t key_generation = 0;
+  rex::ui::Window::CursorVisibility cursor_visibility = rex::ui::Window::CursorVisibility::kVisible;
   {
     std::lock_guard lock(state_mutex_);
     has_focus_ = false;
     std::memset(key_down_, 0, sizeof(key_down_));
+    ++key_state_generation_;
     ResetPointerMotionLocked();
     mouse_wheel_ = 0;
     release_capture = mouse_captured_;
     cursor_visibility = precapture_cursor_visibility_;
     mouse_captured_ = false;
+    trace_sequence = last_key_event_sequence_;
+    key_generation = key_state_generation_;
+  }
+  if (rex::input::IsInputTraceEnabled()) {
+    if (trace_sequence == 0) {
+      trace_sequence = rex::input::NextInputTraceSequence();
+    }
+    REXLOG_INFO("input-e2e: seq={} stage=focus-capture owner=mnk focus=lost generation={}",
+                trace_sequence, key_generation);
   }
   if (release_capture && attached_window_) {
     attached_window_->SetRelativeMouseMode(false);
@@ -561,6 +674,13 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
 void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
   std::lock_guard lock(state_mutex_);
   has_focus_ = true;
+  if (rex::input::IsInputTraceEnabled()) {
+    const uint64_t trace_sequence = last_key_event_sequence_ != 0
+                                        ? last_key_event_sequence_
+                                        : rex::input::NextInputTraceSequence();
+    REXLOG_INFO("input-e2e: seq={} stage=focus-capture owner=mnk focus=gained generation={}",
+                trace_sequence, key_state_generation_);
+  }
 }
 
 }  // namespace rex::input::mnk

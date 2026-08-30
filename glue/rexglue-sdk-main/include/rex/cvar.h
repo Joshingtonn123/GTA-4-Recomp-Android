@@ -122,7 +122,7 @@ void LoadConfig(const std::filesystem::path& config_path);
 void ApplyEnvironment();
 void FinalizeInit();
 bool IsFinalized();
-void SaveConfig(const std::filesystem::path& config_path);
+[[nodiscard]] bool SaveConfig(const std::filesystem::path& config_path);
 
 //=============================================================================
 // Flag Registry

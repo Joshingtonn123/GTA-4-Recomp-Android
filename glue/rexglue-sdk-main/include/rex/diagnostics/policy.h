@@ -18,6 +18,7 @@ enum class Category : std::size_t {
   kNativeProbes,
   kNativeTranslucency,
   kNativeProfiler,
+  kNativeMemoryProfiler,
   kPresenter,
   kGuestHooks,
   kPhysics,

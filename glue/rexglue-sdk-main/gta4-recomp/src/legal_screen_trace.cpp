@@ -9,6 +9,7 @@
 #include <rex/logging.h>
 
 #include "gta4_init.h"
+#include "gta4_touch_coordinator.h"
 
 REXCVAR_DEFINE_BOOL(gta4_trace_legal_screen, true, "GTA IV/Diagnostics",
                     "Trace legal-screen state and HUD text submission");
@@ -108,6 +109,7 @@ extern "C" void sub_82144800(PPCContext& ctx, uint8_t* base) {
 }
 
 extern "C" void sub_821F6E38(PPCContext& ctx, uint8_t* base) {
+  GTA4_TouchObserveHudSubmit(ctx, base);
   if (rex::diagnostics::IsEnabled(rex::diagnostics::Category::kLegal) &&
       REXCVAR_GET(gta4_trace_legal_screen) && g_legal_trace_depth) {
     ++g_legal_text_submits;

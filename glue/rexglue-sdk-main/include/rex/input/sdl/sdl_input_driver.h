@@ -29,12 +29,16 @@
 
 namespace rex::input::sdl {
 
-class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener {
+class SDLInputDriver final : public InputDriver,
+                             public rex::ui::WindowListener,
+                             public rex::ui::WindowInputListener {
  public:
-  explicit SDLInputDriver(rex::ui::Window* window, size_t window_z_order);
+  explicit SDLInputDriver(rex::ui::Window* window, size_t window_z_order,
+                          bool expose_gamepad_state = true);
   ~SDLInputDriver() override;
 
   X_STATUS Setup() override;
+  const char* trace_name() const override { return "sdl-gamepad"; }
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                            X_INPUT_CAPABILITIES* out_caps) override;
@@ -47,12 +51,17 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
 
  private:
   struct ControllerState {
-    SDL_Gamepad* sdl;
-    X_INPUT_CAPABILITIES caps;
-    X_INPUT_STATE state;
-    MotionState motion;
-    bool state_changed;
-    bool is_active;
+    SDL_Gamepad* sdl = nullptr;
+    X_INPUT_CAPABILITIES caps{};
+    X_INPUT_STATE state{};
+    MotionState motion{};
+    uint16_t left_motor_speed = 0;
+    uint16_t right_motor_speed = 0;
+    uint64_t next_rumble_refresh_ms = 0;
+    bool rumble_supported = false;
+    bool state_changed = false;
+    bool is_active = false;
+    bool trace_initialized = false;
   };
 
   enum class RepeatState {
@@ -73,33 +82,46 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnClosing(rex::ui::UIEvent& e) override;
   void OnLostFocus(rex::ui::UISetupEvent& e) override;
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
+  void OnDpiChanged(rex::ui::UISetupEvent& e) override;
+  void OnResize(rex::ui::UISetupEvent& e) override;
 
+  // WindowInputListener
+  void OnTouchEvent(rex::ui::TouchEvent& e) override;
+
+  static bool SDLCALL EventWatch(void* userdata, SDL_Event* event);
   void HandleEvent(const SDL_Event& event);
-  std::unique_lock<std::mutex> DrainAndLock();
-  void ProcessEventLocked(const SDL_Event& event);
-  void OnControllerDeviceAddedLocked(const SDL_Event& event);
-  void OnControllerDeviceRemovedLocked(const SDL_Event& event);
-  void OnControllerDeviceAxisMotionLocked(const SDL_Event& event);
-  void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
-  void OnControllerDeviceSensorUpdateLocked(const SDL_Event& event);
+  void RefreshDeviceInventoryFromUIThread(uint64_t timestamp_ns);
+  void RefreshAndroidKeyboardFromUIThread(uint64_t timestamp_ns, bool force);
+  void RefreshPointerPresentation(uint64_t timestamp_ns);
+  std::optional<std::vector<SDL_JoystickID>> QueryControllerInventory();
+  std::unique_lock<std::mutex> DrainAndLock(bool refresh_rumble = true);
+  void ReconcileControllerInventoryLocked(const std::vector<SDL_JoystickID>& connected_ids);
+  void CloseControllerLocked(size_t index, const char* reason);
+  void OpenControllerLocked(SDL_JoystickID instance_id);
+  void PollControllerStateLocked(ControllerState& state);
+  void PollConnectedControllerStatesLocked();
 
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
   std::optional<size_t> GetControllerIndexFromInstanceID(SDL_JoystickID instance_id);
   ControllerState* GetControllerState(uint32_t user_index);
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state);
+  X_RESULT ApplyRumbleLocked(uint32_t user_index, ControllerState& state, uint16_t left_motor,
+                             uint16_t right_motor, bool is_refresh);
+  void RefreshRumbleLocked();
   void QueueControllerUpdate();
 
   rex::ui::Window* attached_window_ = nullptr;
+  const bool expose_gamepad_state_;
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
-  std::atomic<int> sdl_events_unflushed_;
+  bool event_watch_installed_ = false;
+  uint64_t next_android_keyboard_refresh_ms_ = 0;
+  std::atomic<bool> accepting_input_requests_{false};
   std::atomic<bool> sdl_pumpevents_queued_;
   std::atomic<uint64_t> next_motion_device_generation_{1};
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
   std::mutex controllers_mutex_;
-  std::mutex event_queue_mutex_;
-  std::vector<SDL_Event> pending_events_;
   std::array<KeystrokeState, HID_SDL_USER_COUNT> keystroke_states_;
 };
 

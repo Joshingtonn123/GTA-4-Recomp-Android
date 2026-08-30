@@ -656,6 +656,7 @@ docs/*.md
 !docs/SHADER_PIPELINE.md
 !docs/RPF_EXTRACTION_DESIGN.md
 !docs/GTA4_COLLISION_VPKUWUS_ALIASING_FIX.md
+!docs/GTA_IV_ASSET_STREAMING_SYSTEM.md
 -e 
 # Claude and GitHub metadata - do not commit
 .claude/
@@ -672,9 +673,26 @@ build-codegen/
 *.sh
 *.py
 /tools/*.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/derive_frontend_advanced_menu_layout.py
+!tools/analyze_native_memory.py
+!tools/test_analyze_native_memory.py
+!docs/NATIVE_MEMORY_PROFILING.md
+!glue/rexglue-sdk-main/community-server/deploy/backup.sh
 !tools/xtd_tools/button_prompt_roundtrip.py
 !LibertyRecompLib/font_atlases/tools/*.py
 !glue/rexglue-sdk-main/gta4-recomp/tools/verify_physics_trace_sites.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_player_info_table.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_gameplay_player_width.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_gameplay_multiplayer_surfaces.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/derive_player_info_64_layout.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_multiplayer_64_consumers.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_multiplayer_peer_width.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_online_services_abi.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_session_search_authority.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_reassignment_consumers.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/audit_voice_receive_pipeline.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/derive_community_client_limits.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/derive_multiplayer_64_layout.py
 !glue/rexglue-sdk-main/tools/gta4_shader_override_compiler.py
 *.pid
 chat_summary*.txt
