@@ -23,6 +23,7 @@
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
+#include "sdl_axis_policy.h"
 #include "sdl_hotplug_policy.h"
 #include "sdl_rumble_policy.h"
 
@@ -843,9 +844,9 @@ void SDLInputDriver::PollControllerStateLocked(ControllerState& state) {
 
   X_INPUT_GAMEPAD polled{};
   polled.thumb_lx = SDL_GetGamepadAxis(state.sdl, SDL_GAMEPAD_AXIS_LEFTX);
-  polled.thumb_ly = ~SDL_GetGamepadAxis(state.sdl, SDL_GAMEPAD_AXIS_LEFTY);
+  polled.thumb_ly = ToXInputThumbY(SDL_GetGamepadAxis(state.sdl, SDL_GAMEPAD_AXIS_LEFTY));
   polled.thumb_rx = SDL_GetGamepadAxis(state.sdl, SDL_GAMEPAD_AXIS_RIGHTX);
-  polled.thumb_ry = ~SDL_GetGamepadAxis(state.sdl, SDL_GAMEPAD_AXIS_RIGHTY);
+  polled.thumb_ry = ToXInputThumbY(SDL_GetGamepadAxis(state.sdl, SDL_GAMEPAD_AXIS_RIGHTY));
   polled.left_trigger =
       static_cast<uint8_t>(SDL_GetGamepadAxis(state.sdl, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) >> 7);
   polled.right_trigger =

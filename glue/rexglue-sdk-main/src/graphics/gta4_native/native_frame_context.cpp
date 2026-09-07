@@ -12,7 +12,7 @@ bool NativeFrameContextRing::ConfigureSlot(uint32_t slot_index, QueryReadbackRes
 
   std::lock_guard lock(mutex_);
   if (slot_index >= slots_.size() || slots_[slot_index].configured ||
-      slots_[slot_index].state != SlotState::kAvailable || slots_[slot_index].generation) {
+      slots_[slot_index].state != SlotState::kAvailable) {
     return false;
   }
 
@@ -33,6 +33,22 @@ bool NativeFrameContextRing::ConfigureSlot(uint32_t slot_index, QueryReadbackRes
   return true;
 }
 
+bool NativeFrameContextRing::ReleaseSlot(uint32_t slot_index,
+                                         QueryReadbackResources resources) {
+  std::lock_guard lock(mutex_);
+  if (slot_index >= slots_.size()) {
+    return false;
+  }
+  Slot& slot = slots_[slot_index];
+  if (!slot.configured || slot.state != SlotState::kAvailable ||
+      slot.resources != resources) {
+    return false;
+  }
+  slot.configured = false;
+  slot.resources = {};
+  return true;
+}
+
 std::optional<NativeFrameContextRing::QueryReadbackResources>
 NativeFrameContextRing::GetSlotResources(uint32_t slot_index) const {
   std::lock_guard lock(mutex_);
@@ -50,7 +66,7 @@ std::optional<NativeFrameContextRing::FrameToken> NativeFrameContextRing::BeginF
   }
 
   Slot& slot = slots_[slot_index];
-  if (!slot.configured || slot.state != SlotState::kAvailable ||
+  if (slot.state != SlotState::kAvailable ||
       slot.generation == std::numeric_limits<uint64_t>::max()) {
     return std::nullopt;
   }
@@ -188,7 +204,7 @@ NativeFrameContextRing::ClaimQueryReadback(FrameToken token) {
     return std::nullopt;
   }
   Slot& slot = slots_[token.slot];
-  if (slot.query_readback_claimed) {
+  if (!slot.configured || slot.query_readback_claimed) {
     return std::nullopt;
   }
   slot.query_readback_claimed = true;

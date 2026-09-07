@@ -132,3 +132,28 @@ TEST_CASE("native buffer arena rejects invalid allocation state transitions",
   CHECK(arena.Release(allocation.allocation.id).status ==
         gta4::NativeBufferArenaStatus::kInvalidAllocation);
 }
+
+TEST_CASE("native buffer arena trims only entirely free blocks after reuse grace",
+          "[gta4-native][buffer-arena]") {
+  auto arena = MakeArena();
+  const auto allocation = arena.Reserve(kBlockCapacity);
+  REQUIRE(allocation);
+  CHECK(arena.TrimFreeBlocks(0, 10, 120).empty());
+  REQUIRE(arena.Commit(allocation.allocation.id) == gta4::NativeBufferArenaStatus::kSuccess);
+  CHECK(arena.TrimFreeBlocks(0, 10, 120).empty());
+  REQUIRE(arena.Release(allocation.allocation.id));
+  CHECK(arena.TrimFreeBlocks(0, 10, 120).empty());
+  CHECK(arena.TrimFreeBlocks(0, 129, 120).empty());
+  const auto reused = arena.Reserve(kBlockCapacity);
+  REQUIRE(reused);
+  CHECK_FALSE(reused.allocation.new_block);
+  CHECK(reused.allocation.block_id == allocation.allocation.block_id);
+  REQUIRE(arena.Commit(reused.allocation.id) == gta4::NativeBufferArenaStatus::kSuccess);
+  REQUIRE(arena.Release(reused.allocation.id));
+  CHECK(arena.TrimFreeBlocks(0, 130, 120).empty());
+  CHECK(arena.TrimFreeBlocks(kBlockCapacity, 1000, 120).empty());
+  const auto trimmed = arena.TrimFreeBlocks(0, 1000, 120);
+  REQUIRE(trimmed.size() == 1);
+  CHECK(trimmed.front() == allocation.allocation.block_id);
+  CHECK(arena.Snapshot().resident_capacity == 0);
+}

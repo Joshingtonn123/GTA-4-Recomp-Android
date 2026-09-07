@@ -14,11 +14,13 @@ inline constexpr uint32_t kNativeTextureEvictionGraceFrames = 240;
 inline constexpr uint32_t kNativeTextureCacheRetentionFrames = 600;
 inline constexpr uint32_t kNativeTextureBudgetReserveDivisor = 10;
 inline constexpr uint32_t kNativeTextureBudgetPollFrames = 120;
+inline constexpr uint32_t kNativeTextureBudgetPollPhaseFrames = 40;
 inline constexpr uint32_t kNativeTexturePressureEnterPercent = 90;
 inline constexpr uint32_t kNativeTexturePressureExitPercent = 85;
-inline constexpr uint64_t kNativeBufferShadowValidationInterval = 64;
+inline constexpr size_t kNativeBufferShadowValidationSlices = 64;
 inline constexpr uint32_t kNativeBufferCacheRetentionFrames = 600;
 inline constexpr uint32_t kNativeBufferCachePollFrames = 120;
+inline constexpr uint32_t kNativeBufferCachePollPhaseFrames = 80;
 inline constexpr uint32_t kNativeBufferCacheLimitMiB = 256;
 inline constexpr size_t kNativeMaximumVertexConversionsPerBuffer = 2;
 inline constexpr uint32_t kNativeUploadShrinkObservationFrames = 120;
@@ -43,12 +45,34 @@ constexpr bool CanReuseNativeBufferCapture(bool cache_entry_present, bool cache_
   return cache_entry_present && !cache_entry_dirty && metadata_matches;
 }
 
-// Sample requests at a deterministic low frequency, but validate every byte
-// of the selected payload. Sparse byte sampling could miss an untracked guest
-// write and incorrectly preserve a stale native generation.
-constexpr bool ShouldValidateNativeBufferShadow(uint64_t clean_reuse_request) {
-  return clean_reuse_request &&
-         !((clean_reuse_request - 1) % kNativeBufferShadowValidationInterval);
+struct NativeBufferShadowValidationRange {
+  size_t offset = 0;
+  size_t length = 0;
+  size_t next_offset = 0;
+  bool completes_sweep = false;
+};
+
+// Validate one contiguous part of every clean reuse rather than comparing a
+// whole resource in one command-capture transaction. Consecutive ranges cover
+// every payload byte, so this is a bounded sweep rather than sparse sampling.
+constexpr NativeBufferShadowValidationRange GetNativeBufferShadowValidationRange(
+    size_t payload_size, size_t requested_offset,
+    size_t slice_count = kNativeBufferShadowValidationSlices) {
+  if (!payload_size || !slice_count) {
+    return {};
+  }
+  const size_t offset = requested_offset < payload_size ? requested_offset : 0;
+  size_t slice_size = payload_size / slice_count;
+  if (payload_size % slice_count) {
+    ++slice_size;
+  }
+  if (!slice_size) {
+    slice_size = 1;
+  }
+  const size_t remaining = payload_size - offset;
+  const size_t length = slice_size < remaining ? slice_size : remaining;
+  const bool completes_sweep = length == remaining;
+  return {offset, length, completes_sweep ? 0 : offset + length, completes_sweep};
 }
 
 inline bool NativeBufferShadowPayloadMatches(const uint8_t* guest_payload,
@@ -58,6 +82,17 @@ inline bool NativeBufferShadowPayloadMatches(const uint8_t* guest_payload,
     return false;
   }
   return !std::memcmp(guest_payload, captured_payload, payload_size);
+}
+
+inline bool NativeBufferShadowPayloadRangeMatches(
+    const uint8_t* guest_payload, const uint8_t* captured_payload, size_t payload_size,
+    const NativeBufferShadowValidationRange& range) {
+  if (!guest_payload || !captured_payload || !range.length || range.offset > payload_size ||
+      range.length > payload_size - range.offset) {
+    return false;
+  }
+  return !std::memcmp(guest_payload + range.offset, captured_payload + range.offset,
+                      range.length);
 }
 
 constexpr bool ShouldDisableNativeBufferFastPath(bool validation_requested,
@@ -99,6 +134,54 @@ constexpr bool ShouldPollNativeTextureBudget(uint32_t current_frame, uint32_t la
   return current_frame - last_poll_frame >= interval;
 }
 
+// A relative countdown avoids uint32 frame-number overflow and lets independent
+// maintenance classes start at different phases. Missed frames run the work at
+// most once, then begin a fresh interval from the observation that performed it.
+class NativePeriodicWorkSchedule {
+ public:
+  constexpr explicit NativePeriodicWorkSchedule(uint32_t initial_delay_frames)
+      : initial_delay_frames_(initial_delay_frames) {}
+
+  constexpr bool ShouldRun(uint32_t current_frame, uint32_t interval_frames) {
+    if (!interval_frames) {
+      initialized_ = true;
+      last_observed_frame_ = current_frame;
+      frames_until_due_ = 0;
+      return true;
+    }
+    if (!initialized_ || current_frame < last_observed_frame_) {
+      initialized_ = true;
+      last_observed_frame_ = current_frame;
+      frames_until_due_ = initial_delay_frames_;
+      if (!frames_until_due_) {
+        frames_until_due_ = interval_frames;
+        return true;
+      }
+      return false;
+    }
+    const uint32_t elapsed_frames = current_frame - last_observed_frame_;
+    last_observed_frame_ = current_frame;
+    if (elapsed_frames < frames_until_due_) {
+      frames_until_due_ -= elapsed_frames;
+      return false;
+    }
+    frames_until_due_ = interval_frames;
+    return true;
+  }
+
+  constexpr void Reset() {
+    initialized_ = false;
+    last_observed_frame_ = 0;
+    frames_until_due_ = 0;
+  }
+
+ private:
+  uint32_t initial_delay_frames_ = 0;
+  uint32_t last_observed_frame_ = 0;
+  uint32_t frames_until_due_ = 0;
+  bool initialized_ = false;
+};
+
 constexpr bool ShouldEvictNativeTextureCandidate(bool referenced, bool budget_pressure,
                                                  uint32_t current_frame,
                                                  uint32_t last_used_frame,
@@ -109,6 +192,10 @@ constexpr bool ShouldEvictNativeTextureCandidate(bool referenced, bool budget_pr
   return grace_frames != 0
              ? ShouldEvictNativeTexture(current_frame, last_used_frame, grace_frames)
              : budget_pressure;
+}
+
+constexpr bool ShouldSortNativeBufferReclamation(uint64_t retained_bytes, uint64_t limit_bytes) {
+  return retained_bytes > limit_bytes;
 }
 
 constexpr bool ShouldReclaimNativeBuffer(bool exclusively_cached, bool over_budget,

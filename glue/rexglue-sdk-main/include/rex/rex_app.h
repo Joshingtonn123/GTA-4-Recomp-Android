@@ -297,6 +297,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
 
   // WindowInputListener overrides
   void OnKeyDown(ui::KeyEvent& e) override;
+  const char* input_trace_name() const override { return "rex-app"; }
 
   PPCImageInfo ppc_info_;
   PathConfig resolved_defaults_;

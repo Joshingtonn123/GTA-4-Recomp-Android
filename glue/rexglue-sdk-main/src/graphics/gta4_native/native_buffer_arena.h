@@ -78,6 +78,10 @@ class NativeBufferArena final {
   NativeBufferArenaStatus Commit(uint64_t allocation_id);
   NativeBufferArenaRelease Cancel(uint64_t allocation_id);
   NativeBufferArenaRelease Release(uint64_t allocation_id);
+  // Only entirely free, committed blocks can be removed. The caller releases
+  // live allocations after CPU-owner expiry and last GPU submission completion.
+  std::vector<uint64_t> TrimFreeBlocks(uint64_t retained_free_capacity,
+                                       uint64_t completed_epoch = 0, uint64_t grace_epochs = 0);
   std::optional<NativeBufferArenaAllocation> GetAllocation(uint64_t allocation_id) const;
   NativeBufferArenaSnapshot Snapshot() const;
 
@@ -97,6 +101,7 @@ class NativeBufferArena final {
     uint64_t capacity = 0;
     bool dedicated = false;
     bool backing_ready = false;
+    std::optional<uint64_t> empty_since_epoch;
     std::vector<Range> free_ranges;
   };
 

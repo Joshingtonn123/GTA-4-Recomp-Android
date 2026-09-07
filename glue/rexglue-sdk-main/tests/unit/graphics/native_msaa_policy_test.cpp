@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/graphics/gta4_native/anti_aliasing_policy.h>
+#include <rex/graphics/gta4_native/supersampling_policy.h>
 
 #include "graphics/gta4_native/native_msaa_policy.h"
 
@@ -87,6 +88,14 @@ TEST_CASE("GTA IV unified anti-aliasing exposes only canonical public values") {
   CHECK(ParseAntiAliasingMode("smaa") == AntiAliasingMode::kSmaa);
   CHECK(ParseAntiAliasingMode("msaa2x") == AntiAliasingMode::kMsaa2x);
   CHECK(ParseAntiAliasingMode("msaa4x") == AntiAliasingMode::kMsaa4x);
+  CHECK(ParseAntiAliasingMode("ssaa2x") == AntiAliasingMode::kSsaa2x);
+  CHECK(ParseAntiAliasingMode("ssaa4x") == AntiAliasingMode::kSsaa4x);
+  CHECK(ParseAntiAliasingMode("ssaa6x") == AntiAliasingMode::kSsaa6x);
+  CHECK(ParseAntiAliasingMode("ssaa8x") == AntiAliasingMode::kSsaa8x);
+  CHECK(ParseAntiAliasingMode("ssaa10x") == AntiAliasingMode::kSsaa10x);
+  CHECK(ParseAntiAliasingMode("ssaa12x") == AntiAliasingMode::kSsaa12x);
+  CHECK(ParseAntiAliasingMode("ssaa14x") == AntiAliasingMode::kSsaa14x);
+  CHECK(ParseAntiAliasingMode("ssaa16x") == AntiAliasingMode::kSsaa16x);
 
   CHECK_FALSE(ParseAntiAliasingMode("spatial").has_value());
   CHECK_FALSE(ParseAntiAliasingMode("2x").has_value());
@@ -121,7 +130,11 @@ TEST_CASE("GTA IV unified anti-aliasing resolves legacy configurations determini
 TEST_CASE("GTA IV unified anti-aliasing routes exactly one implementation") {
   for (AntiAliasingMode mode : {AntiAliasingMode::kOff, AntiAliasingMode::kFxaa,
                                 AntiAliasingMode::kSmaa, AntiAliasingMode::kMsaa2x,
-                                AntiAliasingMode::kMsaa4x}) {
+                                AntiAliasingMode::kMsaa4x, AntiAliasingMode::kSsaa2x,
+                                AntiAliasingMode::kSsaa4x, AntiAliasingMode::kSsaa6x,
+                                AntiAliasingMode::kSsaa8x, AntiAliasingMode::kSsaa10x,
+                                AntiAliasingMode::kSsaa12x, AntiAliasingMode::kSsaa14x,
+                                AntiAliasingMode::kSsaa16x}) {
     CHECK(HasExclusiveAntiAliasingRoute(GetAntiAliasingRoute(mode)));
   }
 
@@ -142,6 +155,14 @@ TEST_CASE("GTA IV unified anti-aliasing routes exactly one implementation") {
 
   CHECK(GetAntiAliasingRoute(AntiAliasingMode::kMsaa2x).scene_sample_count == 2u);
   CHECK(GetAntiAliasingRoute(AntiAliasingMode::kMsaa4x).scene_sample_count == 4u);
+  CHECK(GetAntiAliasingRoute(AntiAliasingMode::kSsaa2x).supersampling_pixel_factor == 2u);
+  CHECK(GetAntiAliasingRoute(AntiAliasingMode::kSsaa4x).supersampling_pixel_factor == 4u);
+  CHECK(GetAntiAliasingRoute(AntiAliasingMode::kSsaa6x).supersampling_pixel_factor == 6u);
+  CHECK(GetAntiAliasingRoute(AntiAliasingMode::kSsaa8x).supersampling_pixel_factor == 8u);
+  CHECK(GetAntiAliasingRoute(AntiAliasingMode::kSsaa10x).supersampling_pixel_factor == 10u);
+  CHECK(GetAntiAliasingRoute(AntiAliasingMode::kSsaa12x).supersampling_pixel_factor == 12u);
+  CHECK(GetAntiAliasingRoute(AntiAliasingMode::kSsaa14x).supersampling_pixel_factor == 14u);
+  CHECK(GetAntiAliasingRoute(AntiAliasingMode::kSsaa16x).supersampling_pixel_factor == 16u);
 }
 
 TEST_CASE("GTA IV unified anti-aliasing applies only topology-compatible changes live") {
@@ -155,6 +176,44 @@ TEST_CASE("GTA IV unified anti-aliasing applies only topology-compatible changes
                                       AntiAliasingMode::kOff));
   CHECK_FALSE(CanApplyAntiAliasingLive(AntiAliasingMode::kMsaa2x,
                                       AntiAliasingMode::kMsaa4x));
+  CHECK_FALSE(CanApplyAntiAliasingLive(AntiAliasingMode::kSmaa,
+                                      AntiAliasingMode::kSsaa2x));
+  CHECK_FALSE(CanApplyAntiAliasingLive(AntiAliasingMode::kSsaa2x,
+                                      AntiAliasingMode::kSsaa4x));
+  CHECK_FALSE(CanApplyAntiAliasingLive(AntiAliasingMode::kSsaa16x,
+                                      AntiAliasingMode::kOff));
+}
+
+TEST_CASE("GTA IV SSAA accepts only even total pixel factors") {
+  CHECK_FALSE(IsSupportedSupersamplingPixelFactor(1u));
+  CHECK(IsSupportedSupersamplingPixelFactor(2u));
+  CHECK_FALSE(IsSupportedSupersamplingPixelFactor(3u));
+  CHECK(IsSupportedSupersamplingPixelFactor(16u));
+  CHECK_FALSE(IsSupportedSupersamplingPixelFactor(18u));
+}
+
+TEST_CASE("GTA IV SSAA maps physical fragment coordinates back to the guest grid") {
+  constexpr FragmentCoordinateScale kIdentity{1.0f, 1.0f};
+  constexpr FragmentCoordinateScale kHalfScale{0.5f, 0.5f};
+  CHECK(CalculateFragmentCoordinateScale(1920u, 1080u, 1920u, 1080u) == kIdentity);
+  CHECK(CalculateFragmentCoordinateScale(1920u, 1080u, 3840u, 2160u) == kHalfScale);
+  CHECK(CalculateFragmentCoordinateScale(0u, 1080u, 3840u, 2160u) == kIdentity);
+}
+
+TEST_CASE("GTA IV SSAA derives host-only even physical extents") {
+  constexpr SupersampledExtent k1080p2x{2716u, 1528u};
+  constexpr SupersampledExtent k1080p6x{4704u, 2646u};
+  constexpr SupersampledExtent k4k16x{15360u, 8640u};
+  CHECK(CalculateSupersampledExtent(1920u, 1080u, 2u) ==
+        k1080p2x);
+  CHECK(CalculateSupersampledExtent(1920u, 1080u, 6u) ==
+        k1080p6x);
+  CHECK(CalculateSupersampledExtent(3840u, 2160u, 16u) ==
+        k4k16x);
+
+  CHECK_FALSE(CalculateSupersampledExtent(1920u, 1080u, 6u, 4095u).has_value());
+  CHECK_FALSE(CalculateSupersampledExtent(0u, 1080u, 2u).has_value());
+  CHECK_FALSE(CalculateSupersampledExtent(1920u, 1080u, 3u).has_value());
 }
 
 }  // namespace

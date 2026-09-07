@@ -3,8 +3,21 @@
 #include <cstdint>
 
 #include <vulkan/vulkan.h>
+#include <rex/graphics/gta4_native/forward_stencil.h>
 
 namespace rex::graphics::gta4_native {
+
+inline VkStencilOpState SceneDepthHandoffStencilState() {
+  VkStencilOpState state{};
+  state.failOp = VK_STENCIL_OP_KEEP;
+  state.passOp = VK_STENCIL_OP_REPLACE;
+  state.depthFailOp = VK_STENCIL_OP_KEEP;
+  state.compareOp = VK_COMPARE_OP_ALWAYS;
+  state.compareMask = 0xFF;
+  state.writeMask = 0xFF;
+  state.reference = kForwardCoveredSceneStencil;
+  return state;
+}
 
 enum class DepthHandoffTransport : uint8_t {
   kBuffer,

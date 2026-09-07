@@ -301,8 +301,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
         }
         if (rex::input::IsInputTraceEnabled()) {
           const int32_t state = active ? 1 : 0;
-          const int32_t previous = input_trace_last_active_state_.exchange(
-              state, std::memory_order_acq_rel);
+          const int32_t previous =
+              input_trace_last_active_state_.exchange(state, std::memory_order_acq_rel);
           if (previous != state) {
             REXLOG_INFO(
                 "input-e2e: seq={} stage=focus-capture owner=app active={} title-captured={} "
@@ -587,7 +587,9 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
 
 bool ReXApp::OnCloseRequested(ui::UIEvent& e) {
   (void)e;
-  return OnWindowCloseRequested();
+  const bool accepted = OnWindowCloseRequested();
+  REXLOG_INFO("app-quit-trace: source=window-listener-close-requested accepted={}", accepted);
+  return accepted;
 }
 
 void ReXApp::OnResize(ui::UISetupEvent& e) {

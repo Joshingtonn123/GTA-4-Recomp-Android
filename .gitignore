@@ -674,8 +674,13 @@ build-codegen/
 *.py
 /tools/*.py
 !glue/rexglue-sdk-main/gta4-recomp/tools/derive_frontend_advanced_menu_layout.py
+!glue/rexglue-sdk-main/gta4-recomp/tools/verify_gta4_keyboard_consumers.py
 !tools/analyze_native_memory.py
 !tools/test_analyze_native_memory.py
+!tools/validate_shader_preservation.py
+!tools/test_validate_shader_preservation.py
+!tools/recover_shader_sources.py
+!tools/test_recover_shader_sources.py
 !docs/NATIVE_MEMORY_PROFILING.md
 !glue/rexglue-sdk-main/community-server/deploy/backup.sh
 !tools/xtd_tools/button_prompt_roundtrip.py
@@ -706,3 +711,10 @@ run.pid
 
 # Scripts
 scripts/
+
+# Execution captures, investigation reports, and local server state are not source.
+/captures/
+/reports/
+/libserver/runtime/data/state.json
+!tools/test_dependency_patches.py
+!tools/validate_shader_cache_candidate.py

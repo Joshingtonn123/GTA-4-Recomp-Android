@@ -108,6 +108,15 @@ X_STATUS MnkInputDriver::Setup() {
 void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
   if (window) {
     attached_window_ = window;
+    {
+      std::lock_guard lock(state_mutex_);
+      // Input drivers attach after presentation opens the window. AddListener
+      // does not replay that window's initial focus notification.
+      has_focus_ = window->HasFocus();
+      ResetKeyboardStateLocked();
+      ResetPointerMotionLocked();
+      mouse_wheel_ = 0;
+    }
     window->AddInputListener(this, window_z_order());
     window->AddListener(this);
   }
@@ -127,7 +136,7 @@ void MnkInputDriver::OnClosing(rex::ui::UIEvent&) {
     cursor_visibility = precapture_cursor_visibility_;
     mouse_captured_ = false;
     has_focus_ = false;
-    std::memset(key_down_, 0, sizeof(key_down_));
+    ResetKeyboardStateLocked();
     mouse_wheel_ = 0;
     ResetPointerMotionLocked();
   }
@@ -198,9 +207,15 @@ X_RESULT MnkInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
 }
 
 X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  if (user_index != UserIndex()) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
   UpdateMouseCapture();
-
-  if (!IsEnabled() || user_index != UserIndex()) {
+  if (!IsEnabled()) {
+    std::lock_guard lock(state_mutex_);
+    ResetKeyboardStateLocked();
+    pointer_motion_.Reset();
+    mouse_wheel_ = 0;
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   if (!out_state) {
@@ -209,55 +224,77 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     return X_ERROR_SUCCESS;
   }
 
+  const bool active = is_active();
   std::lock_guard lock(state_mutex_);
 
+  if (!active || !has_focus_) {
+    ResetKeyboardStateLocked();
+    pointer_motion_.Reset();
+    mouse_wheel_ = 0;
+  }
+
+  bool sampled_keys[256] = {};
+  for (size_t index = 0; index < std::size(sampled_keys); ++index) {
+    auto& transitions = controller_key_transitions_[index];
+    sampled_keys[index] = transitions.empty() ? key_down_[index] : transitions.front() != 0;
+    if (!transitions.empty()) {
+      transitions.erase(transitions.begin());
+    }
+  }
+
   X_INPUT_GAMEPAD gamepad = {};
-  if (is_active() && has_focus_ && REXCVAR_GET(mnk_controller_emulation)) {
+  const bool controller_emulation = REXCVAR_GET(mnk_controller_emulation);
+  const NativeControllerCompatibilityBindings compatibility_bindings =
+      GetNativeControllerCompatibilityBindings();
+  if (active && has_focus_ && controller_emulation) {
+    for (auto& transitions : native_key_transitions_) {
+      transitions.clear();
+    }
     uint16_t buttons = 0;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_a)))
       buttons |= X_INPUT_GAMEPAD_A;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_b)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_b)))
       buttons |= X_INPUT_GAMEPAD_B;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_x)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_x)))
       buttons |= X_INPUT_GAMEPAD_X;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_y)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_y)))
       buttons |= X_INPUT_GAMEPAD_Y;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_left_shoulder)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_left_shoulder)))
       buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_right_shoulder)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_right_shoulder)))
       buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_press)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_press)))
       buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_press)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_rstick_press)))
       buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_back)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_back)))
       buttons |= X_INPUT_GAMEPAD_BACK;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_start)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_start)))
       buttons |= X_INPUT_GAMEPAD_START;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_guide)))
       buttons |= X_INPUT_GAMEPAD_GUIDE;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_up)))
       buttons |= X_INPUT_GAMEPAD_DPAD_UP;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_down)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_down)))
       buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_left)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_left)))
       buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_right)))
       buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
 
     gamepad.buttons = buttons;
-    gamepad.left_trigger = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
-    gamepad.right_trigger = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+    gamepad.left_trigger = IsBindPressed(sampled_keys, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+    gamepad.right_trigger = IsBindPressed(sampled_keys, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
 
     int32_t lx = 0;
     int32_t ly = 0;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_left)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_left)))
       lx -= INT16_MAX;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_right)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_right)))
       lx += INT16_MAX;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_up)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_up)))
       ly += INT16_MAX;
-    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
+    if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_down)))
       ly -= INT16_MAX;
 
     // A non-null legacy-controller poll is the sampling boundary. The native
@@ -281,6 +318,12 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     gamepad.thumb_ly = clamp16(ly);
     gamepad.thumb_rx = clamp16(rx);
     gamepad.thumb_ry = clamp16(ry);
+  } else if (active && has_focus_) {
+    gamepad = BuildNativeControllerCompatibilityGamepad(
+        compatibility_bindings, sampled_keys, std::size(sampled_keys));
+  }
+  if (!controller_emulation) {
+    TraceControllerCompatibility(compatibility_bindings, gamepad);
   }
 
   if (std::memcmp(&gamepad, &last_emulated_gamepad_, sizeof(gamepad)) != 0) {
@@ -292,6 +335,175 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   out_state->packet_number = packet_number_;
   out_state->gamepad = gamepad;
   return X_ERROR_SUCCESS;
+}
+
+void MnkInputDriver::TraceControllerCompatibility(
+    const NativeControllerCompatibilityBindings& bindings,
+    const X_INPUT_GAMEPAD& gamepad) {
+  if (!rex::input::IsInputTraceEnabled()) {
+    return;
+  }
+
+  auto key_name = [](VirtualKey key) {
+    return rex::input::InputTraceVirtualKeyName(static_cast<uint16_t>(key));
+  };
+  if (!compatibility_trace_configured_ ||
+      bindings != last_traced_compatibility_bindings_) {
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=mnk-controller-compat-config mode=native-digital "
+        "a={}:{} a-alias={}:{} b={}:{} b-alias={}:{} x={}:{} y={}:{} "
+        "dpad-up={}:{} dpad-down={}:{} dpad-left={}:{} dpad-right={}:{} "
+        "start={}:{} back={}:{} shoulder={}:{}/{}:{} trigger={}:{}/{}:{} "
+        "lstick-up={}:{} lstick-down={}:{} lstick-left={}:{} lstick-right={}:{}",
+        rex::input::NextInputTraceSequence(), key_name(bindings.a),
+        static_cast<uint16_t>(bindings.a), key_name(bindings.a_alias),
+        static_cast<uint16_t>(bindings.a_alias), key_name(bindings.b),
+        static_cast<uint16_t>(bindings.b), key_name(bindings.b_alias),
+        static_cast<uint16_t>(bindings.b_alias), key_name(bindings.x),
+        static_cast<uint16_t>(bindings.x), key_name(bindings.y),
+        static_cast<uint16_t>(bindings.y), key_name(bindings.dpad_up),
+        static_cast<uint16_t>(bindings.dpad_up), key_name(bindings.dpad_down),
+        static_cast<uint16_t>(bindings.dpad_down), key_name(bindings.dpad_left),
+        static_cast<uint16_t>(bindings.dpad_left), key_name(bindings.dpad_right),
+        static_cast<uint16_t>(bindings.dpad_right), key_name(bindings.start),
+        static_cast<uint16_t>(bindings.start), key_name(bindings.back),
+        static_cast<uint16_t>(bindings.back), key_name(bindings.left_shoulder),
+        static_cast<uint16_t>(bindings.left_shoulder),
+        key_name(bindings.right_shoulder),
+        static_cast<uint16_t>(bindings.right_shoulder),
+        key_name(bindings.left_trigger),
+        static_cast<uint16_t>(bindings.left_trigger),
+        key_name(bindings.right_trigger),
+        static_cast<uint16_t>(bindings.right_trigger),
+        key_name(bindings.left_stick_up),
+        static_cast<uint16_t>(bindings.left_stick_up),
+        key_name(bindings.left_stick_down),
+        static_cast<uint16_t>(bindings.left_stick_down),
+        key_name(bindings.left_stick_left),
+        static_cast<uint16_t>(bindings.left_stick_left),
+        key_name(bindings.left_stick_right),
+        static_cast<uint16_t>(bindings.left_stick_right));
+    compatibility_trace_configured_ = true;
+  }
+
+  auto trace_button = [&](VirtualKey key, const char* controller_button,
+                          uint16_t mask) {
+    const bool down = (static_cast<uint16_t>(gamepad.buttons) & mask) != 0;
+    const bool was_down =
+        (static_cast<uint16_t>(last_traced_compatibility_gamepad_.buttons) & mask) != 0;
+    if ((compatibility_trace_initialized_ && down == was_down) ||
+        (!compatibility_trace_initialized_ && !down)) {
+      return;
+    }
+    const auto index = static_cast<uint16_t>(key);
+    const uint64_t sequence =
+        index < key_event_sequences_.size() && key_event_sequences_[index] != 0
+            ? key_event_sequences_[index]
+            : rex::input::NextInputTraceSequence();
+    rex::input::LinkInputTraceSequence(sequence);
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=mnk-controller-compat key={} vk={} "
+        "controller={} mask={:04X} down={} buttons={:04X} packet-before={} "
+        "generation={} result=published",
+        sequence, key_name(key), index, controller_button, mask, down,
+        static_cast<uint16_t>(gamepad.buttons), packet_number_,
+        key_state_generation_);
+  };
+  auto most_recent_key = [&](VirtualKey first, VirtualKey second) {
+    if (first == VirtualKey::kNone) {
+      return second;
+    }
+    if (second == VirtualKey::kNone) {
+      return first;
+    }
+    const auto first_index = static_cast<uint16_t>(first);
+    const auto second_index = static_cast<uint16_t>(second);
+    const uint64_t first_sequence =
+        first_index < key_event_sequences_.size()
+            ? key_event_sequences_[first_index]
+            : 0;
+    const uint64_t second_sequence =
+        second_index < key_event_sequences_.size()
+            ? key_event_sequences_[second_index]
+            : 0;
+    return second_sequence > first_sequence ? second : first;
+  };
+  trace_button(most_recent_key(bindings.a, bindings.a_alias), "a",
+               X_INPUT_GAMEPAD_A);
+  trace_button(most_recent_key(bindings.b, bindings.b_alias), "b",
+               X_INPUT_GAMEPAD_B);
+  trace_button(bindings.x, "x", X_INPUT_GAMEPAD_X);
+  trace_button(bindings.y, "y", X_INPUT_GAMEPAD_Y);
+  trace_button(bindings.dpad_up, "dpad-up", X_INPUT_GAMEPAD_DPAD_UP);
+  trace_button(bindings.dpad_down, "dpad-down", X_INPUT_GAMEPAD_DPAD_DOWN);
+  trace_button(bindings.dpad_left, "dpad-left", X_INPUT_GAMEPAD_DPAD_LEFT);
+  trace_button(bindings.dpad_right, "dpad-right", X_INPUT_GAMEPAD_DPAD_RIGHT);
+  trace_button(bindings.start, "start", X_INPUT_GAMEPAD_START);
+  trace_button(bindings.back, "back", X_INPUT_GAMEPAD_BACK);
+  trace_button(bindings.left_shoulder, "left-shoulder",
+               X_INPUT_GAMEPAD_LEFT_SHOULDER);
+  trace_button(bindings.right_shoulder, "right-shoulder",
+               X_INPUT_GAMEPAD_RIGHT_SHOULDER);
+
+  auto trace_trigger = [&](VirtualKey key, const char* controller_trigger,
+                           uint8_t value, uint8_t previous) {
+    if ((compatibility_trace_initialized_ && value == previous) ||
+        (!compatibility_trace_initialized_ && value == 0)) {
+      return;
+    }
+    const auto index = static_cast<uint16_t>(key);
+    const uint64_t sequence =
+        index < key_event_sequences_.size() && key_event_sequences_[index] != 0
+            ? key_event_sequences_[index]
+            : rex::input::NextInputTraceSequence();
+    rex::input::LinkInputTraceSequence(sequence);
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=mnk-controller-compat key={} vk={} "
+        "controller={} value={} packet-before={} generation={} result=published",
+        sequence, key_name(key), index, controller_trigger, value,
+        packet_number_, key_state_generation_);
+  };
+  trace_trigger(bindings.left_trigger, "left-trigger", gamepad.left_trigger,
+                last_traced_compatibility_gamepad_.left_trigger);
+  trace_trigger(bindings.right_trigger, "right-trigger", gamepad.right_trigger,
+                last_traced_compatibility_gamepad_.right_trigger);
+
+  auto trace_axis = [&](VirtualKey negative, VirtualKey positive,
+                        VirtualKey previous_negative, VirtualKey previous_positive,
+                        const char* controller_axis, int16_t value, int16_t previous) {
+    if ((compatibility_trace_initialized_ && value == previous) ||
+        (!compatibility_trace_initialized_ && value == 0)) {
+      return;
+    }
+    VirtualKey key = most_recent_key(negative, positive);
+    if (key == VirtualKey::kNone) {
+      // A context change can unbind a held axis without a new host event.
+      key = most_recent_key(previous_negative, previous_positive);
+    }
+    const auto index = static_cast<uint16_t>(key);
+    const uint64_t sequence =
+        index < key_event_sequences_.size() && key_event_sequences_[index] != 0
+            ? key_event_sequences_[index]
+            : rex::input::NextInputTraceSequence();
+    rex::input::LinkInputTraceSequence(sequence);
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=mnk-controller-compat key={} vk={} "
+        "controller={} value={} previous={} packet-before={} generation={} result=published",
+        sequence, key_name(key), index, controller_axis, value, previous,
+        packet_number_, key_state_generation_);
+  };
+  trace_axis(bindings.left_stick_left, bindings.left_stick_right,
+             last_traced_compatibility_bindings_.left_stick_left,
+             last_traced_compatibility_bindings_.left_stick_right,
+             "left-stick-x", gamepad.thumb_lx, last_traced_compatibility_gamepad_.thumb_lx);
+  trace_axis(bindings.left_stick_down, bindings.left_stick_up,
+             last_traced_compatibility_bindings_.left_stick_down,
+             last_traced_compatibility_bindings_.left_stick_up,
+             "left-stick-y", gamepad.thumb_ly, last_traced_compatibility_gamepad_.thumb_ly);
+
+  last_traced_compatibility_bindings_ = bindings;
+  last_traced_compatibility_gamepad_ = gamepad;
+  compatibility_trace_initialized_ = true;
 }
 
 X_RESULT MnkInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* /*vibration*/) {
@@ -423,12 +635,33 @@ void MnkInputDriver::ResetPointerMotionLocked() {
   ++mouse_reset_generation_;
 }
 
+void MnkInputDriver::ResetKeyboardStateLocked() {
+  const bool changed =
+      std::any_of(std::begin(key_down_), std::end(key_down_), [](bool value) { return value; }) ||
+      std::any_of(native_key_transitions_.begin(), native_key_transitions_.end(),
+                  [](const auto& transitions) { return !transitions.empty(); }) ||
+      std::any_of(controller_key_transitions_.begin(), controller_key_transitions_.end(),
+                  [](const auto& transitions) { return !transitions.empty(); });
+  std::memset(key_down_, 0, sizeof(key_down_));
+  for (auto& transitions : native_key_transitions_) {
+    transitions.clear();
+  }
+  for (auto& transitions : controller_key_transitions_) {
+    transitions.clear();
+  }
+  if (changed) {
+    ++key_state_generation_;
+  }
+}
+
 bool MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
   if (vk < 256) {
     if (key_down_[vk] == down) {
       return false;
     }
     key_down_[vk] = down;
+    native_key_transitions_[vk].push_back(down);
+    controller_key_transitions_[vk].push_back(down);
     ++key_state_generation_;
     return true;
   }
@@ -437,14 +670,18 @@ bool MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
 
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
   if (!IsEnabled()) {
+    std::lock_guard lock(state_mutex_);
+    ResetKeyboardStateLocked();
     if (rex::input::IsInputTraceEnabled()) {
       REXLOG_INFO("input-e2e: seq={} stage=mnk-key direction=down result=disabled vk={}",
                   e.input_trace_sequence(), static_cast<uint32_t>(e.virtual_key()));
     }
     return;
   }
+  const bool active = is_active();
   std::lock_guard lock(state_mutex_);
-  if (!has_focus_) {
+  if (!active || !has_focus_) {
+    ResetKeyboardStateLocked();
     if (rex::input::IsInputTraceEnabled()) {
       REXLOG_INFO("input-e2e: seq={} stage=mnk-key direction=down result=no-focus vk={}",
                   e.input_trace_sequence(), static_cast<uint32_t>(e.virtual_key()));
@@ -452,6 +689,11 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
     return;
   }
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+  if (vk >= std::size(key_down_) || (e.prev_state() && !key_down_[vk])) {
+    // A key held while an overlay owned input must be released and pressed
+    // again; OS repeat events cannot resurrect the discarded game action.
+    return;
+  }
   const bool changed = SetKeyState(vk, true);
   last_key_event_sequence_ = e.input_trace_sequence();
   if (vk < key_event_sequences_.size()) {
@@ -467,14 +709,12 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
 }
 
 void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+  // Releases must retire held state even if input was disabled after key-down.
+  std::lock_guard lock(state_mutex_);
   if (!IsEnabled()) {
-    if (rex::input::IsInputTraceEnabled()) {
-      REXLOG_INFO("input-e2e: seq={} stage=mnk-key direction=up result=disabled vk={}",
-                  e.input_trace_sequence(), static_cast<uint32_t>(e.virtual_key()));
-    }
+    ResetKeyboardStateLocked();
     return;
   }
-  std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
   const bool changed = SetKeyState(vk, false);
   last_key_event_sequence_ = e.input_trace_sequence();
@@ -491,11 +731,12 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
 }
 
 void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
-  if (!IsEnabled())
-    return;
+  const bool active = IsEnabled() && is_active();
   std::lock_guard lock(state_mutex_);
-  if (!has_focus_)
+  if (!active || !has_focus_) {
+    ResetKeyboardStateLocked();
     return;
+  }
   switch (e.button()) {
     case rex::ui::MouseEvent::Button::kLeft:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kLButton), true);
@@ -506,15 +747,23 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
     case rex::ui::MouseEvent::Button::kMiddle:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), true);
       break;
+    case rex::ui::MouseEvent::Button::kX1:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), true);
+      break;
+    case rex::ui::MouseEvent::Button::kX2:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), true);
+      break;
     default:
       break;
   }
 }
 
 void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
-  if (!IsEnabled())
-    return;
   std::lock_guard lock(state_mutex_);
+  if (!IsEnabled()) {
+    ResetKeyboardStateLocked();
+    return;
+  }
   switch (e.button()) {
     case rex::ui::MouseEvent::Button::kLeft:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kLButton), false);
@@ -525,17 +774,26 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
     case rex::ui::MouseEvent::Button::kMiddle:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), false);
       break;
+    case rex::ui::MouseEvent::Button::kX1:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), false);
+      break;
+    case rex::ui::MouseEvent::Button::kX2:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), false);
+      break;
     default:
       break;
   }
 }
 
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
-  if (!IsEnabled())
-    return;
+  const bool active = IsEnabled() && is_active();
   std::lock_guard lock(state_mutex_);
-  if (!has_focus_)
+  if (!active || !has_focus_) {
+    prev_mouse_x_ = e.x();
+    prev_mouse_y_ = e.y();
+    pointer_motion_.Reset();
     return;
+  }
   int32_t x = e.x();
   int32_t y = e.y();
   if (e.has_relative_delta()) {
@@ -549,10 +807,9 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
 }
 
 void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
-  if (!IsEnabled())
-    return;
+  const bool active = IsEnabled() && is_active();
   std::lock_guard lock(state_mutex_);
-  if (!has_focus_)
+  if (!active || !has_focus_)
     return;
   mouse_wheel_ = SaturatingAdd(mouse_wheel_, e.scroll_y());
 }
@@ -580,9 +837,25 @@ bool MnkInputDriver::ConsumeNativeState(NativeInputState* out_state) {
     last_traced_consume_status_ = static_cast<int32_t>(allowed);
   }
   if (!allowed) {
+    if (!enabled || !active || !has_focus_) {
+      ResetKeyboardStateLocked();
+      pointer_motion_.Reset();
+      mouse_wheel_ = 0;
+    } else if (emulated) {
+      for (auto& transitions : native_key_transitions_) {
+        transitions.clear();
+      }
+    }
     return false;
   }
-  std::copy(std::begin(key_down_), std::end(key_down_), out_state->keys.begin());
+  for (size_t index = 0; index < out_state->keys.size(); ++index) {
+    auto& transitions = native_key_transitions_[index];
+    out_state->keys[index] = transitions.empty() ? key_down_[index] : transitions.front();
+    out_state->pressed_keys[index] = !transitions.empty() && transitions.front() != 0;
+    if (!transitions.empty()) {
+      transitions.erase(transitions.begin());
+    }
+  }
   out_state->user_index = UserIndex();
   // A successful native gameplay read owns exactly one accumulated interval.
   // GetState cannot consume it because controller emulation is disabled here.
@@ -604,11 +877,28 @@ bool MnkInputDriver::ConsumeNativeState(NativeInputState* out_state) {
   mouse_wheel_ = 0;
   if (rex::input::IsInputTraceEnabled() &&
       (!trace_snapshot_initialized_ ||
-       last_traced_snapshot_generation_ != key_state_generation_ || motion.has_motion ||
+       last_traced_snapshot_generation_ != key_state_generation_ ||
+       last_traced_snapshot_keys_ != out_state->keys || motion.has_motion ||
        out_state->mouse_wheel != 0)) {
     const uint64_t trace_sequence = last_key_event_sequence_ != 0
                                         ? last_key_event_sequence_
                                         : rex::input::NextInputTraceSequence();
+    for (size_t index = 0; index < out_state->keys.size(); ++index) {
+      if ((trace_snapshot_initialized_ &&
+           last_traced_snapshot_keys_[index] == out_state->keys[index]) ||
+          (!trace_snapshot_initialized_ && out_state->keys[index] == 0)) {
+        continue;
+      }
+      const uint64_t key_sequence = out_state->key_event_sequences[index] != 0
+                                        ? out_state->key_event_sequences[index]
+                                        : trace_sequence;
+      REXLOG_INFO(
+          "input-e2e: seq={} stage=mnk-snapshot-key user={} generation={} "
+          "key={} vk={} down={} result=published",
+          key_sequence, out_state->user_index, key_state_generation_,
+          rex::input::InputTraceVirtualKeyName(static_cast<uint32_t>(index)),
+          index, out_state->keys[index] != 0);
+    }
     REXLOG_INFO(
         "input-e2e: seq={} stage=mnk-snapshot result=published user={} generation={} "
         "w={} a={} s={} d={} return={} space={} back={} delete={} escape={} "
@@ -632,6 +922,7 @@ bool MnkInputDriver::ConsumeNativeState(NativeInputState* out_state) {
         out_state->key_event_sequences[static_cast<uint16_t>(VirtualKey::kDown)],
         out_state->mouse_dx, out_state->mouse_dy, out_state->mouse_wheel);
     last_traced_snapshot_generation_ = key_state_generation_;
+    last_traced_snapshot_keys_ = out_state->keys;
     trace_snapshot_initialized_ = true;
   }
   return true;
@@ -645,8 +936,7 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   {
     std::lock_guard lock(state_mutex_);
     has_focus_ = false;
-    std::memset(key_down_, 0, sizeof(key_down_));
-    ++key_state_generation_;
+    ResetKeyboardStateLocked();
     ResetPointerMotionLocked();
     mouse_wheel_ = 0;
     release_capture = mouse_captured_;

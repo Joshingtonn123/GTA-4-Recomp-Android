@@ -10,6 +10,9 @@
 
 #include <rex/graphics/gta4_native/title_commands.h>
 #include <rex/graphics/gta4_native/anti_aliasing_policy.h>
+#include <rex/graphics/gta4_native/hdr_policy.h>
+#include <rex/graphics/gta4_native/supersampling_policy.h>
+#include <rex/graphics/video_mode_util.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
@@ -19,9 +22,11 @@
 #include <rex/system/xam/user_profile.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/window.h>
 
 #include "achievement_bridge_gc.h"
 #include "gta4_frontend_hooks.h"
+#include "gta4_keyboard_controller.h"
 #include "gta4_touch_coordinator.h"
 #include "install/gta4_install_dialog.h"
 #include "install/gta4_installer.h"
@@ -66,6 +71,9 @@ REXCVAR_DEFINE_BOOL(install_dlc, false, "GTA IV/Installation",
 REXCVAR_DEFINE_BOOL(install_check, false, "GTA IV/Installation",
                     "Verify the installed game and episode layouts before launch")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(gta4_diagnostics_skip_user_music, false, "GTA IV/Diagnostics",
+                    "Skip the host user-music player during isolated diagnostics")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 GTA4App::GTA4App(rex::ui::WindowedAppContext& context)
     : ReXApp(context, "Liberty Recompiled", PPCImageConfig) {}
@@ -84,6 +92,27 @@ REXCVAR_DEFINE_UINT32(gta4_frame_limit, 60, "GTA IV/Graphics/Display",
                       "Maximum guest frame rate: 0 is unlocked; supported caps are 30, 60, and "
                       "120 FPS")
     .allowed({"0", "30", "60", "120"});
+REXCVAR_DEFINE_STRING(gta4_native_hdr_mode, "off", "GTA IV/Graphics/HDR",
+                      "HDR output: off, scRGB, or Auto HDR")
+    .allowed({"off", "scrgb", "auto_hdr"});
+REXCVAR_DEFINE_BOOL(gta4_native_hdr_mode_unified, false,
+                    "GTA IV/Graphics/HDR/Compatibility",
+                    "Canonical HDR mode has replaced the legacy Vulkan HDR toggle");
+REXCVAR_DEFINE_DOUBLE(gta4_native_hdr_paper_white_nits, 203.0,
+                      "GTA IV/Graphics/HDR",
+                      "SDR reference white brightness used by scRGB and Auto HDR")
+    .range(80.0, 500.0);
+REXCVAR_DEFINE_DOUBLE(gta4_native_hdr_peak_nits, 400.0, "GTA IV/Graphics/HDR",
+                      "Auto HDR highlight target brightness")
+    .range(80.0, 2000.0);
+REXCVAR_DEFINE_DOUBLE(gta4_native_auto_hdr_shoulder_start, 0.0,
+                      "GTA IV/Graphics/HDR/Advanced",
+                      "Normalized luminance where Auto HDR highlight expansion begins")
+    .range(0.0, 1.0);
+REXCVAR_DEFINE_DOUBLE(gta4_native_auto_hdr_shoulder_power, 2.5,
+                      "GTA IV/Graphics/HDR/Advanced",
+                      "Auto HDR highlight shoulder exponent")
+    .range(1.0, 10.0);
 
 REXCVAR_DEFINE_UINT32(gta4_shadow_map_base_size, 512, "GTA IV/Graphics/Shadows",
                       "Base shadow-map size (512 creates a 4096x4096 point-shadow cache)")
@@ -127,10 +156,12 @@ REXCVAR_DEFINE_STRING(gta4_reflection_capture_distance, "original",
                       "far (80)")
     .allowed({"original", "extended", "far"});
 REXCVAR_DEFINE_STRING(gta4_native_anti_aliasing, "smaa", "GTA IV/Graphics/Anti-Aliasing",
-                      "Anti-aliasing: off, fxaa, smaa, or deferred-scene msaa2x/msaa4x")
+                      "Anti-aliasing: off, fxaa, smaa, deferred MSAA, or even-factor SSAA")
     // `spatial` remains loadable as a deprecated compatibility alias. It is
     // never exposed by the frontend or accepted by the controller setter.
-    .allowed({"off", "fxaa", "smaa", "msaa2x", "msaa4x", "spatial"});
+    .allowed({"off", "fxaa", "smaa", "msaa2x", "msaa4x", "ssaa2x", "ssaa4x",
+              "ssaa6x", "ssaa8x", "ssaa10x", "ssaa12x", "ssaa14x", "ssaa16x",
+              "spatial"});
 REXCVAR_DEFINE_BOOL(gta4_native_anti_aliasing_unified, false,
                     "GTA IV/Graphics/Anti-Aliasing/Compatibility",
                     "Canonical unified anti-aliasing selection has replaced legacy split values");
@@ -152,16 +183,12 @@ REXCVAR_DEFINE_DOUBLE(gta4_fsr1_sharpness_reduction, 0.2, "GTA IV/Graphics/Upsca
 REXCVAR_DEFINE_BOOL(gta4_force_highest_lod, true, "GTA IV/Graphics/LOD",
                     "Prefer the highest resident model LOD regardless of distance");
 REXCVAR_DEFINE_DOUBLE(gta4_draw_distance_scale, 3.0, "GTA IV/Graphics/LOD",
-                      "Multiplier applied to GTA IV's world draw-distance scale")
+                      "Multiplier applied through GTA IV's built-in world-distance input")
     .range(1.0, 4.0);
-REXCVAR_DEFINE_BOOL(gta4_disable_timecycle_far_clip, true, "GTA IV/Graphics/LOD",
-                    "Prevent timecycle weather data from shortening the camera far clip");
 REXCVAR_DEFINE_UINT32(gta4_drawable_reference_limit, 20000, "GTA IV/Graphics/LOD",
                       "Drawable-reference capacity used by extended draw distances")
     .range(13000, 40000)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(gta4_disable_model_budget_reduction, true, "GTA IV/Graphics/LOD",
-                    "Disable pedestrian and vehicle model-budget reduction");
 
 namespace {
 
@@ -171,6 +198,10 @@ std::atomic<rex::graphics::gta4_native::AntiAliasingMode>
     g_configured_anti_aliasing_mode{rex::graphics::gta4_native::AntiAliasingMode::kSmaa};
 std::atomic<rex::graphics::gta4_native::AntiAliasingMode>
     g_active_anti_aliasing_mode{rex::graphics::gta4_native::AntiAliasingMode::kSmaa};
+std::mutex g_hdr_controller_mutex;
+std::atomic<bool> g_hdr_controller_initialized{false};
+std::atomic<rex::graphics::gta4_native::HdrMode> g_configured_hdr_mode{
+    rex::graphics::gta4_native::HdrMode::kOff};
 
 const char* AntiAliasingCompatibilityName(
     rex::graphics::gta4_native::AntiAliasingCompatibility compatibility) {
@@ -208,17 +239,161 @@ void InitializeFrontendAntiAliasingControllerLocked() {
   REXLOG_INFO(
       "GTA4AAPolicy owner=frontend event=initialize configured-raw={} legacy-msaa={} "
       "legacy-spatial={} unified={} configured={} active={} compatibility={} "
-      "ignored-legacy-msaa={} route-fxaa={} route-smaa={} scene-samples={}",
+      "ignored-legacy-msaa={} route-fxaa={} route-smaa={} scene-samples={} ssaa-factor={}",
       configured, legacy_scene_msaa, rex::cvar::Query<bool>("gta4_native_spatial_aa"),
       REXCVAR_GET(gta4_native_anti_aliasing_unified), AntiAliasingModeName(resolved.mode),
       AntiAliasingModeName(resolved.mode), AntiAliasingCompatibilityName(resolved.compatibility),
       resolved.ignored_legacy_scene_msaa, route.presentation_fxaa, route.presentation_smaa,
-      route.scene_sample_count);
+      route.scene_sample_count, route.supersampling_pixel_factor);
+}
+
+const char* HdrCompatibilityName(
+    rex::graphics::gta4_native::HdrCompatibility compatibility) {
+  using Compatibility = rex::graphics::gta4_native::HdrCompatibility;
+  switch (compatibility) {
+    case Compatibility::kCanonical:
+      return "canonical";
+    case Compatibility::kLegacyVulkanHdr:
+      return "legacy-vulkan-hdr";
+    case Compatibility::kFallbackOff:
+      return "fallback-off";
+  }
+  return "fallback-off";
+}
+
+void InitializeFrontendHdrControllerLocked() {
+  using namespace rex::graphics::gta4_native;
+  if (g_hdr_controller_initialized.load(std::memory_order_acquire)) {
+    return;
+  }
+  const std::string configured = REXCVAR_GET(gta4_native_hdr_mode);
+  const bool legacy_vulkan_hdr = rex::cvar::Query<bool>("vulkan_hdr");
+  const auto resolved = ResolveHdrConfiguration(
+      configured, legacy_vulkan_hdr, REXCVAR_GET(gta4_native_hdr_mode_unified));
+  const std::string_view resolved_name = HdrModeName(resolved.mode);
+  const bool transport_enabled = HdrModeNeedsExtendedOutput(resolved.mode);
+  const bool canonical_written =
+      rex::cvar::SetFlagByName("gta4_native_hdr_mode", resolved_name);
+  const bool marker_written =
+      rex::cvar::SetFlagByName("gta4_native_hdr_mode_unified", "true");
+  const bool transport_written = rex::cvar::SetFlagByName(
+      "vulkan_hdr", transport_enabled ? "true" : "false");
+  if (!canonical_written || !marker_written || !transport_written) {
+    REXLOG_ERROR(
+        "GTA4HDRPolicy event=initialize-failed configured-raw={} legacy-vulkan-hdr={} "
+        "resolved={} canonical-written={} marker-written={} transport-written={}",
+        configured, legacy_vulkan_hdr, resolved_name, canonical_written, marker_written,
+        transport_written);
+  }
+  g_configured_hdr_mode.store(resolved.mode, std::memory_order_release);
+  g_hdr_controller_initialized.store(true, std::memory_order_release);
+  REXLOG_INFO(
+      "GTA4HDRPolicy event=initialize configured-raw={} legacy-vulkan-hdr={} unified={} "
+      "configured={} compatibility={} transport={}",
+      configured, legacy_vulkan_hdr, REXCVAR_GET(gta4_native_hdr_mode_unified), resolved_name,
+      HdrCompatibilityName(resolved.compatibility), transport_enabled);
+}
+
+bool ValidateSupersamplingSelection(
+    rex::graphics::gta4_native::AntiAliasingMode mode) {
+  using namespace rex::graphics::gta4_native;
+  const uint32_t pixel_factor = GetAntiAliasingRoute(mode).supersampling_pixel_factor;
+  if (pixel_factor == 1u) {
+    return true;
+  }
+
+  auto* runtime = rex::Runtime::instance();
+  auto* graphics = runtime ? runtime->graphics_system() : nullptr;
+  auto* window = runtime ? runtime->display_window() : nullptr;
+  if (!graphics || graphics->GetTitleCommandAbi(kTitleId) != kTitleCommandAbi || !window) {
+    REXLOG_ERROR(
+        "GTA4SSAA event=reject-selection factor={} reason=device-capabilities-unavailable",
+        pixel_factor);
+    return false;
+  }
+
+  uint32_t output_width = window->GetActualPhysicalWidth();
+  uint32_t output_height = window->GetActualPhysicalHeight();
+  int32_t preset_width = 0;
+  int32_t preset_height = 0;
+  if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
+                                                                     preset_height) &&
+      preset_width > 0 && preset_height > 0) {
+    output_width = uint32_t(preset_width);
+    output_height = uint32_t(preset_height);
+  }
+
+  QueryDeviceCapabilitiesCommand command{};
+  DeviceCapabilitiesResult capabilities{};
+  if (!output_width || !output_height ||
+      !graphics->ExecuteTitleCommand(kTitleId, kTitleCommandAbi, &command, sizeof(command),
+                                     &capabilities, sizeof(capabilities))) {
+    REXLOG_ERROR(
+        "GTA4SSAA event=reject-selection factor={} output={}x{} "
+        "reason=device-query-failed",
+        pixel_factor, output_width, output_height);
+    return false;
+  }
+
+  const auto physical = CalculateSupersampledExtent(
+      output_width, output_height, pixel_factor, capabilities.max_image_dimension_2d);
+  if (!physical) {
+    REXLOG_ERROR(
+        "GTA4SSAA event=reject-selection factor={} output={}x{} max-dimension={} "
+        "reason=physical-extent-unsupported",
+        pixel_factor, output_width, output_height, capabilities.max_image_dimension_2d);
+    return false;
+  }
+  REXLOG_INFO(
+      "GTA4SSAA event=validate-selection factor={} logical={}x{} physical={}x{} "
+      "max-dimension={}",
+      pixel_factor, output_width, output_height, physical->width, physical->height,
+      capabilities.max_image_dimension_2d);
+  return true;
 }
 
 }  // namespace
 
 namespace rex::graphics::gta4_native {
+
+void InitializeHdrController() {
+  std::lock_guard lock(g_hdr_controller_mutex);
+  InitializeFrontendHdrControllerLocked();
+}
+
+HdrMode GetConfiguredHdrMode() {
+  InitializeHdrController();
+  return g_configured_hdr_mode.load(std::memory_order_acquire);
+}
+
+std::string_view GetConfiguredHdrModeName() {
+  return HdrModeName(GetConfiguredHdrMode());
+}
+
+bool SetConfiguredHdrMode(std::string_view value) {
+  const auto requested = ParseHdrMode(value);
+  if (!requested) {
+    REXLOG_ERROR("GTA4HDRPolicy event=reject requested={} reason=invalid-mode", value);
+    return false;
+  }
+  std::lock_guard lock(g_hdr_controller_mutex);
+  InitializeFrontendHdrControllerLocked();
+  const HdrMode previous =
+      g_configured_hdr_mode.load(std::memory_order_acquire);
+  const bool transport_enabled = HdrModeNeedsExtendedOutput(*requested);
+  if (!rex::cvar::SetFlagByName("gta4_native_hdr_mode_unified", "true") ||
+      !rex::cvar::SetFlagByName("gta4_native_hdr_mode", HdrModeName(*requested)) ||
+      !rex::cvar::SetFlagByName("vulkan_hdr",
+                                transport_enabled ? "true" : "false")) {
+    REXLOG_ERROR("GTA4HDRPolicy event=reject requested={} reason=cvar-write", value);
+    return false;
+  }
+  g_configured_hdr_mode.store(*requested, std::memory_order_release);
+  REXLOG_INFO(
+      "GTA4HDRPolicy event=set previous={} configured={} transport={} apply=live",
+      HdrModeName(previous), HdrModeName(*requested), transport_enabled);
+  return true;
+}
 
 void InitializeAntiAliasingController() {
   std::lock_guard lock(g_anti_aliasing_controller_mutex);
@@ -256,6 +431,17 @@ AntiAliasingApplyResult SetConfiguredAntiAliasingMode(std::string_view value) {
       g_active_anti_aliasing_mode.load(std::memory_order_acquire);
   const AntiAliasingMode previous_configured =
       g_configured_anti_aliasing_mode.load(std::memory_order_acquire);
+  if (UsesSceneSupersampling(*requested) &&
+      rex::cvar::GetFlagByName("gta4_native_upscaler") != "native") {
+    REXLOG_ERROR(
+        "GTA4AAPolicy owner=frontend event=reject requested={} reason=upscaler-conflict "
+        "upscaler={}",
+        value, rex::cvar::GetFlagByName("gta4_native_upscaler"));
+    return AntiAliasingApplyResult::kRejected;
+  }
+  if (!ValidateSupersamplingSelection(*requested)) {
+    return AntiAliasingApplyResult::kRejected;
+  }
   const bool apply_live = CanApplyAntiAliasingLive(active, *requested);
 
   if (!rex::cvar::SetFlagByName("gta4_native_anti_aliasing_unified", "true")) {
@@ -295,11 +481,11 @@ AntiAliasingApplyResult SetConfiguredAntiAliasingMode(std::string_view value) {
   const auto route = GetAntiAliasingRoute(resulting_active);
   REXLOG_INFO(
       "GTA4AAPolicy owner=frontend event=set previous-configured={} requested={} active-before={} "
-      "active-after={} apply={} route-fxaa={} route-smaa={} scene-samples={}",
+      "active-after={} apply={} route-fxaa={} route-smaa={} scene-samples={} ssaa-factor={}",
       AntiAliasingModeName(previous_configured), AntiAliasingModeName(*requested),
       AntiAliasingModeName(active), AntiAliasingModeName(resulting_active),
       apply_live ? "live" : "restart", route.presentation_fxaa, route.presentation_smaa,
-      route.scene_sample_count);
+      route.scene_sample_count, route.supersampling_pixel_factor);
   return apply_live ? AntiAliasingApplyResult::kAppliedLive
                     : AntiAliasingApplyResult::kRestartRequired;
 }
@@ -428,22 +614,38 @@ std::optional<rex::PathConfig> GTA4App::OnFinalizePaths(
 }
 
 void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
+  rex::input::mnk::SetNativeControllerCompatibilityBindings(
+      gta4::input::KeyboardControllerBindings());
   if (!config.graphics && config.gpu_plugin.empty()) {
     config.gpu_plugin = "gta4-native";
   }
 
   ApplyPresentationMode();
+  rex::graphics::gta4_native::InitializeHdrController();
 
-  const bool use_fsr1 = REXCVAR_GET(gta4_native_upscaler) == "fsr1";
+  const bool ssaa_active =
+      rex::graphics::gta4_native::UsesSceneSupersampling(
+          rex::graphics::gta4_native::GetActiveAntiAliasingMode());
+  const bool fsr1_requested = REXCVAR_GET(gta4_native_upscaler) == "fsr1";
+  const bool use_fsr1 = fsr1_requested && !ssaa_active;
+  if (fsr1_requested && ssaa_active) {
+    REXLOG_ERROR(
+        "GTA4AAPolicy owner=startup event=reject-upscaler upscaler=fsr1 aa={} "
+        "reason=ssaa-renders-above-output-resolution",
+        rex::graphics::gta4_native::GetActiveAntiAliasingModeName());
+  }
   REXCVAR_SET(present_effect, use_fsr1 ? "fsr" : "bilinear");
   REXCVAR_SET(present_fsr_sharpness_reduction, REXCVAR_GET(gta4_fsr1_sharpness_reduction));
   REXLOG_INFO(
       "GTA IV native image quality: aa={} upscaler={} fsr1-quality={} "
-      "fsr1-sharpness-reduction={} aspect={} present-mode={} hdr={}",
+      "fsr1-sharpness-reduction={} aspect={} present-mode={} hdr-mode={} hdr-transport={} "
+      "paper-white-nits={} peak-nits={}",
       REXCVAR_GET(gta4_native_anti_aliasing), REXCVAR_GET(gta4_native_upscaler),
       REXCVAR_GET(gta4_fsr1_quality), REXCVAR_GET(gta4_fsr1_sharpness_reduction),
       REXCVAR_GET(gta4_aspect_ratio), REXCVAR_GET(gta4_present_mode),
-      rex::cvar::Query<bool>("vulkan_hdr"));
+      rex::graphics::gta4_native::GetConfiguredHdrModeName(),
+      rex::cvar::Query<bool>("vulkan_hdr"), REXCVAR_GET(gta4_native_hdr_paper_white_nits),
+      REXCVAR_GET(gta4_native_hdr_peak_nits));
 
   const std::string backend = REXCVAR_GET(gta4_multiplayer_backend);
   config.live.session_protocol_version = 2;
@@ -480,9 +682,14 @@ void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
 void GTA4App::OnPostSetup() {
   rex::graphics::gta4_native::InitializeAntiAliasingController();
   gta4::input::InitializeContextTouchControls();
-  user_music_player_ =
-      std::make_unique<gta4::input::UserMusicPlayer>(liberty_root_ / "User Music");
-  gta4::input::PublishUserMusicPlayer(user_music_player_.get());
+  if (REXCVAR_GET(gta4_diagnostics_skip_user_music)) {
+    gta4::input::PublishUserMusicPlayer(nullptr);
+    REXLOG_INFO("gta4-user-music: skipped for isolated diagnostics");
+  } else {
+    user_music_player_ =
+        std::make_unique<gta4::input::UserMusicPlayer>(liberty_root_ / "User Music");
+    gta4::input::PublishUserMusicPlayer(user_music_player_.get());
+  }
   if (text_chat_dialog_) {
     text_chat_dialog_->AttachLive(
         runtime()->kernel_state()->live_compatibility());

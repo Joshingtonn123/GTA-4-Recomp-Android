@@ -107,6 +107,13 @@ TEST_CASE("GTA IV frontend descriptor ownership is page-specific", "[system][gta
   CHECK_FALSE(policy::OwnsDescriptor(policy::Page::kDisabled, 0x1000, 0x1000, 0x2000));
 }
 
+TEST_CASE("GTA IV frontend frees guest storage only while descriptor ownership is live",
+          "[system][gta4][frontend]") {
+  CHECK(policy::ShouldFreeGuestAllocation(true, 0x1000));
+  CHECK_FALSE(policy::ShouldFreeGuestAllocation(false, 0x1000));
+  CHECK_FALSE(policy::ShouldFreeGuestAllocation(true, 0));
+}
+
 TEST_CASE("GTA IV frontend restores primary only when advanced leaves Display",
           "[system][gta4][frontend]") {
   CHECK(policy::ShouldRestorePrimaryBeforeSwitch(policy::Page::kAdvanced, 7, 8));

@@ -59,6 +59,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void Draw(UIDrawContext& ui_draw_context) override;
 
  protected:
+  const char* input_trace_name() const override { return "imgui"; }
   void OnKeyDown(KeyEvent& e) override;
   void OnKeyUp(KeyEvent& e) override;
   void OnKeyChar(KeyEvent& e) override;

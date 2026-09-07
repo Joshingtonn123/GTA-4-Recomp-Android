@@ -167,6 +167,11 @@ constexpr bool OwnsDescriptor(Page page, uint32_t published_rows, uint32_t prima
   return false;
 }
 
+constexpr bool ShouldFreeGuestAllocation(bool owns_published_descriptor,
+                                         uint32_t allocation) noexcept {
+  return owns_published_descriptor && allocation != 0;
+}
+
 constexpr bool ShouldRestorePrimaryBeforeSwitch(Page page, uint32_t target_screen,
                                                 uint32_t display_screen) noexcept {
   return page == Page::kAdvanced && target_screen != display_screen;

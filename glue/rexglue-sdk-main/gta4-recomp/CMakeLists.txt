@@ -100,7 +100,6 @@ if(APPLE AND LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
         src/gta4_native_hooks.cpp
         src/gta4_population_hooks.cpp
         src/gta4_streaming_diagnostics.cpp
-        src/gta4_physics_trace.cpp
         src/gta4_touch_coordinator.cpp
         src/gta4_transition_hooks.cpp
         src/install/gta4_install_dialog.cpp
@@ -169,6 +168,14 @@ if(APPLE AND LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
     # same runtime directory after the generic staging command has run.
     if(TARGET MoltenVK)
         add_dependencies(LibertyRecomp MoltenVK)
+        # The target dependency establishes build order, but by itself it does
+        # not rerun this target's POST_BUILD events when only MoltenVK changes.
+        # Make the driver a file-level link dependency so the app is relinked
+        # and the authoritative workspace driver is restaged after the generic
+        # SDK runtime staging step.
+        set_property(TARGET LibertyRecomp APPEND PROPERTY LINK_DEPENDS
+            "$<TARGET_FILE:MoltenVK>"
+        )
         add_custom_command(TARGET LibertyRecomp POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 "$<TARGET_BUNDLE_CONTENT_DIR:LibertyRecomp>/Resources/vulkan/lib"

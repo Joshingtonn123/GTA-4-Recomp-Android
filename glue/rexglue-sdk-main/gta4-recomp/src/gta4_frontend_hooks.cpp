@@ -14,6 +14,7 @@
 #include <rex/cvar.h>
 #include <rex/diagnostics/policy.h>
 #include <rex/graphics/gta4_native/anti_aliasing_policy.h>
+#include <rex/graphics/gta4_native/hdr_policy.h>
 #include <rex/input/input_trace.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
@@ -79,6 +80,8 @@ enum class TextId : uint8_t {
   kPresentationLabel,
   kFrameLimitLabel,
   kHdrLabel,
+  kPaperWhiteLabel,
+  kPeakBrightnessLabel,
   kPostAaLabel,
   kUpscalingLabel,
   kFsrLabel,
@@ -105,11 +108,34 @@ enum class TextId : uint8_t {
   kFullscreen,
   kOff,
   kOn,
+  kScRgb,
+  kAutoHdr,
+  k80Nits,
+  k100Nits,
+  k160Nits,
+  k203Nits,
+  k250Nits,
+  k300Nits,
+  k400Nits,
+  k500Nits,
+  k600Nits,
+  k800Nits,
+  k1000Nits,
+  k1500Nits,
+  k2000Nits,
   kMailbox,
   kFxaa,
   kSmaa,
   kMsaa2x,
   kMsaa4x,
+  kSsaa2x,
+  kSsaa4x,
+  kSsaa6x,
+  kSsaa8x,
+  kSsaa10x,
+  kSsaa12x,
+  kSsaa14x,
+  kSsaa16x,
   kLow,
   kMedium,
   kHigh,
@@ -145,6 +171,8 @@ struct Choice {
 enum class SettingBinding : uint8_t {
   kCvar,
   kAntiAliasing,
+  kHdr,
+  kUpscaler,
 };
 
 struct Setting {
@@ -172,6 +200,29 @@ constexpr std::array kToggleChoices = {
     Choice{"false", TextId::kOff},
     Choice{"true", TextId::kOn},
 };
+constexpr std::array kHdrChoices = {
+    Choice{"off", TextId::kOff},
+    Choice{"scrgb", TextId::kScRgb},
+    Choice{"auto_hdr", TextId::kAutoHdr},
+};
+constexpr std::array kPaperWhiteChoices = {
+    Choice{"80", TextId::k80Nits},
+    Choice{"100", TextId::k100Nits},
+    Choice{"160", TextId::k160Nits},
+    Choice{"203", TextId::k203Nits},
+    Choice{"250", TextId::k250Nits},
+    Choice{"300", TextId::k300Nits},
+    Choice{"400", TextId::k400Nits},
+    Choice{"500", TextId::k500Nits},
+};
+constexpr std::array kPeakBrightnessChoices = {
+    Choice{"400", TextId::k400Nits},
+    Choice{"600", TextId::k600Nits},
+    Choice{"800", TextId::k800Nits},
+    Choice{"1000", TextId::k1000Nits},
+    Choice{"1500", TextId::k1500Nits},
+    Choice{"2000", TextId::k2000Nits},
+};
 constexpr std::array kDisplayModeChoices = {
     Choice{"false", TextId::kWindowed},
     Choice{"true", TextId::kFullscreen},
@@ -194,6 +245,14 @@ constexpr std::array kAntiAliasingChoices = {
     Choice{"smaa", TextId::kSmaa},
     Choice{"msaa2x", TextId::kMsaa2x},
     Choice{"msaa4x", TextId::kMsaa4x},
+    Choice{"ssaa2x", TextId::kSsaa2x},
+    Choice{"ssaa4x", TextId::kSsaa4x},
+    Choice{"ssaa6x", TextId::kSsaa6x},
+    Choice{"ssaa8x", TextId::kSsaa8x},
+    Choice{"ssaa10x", TextId::kSsaa10x},
+    Choice{"ssaa12x", TextId::kSsaa12x},
+    Choice{"ssaa14x", TextId::kSsaa14x},
+    Choice{"ssaa16x", TextId::kSsaa16x},
 };
 constexpr std::array kUpscalerChoices = {
     Choice{"native", TextId::kNative},
@@ -239,14 +298,20 @@ constexpr std::array kSettings = {
             kResolutionChoices.size(), true},
     Setting{"LR_ASPECT", TextId::kAspectLabel, "gta4_aspect_ratio", kAspectChoices.data(),
             kAspectChoices.size(), true},
-    Setting{"LR_HDR", TextId::kHdrLabel, "vulkan_hdr", kToggleChoices.data(),
-            kToggleChoices.size()},
+    Setting{"LR_HDR", TextId::kHdrLabel, "gta4_native_hdr_mode", kHdrChoices.data(),
+            kHdrChoices.size(), false, SettingBinding::kHdr},
+    Setting{"LR_HDR_WHITE", TextId::kPaperWhiteLabel,
+            "gta4_native_hdr_paper_white_nits", kPaperWhiteChoices.data(),
+            kPaperWhiteChoices.size()},
+    Setting{"LR_HDR_PEAK", TextId::kPeakBrightnessLabel,
+            "gta4_native_hdr_peak_nits", kPeakBrightnessChoices.data(),
+            kPeakBrightnessChoices.size()},
     Setting{"LR_PRESENT", TextId::kPresentationLabel, "gta4_present_mode", kPresentChoices.data(),
             kPresentChoices.size(), true},
     Setting{"LR_FPS", TextId::kFrameLimitLabel, "gta4_frame_limit", kFrameLimitChoices.data(),
             kFrameLimitChoices.size()},
     Setting{"LR_UPSCALE", TextId::kUpscalingLabel, "gta4_native_upscaler", kUpscalerChoices.data(),
-            kUpscalerChoices.size(), true},
+            kUpscalerChoices.size(), true, SettingBinding::kUpscaler},
     Setting{"LR_FSR", TextId::kFsrLabel, "gta4_fsr1_quality", kFsrQualityChoices.data(),
             kFsrQualityChoices.size(), true},
     Setting{"LR_AA", TextId::kPostAaLabel, "gta4_native_anti_aliasing", kAntiAliasingChoices.data(),
@@ -280,6 +345,8 @@ constexpr std::array<std::string_view, static_cast<size_t>(TextId::kCount)> kStr
     "Vertical Sync",
     "Frame Rate Limit",
     "HDR",
+    "Paper White",
+    "Peak Brightness",
     "Anti-Aliasing",
     "Upscaler",
     "Upscaling Quality",
@@ -306,11 +373,34 @@ constexpr std::array<std::string_view, static_cast<size_t>(TextId::kCount)> kStr
     "Fullscreen",
     "Off",
     "On",
+    "scRGB",
+    "Auto HDR",
+    "80 nits",
+    "100 nits",
+    "160 nits",
+    "203 nits",
+    "250 nits",
+    "300 nits",
+    "400 nits",
+    "500 nits",
+    "600 nits",
+    "800 nits",
+    "1000 nits",
+    "1500 nits",
+    "2000 nits",
     "Mailbox (Low Latency)",
     "FXAA",
     "SMAA",
     "MSAA 2x (Deferred)",
     "MSAA 4x (Deferred)",
+    "SSAA 2x",
+    "SSAA 4x",
+    "SSAA 6x",
+    "SSAA 8x",
+    "SSAA 10x",
+    "SSAA 12x",
+    "SSAA 14x",
+    "SSAA 16x",
     "Low",
     "Medium",
     "High",
@@ -808,6 +898,9 @@ std::string CurrentSettingValue(const Setting& setting) {
     return std::string(
         rex::graphics::gta4_native::GetConfiguredAntiAliasingModeName());
   }
+  if (setting.binding == SettingBinding::kHdr) {
+    return std::string(rex::graphics::gta4_native::GetConfiguredHdrModeName());
+  }
   return rex::cvar::GetFlagByName(setting.cvar);
 }
 
@@ -975,8 +1068,17 @@ void ReleaseDisplayExtension(PPCContext& ctx, uint8_t* base) {
   }
   const uint32_t allocation = g_display_menu.allocation;
   g_display_menu = {};
-  if (allocation != 0) {
+  if (gta4::frontend_menu::policy::ShouldFreeGuestAllocation(owns_published_descriptor,
+                                                              allocation)) {
     InvokeGuest(ctx, base, sub_821B3560, allocation);
+  } else if (allocation != 0) {
+    // Host-side menu state survives an episode/title reload, but its guest
+    // allocation does not. A changed descriptor means the guest no longer
+    // proves ownership of this address, so calling the guest allocator with it
+    // can free recycled memory.
+    REXLOG_WARN(
+        "GTA IV native menu: discarded stale allocation metadata {:08X}; guest free skipped",
+        allocation);
   }
   REXLOG_INFO("GTA IV native menu: release complete restored={}", owns_published_descriptor);
 }
@@ -1194,6 +1296,19 @@ void ChangeSetting(const Setting& setting, int32_t delta) {
       return;
     }
     restart_required = result == AntiAliasingApplyResult::kRestartRequired;
+  } else if (setting.binding == SettingBinding::kHdr) {
+    if (!rex::graphics::gta4_native::SetConfiguredHdrMode(choice.value)) {
+      REXLOG_ERROR("GTA IV Advanced Graphics: rejected {}={}", setting.cvar, choice.value);
+      return;
+    }
+  } else if (setting.binding == SettingBinding::kUpscaler && choice.value != "native" &&
+             rex::graphics::gta4_native::UsesSceneSupersampling(
+                 rex::graphics::gta4_native::GetConfiguredAntiAliasingMode())) {
+    REXLOG_ERROR(
+        "GTA IV Advanced Graphics: rejected {}={} because SSAA is selected; "
+        "select a non-SSAA anti-aliasing mode first",
+        setting.cvar, choice.value);
+    return;
   } else if (!rex::cvar::SetFlagByName(setting.cvar, choice.value)) {
     REXLOG_ERROR("GTA IV Advanced Graphics: rejected {}={}", setting.cvar, choice.value);
     return;

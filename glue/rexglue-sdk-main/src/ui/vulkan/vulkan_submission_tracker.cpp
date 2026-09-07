@@ -12,6 +12,7 @@
 #include <cstdint>
 
 #include <rex/assert.h>
+#include <rex/diagnostics/gpu_flight_recorder.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/util.h>
@@ -20,12 +21,17 @@ namespace rex {
 namespace ui {
 namespace vulkan {
 
+namespace gpu_flight = rex::diagnostics::gpu_flight;
+
 VulkanSubmissionTracker::FenceAcquisition::~FenceAcquisition() {
   if (!submission_tracker_) {
     // Dropped submission or left after std::move.
     return;
   }
   assert_true(submission_tracker_->fence_acquired_ == fence_);
+  gpu_flight::Record("fence.submission-register", uint64_t(uintptr_t(fence_)),
+                     submission_tracker_->submission_current_, 0,
+                     uint64_t(uintptr_t(submission_tracker_)), signal_failed_);
   if (fence_ != VK_NULL_HANDLE) {
     if (signal_failed_) {
       // Left in the unsignaled state.
@@ -45,6 +51,12 @@ void VulkanSubmissionTracker::Shutdown() {
   const VkDevice device = vulkan_device_->device();
   if (!AwaitAllSubmissionsCompletion()) {
     const VkResult idle_result = dfn.vkDeviceWaitIdle(device);
+    gpu_flight::Record("tracker.device-idle", uint64_t(uintptr_t(device)), submission_current_,
+                       0, uint64_t(uintptr_t(this)), 0, int32_t(idle_result));
+    if (idle_result < VK_SUCCESS) {
+      gpu_flight::Fail("tracker.device-idle", int32_t(idle_result),
+                       uint64_t(uintptr_t(device)), submission_current_);
+    }
     if (idle_result != VK_SUCCESS && idle_result != VK_ERROR_DEVICE_LOST) {
       // Destroying pending fences is invalid. Leave them to vkDestroyDevice,
       // which is the enclosing lifetime owner during fatal shutdown.
@@ -75,6 +87,9 @@ void VulkanSubmissionTracker::FenceAcquisition::SubmissionFailedOrDropped() {
     return;
   }
   assert_true(submission_tracker_->fence_acquired_ == fence_);
+  gpu_flight::Record("fence.submission-dropped", uint64_t(uintptr_t(fence_)),
+                     submission_tracker_->submission_current_, 0,
+                     uint64_t(uintptr_t(submission_tracker_)));
   if (fence_ != VK_NULL_HANDLE) {
     submission_tracker_->fences_reclaimed_.push_back(fence_);
   }
@@ -92,9 +107,16 @@ uint64_t VulkanSubmissionTracker::UpdateAndGetCompletedSubmission() {
     while (!fences_pending_.empty()) {
       const std::pair<uint64_t, VkFence>& pending_pair = fences_pending_.front();
       assert_true(pending_pair.first > submission_completed_on_gpu_);
-      if (dfn.vkGetFenceStatus(device, pending_pair.second) != VK_SUCCESS) {
+      const VkResult poll_result = dfn.vkGetFenceStatus(device, pending_pair.second);
+      if (poll_result < VK_SUCCESS) {
+        gpu_flight::Fail("fence.poll", int32_t(poll_result),
+                         uint64_t(uintptr_t(pending_pair.second)), pending_pair.first);
+      }
+      if (poll_result != VK_SUCCESS) {
         break;
       }
+      gpu_flight::Record("fence.completed", uint64_t(uintptr_t(pending_pair.second)),
+                         pending_pair.first, 0, uint64_t(uintptr_t(this)));
       fences_reclaimed_.push_back(pending_pair.second);
       submission_completed_on_gpu_ = pending_pair.first;
       fences_pending_.pop_front();
@@ -109,6 +131,9 @@ bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_inde
   // completely invalid value or has done overly optimistic math if such an
   // index has been obtained somehow.
   assert_true(submission_index <= submission_current_);
+  if (SubmissionCompletionReached(submission_completed_on_gpu_, submission_index)) {
+    return true;
+  }
   // Waiting for the current submission is fine if there was a failure or a
   // refusal to submit, and the submission index wasn't incremented, but still
   // need to release objects referenced in the dropped submission (while
@@ -134,13 +159,28 @@ bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_inde
       assert_true(pending_pair.first > submission_completed_on_gpu_);
       if (pending_pair.first <= submission_index) {
         // Wait if requested.
-        if (dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE, UINT64_MAX) ==
-            VK_SUCCESS) {
+        gpu_flight::Record("fence.wait-begin", uint64_t(uintptr_t(pending_pair.second)),
+                           pending_pair.first, 0, uint64_t(uintptr_t(this)), submission_index);
+        const VkResult wait_result =
+            dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE, UINT64_MAX);
+        gpu_flight::Record("fence.wait-end", uint64_t(uintptr_t(pending_pair.second)),
+                           pending_pair.first, 0, uint64_t(uintptr_t(this)), submission_index,
+                           int32_t(wait_result));
+        if (wait_result < VK_SUCCESS) {
+          gpu_flight::Fail("fence.wait", int32_t(wait_result),
+                           uint64_t(uintptr_t(pending_pair.second)), pending_pair.first);
+        }
+        if (wait_result == VK_SUCCESS) {
           break;
         }
       }
       // Just refresh the completed submission.
-      if (dfn.vkGetFenceStatus(device, pending_pair.second) == VK_SUCCESS) {
+      const VkResult poll_result = dfn.vkGetFenceStatus(device, pending_pair.second);
+      if (poll_result < VK_SUCCESS) {
+        gpu_flight::Fail("fence.wait-poll", int32_t(poll_result),
+                         uint64_t(uintptr_t(pending_pair.second)), pending_pair.first);
+      }
+      if (poll_result == VK_SUCCESS) {
         break;
       }
       --reclaim_end;
@@ -153,7 +193,7 @@ bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_inde
       }
     }
   }
-  return submission_completed_on_gpu_ == submission_index;
+  return SubmissionCompletionReached(submission_completed_on_gpu_, submission_index);
 }
 
 VulkanSubmissionTracker::FenceAcquisition
@@ -166,7 +206,15 @@ VulkanSubmissionTracker::AcquireFenceToAdvanceSubmission() {
   const VkDevice device = vulkan_device_->device();
   if (!fences_reclaimed_.empty()) {
     VkFence reclaimed_fence = fences_reclaimed_.back();
-    if (dfn.vkResetFences(device, 1, &reclaimed_fence) == VK_SUCCESS) {
+    const VkResult reset_result = dfn.vkResetFences(device, 1, &reclaimed_fence);
+    gpu_flight::Record("fence.reset", uint64_t(uintptr_t(reclaimed_fence)), submission_current_,
+                       0, uint64_t(uintptr_t(this)), submission_completed_on_gpu_,
+                       int32_t(reset_result));
+    if (reset_result < VK_SUCCESS) {
+      gpu_flight::Fail("fence.reset", int32_t(reset_result),
+                       uint64_t(uintptr_t(reclaimed_fence)), submission_current_);
+    }
+    if (reset_result == VK_SUCCESS) {
       fence_acquired_ = fences_reclaimed_.back();
       fences_reclaimed_.pop_back();
     }
@@ -177,7 +225,14 @@ VulkanSubmissionTracker::AcquireFenceToAdvanceSubmission() {
     fence_create_info.pNext = nullptr;
     fence_create_info.flags = 0;
     // May fail, a null fence is handled in FenceAcquisition.
-    dfn.vkCreateFence(device, &fence_create_info, nullptr, &fence_acquired_);
+    const VkResult create_result =
+        dfn.vkCreateFence(device, &fence_create_info, nullptr, &fence_acquired_);
+    gpu_flight::Record("fence.create", uint64_t(uintptr_t(fence_acquired_)), submission_current_,
+                       0, uint64_t(uintptr_t(this)), 0, int32_t(create_result));
+    if (create_result < VK_SUCCESS) {
+      gpu_flight::Fail("fence.create", int32_t(create_result),
+                       uint64_t(uintptr_t(device)), submission_current_);
+    }
   }
   return FenceAcquisition(*this, fence_acquired_);
 }

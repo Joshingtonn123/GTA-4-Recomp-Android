@@ -1,0 +1,2306 @@
+diff --git a/XenosRecomp/air_compiler.cpp b/XenosRecomp/air_compiler.cpp
+index 9da5a539ed99edbe03b7469bb82d21fe22b9e69d..131f890c817c9f3332be6c1839a2a49eefdd087c 100644
+--- a/XenosRecomp/air_compiler.cpp
++++ b/XenosRecomp/air_compiler.cpp
+@@ -5,6 +5,8 @@
+ #include <spawn.h>
+ #include <unistd.h>
+ 
++extern char** environ;
++
+ struct TemporaryPath
+ {
+     const std::string path;
+@@ -20,7 +22,7 @@ struct TemporaryPath
+ static int executeCommand(const char** argv)
+ {
+     pid_t pid;
+-    if (posix_spawn(&pid, argv[0], nullptr, nullptr, const_cast<char**>(argv), nullptr) != 0)
++    if (posix_spawn(&pid, argv[0], nullptr, nullptr, const_cast<char**>(argv), environ) != 0)
+         return -1;
+ 
+     int status;
+@@ -54,7 +56,11 @@ std::vector<uint8_t> AirCompiler::compile(const std::string& shaderSource)
+     }
+ 
+     const char* compileCommand[] = {
+-        "/usr/bin/xcrun", "-sdk", "macosx", "metal", "-o", irPath.path.c_str(), "-c", sourcePath.path.c_str(), "-Wno-unused-variable", "-frecord-sources", "-gline-tables-only", "-fmetal-math-mode=relaxed", "-D__air__",
++        // Let xcrun select the installed Metal toolchain. Passing
++        // "-sdk macosx" bypasses the separately downloaded MobileAsset
++        // toolchain in recent Xcode releases even though `xcrun metal` finds
++        // it correctly.
++        "/usr/bin/xcrun", "metal", "-o", irPath.path.c_str(), "-c", sourcePath.path.c_str(), "-Wno-unused-variable", "-frecord-sources", "-gline-tables-only", "-fmetal-math-mode=relaxed", "-D__air__",
+ #ifdef UNLEASHED_RECOMP
+         "-DUNLEASHED_RECOMP",
+ #endif
+@@ -73,7 +79,7 @@ std::vector<uint8_t> AirCompiler::compile(const std::string& shaderSource)
+         std::exit(1);
+     }
+ 
+-    const char* linkCommand[] = { "/usr/bin/xcrun", "-sdk", "macosx", "metallib", "-o", metalLibPath.path.c_str(), irPath.path.c_str(), nullptr };
++    const char* linkCommand[] = { "/usr/bin/xcrun", "metallib", "-o", metalLibPath.path.c_str(), irPath.path.c_str(), nullptr };
+     if (const int linkStatus = executeCommand(linkCommand); linkStatus != 0)
+     {
+         fmt::println("Metal linker exited with status: {}", linkStatus);
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index 5cbea50e6e5f0701a5dcdba40ccbc08d11d29329..753bcd34506aa1a634e0c70e148eb091003b017c 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -1,4 +1,5 @@
+ #include <deque>
++#include <fstream>
+ #include <mutex>
+ #include <thread>
+ 
+@@ -6,6 +7,7 @@
+ #include "shader_common.h"
+ #include "shader_recompiler.h"
+ #include "dxc_compiler.h"
++#include "shader_source_preservation.h"
+ 
+ #ifdef XENOS_RECOMP_AIR
+ #include "air_compiler.h"
+@@ -38,6 +40,10 @@ struct RecompiledShader
+     std::vector<uint8_t> lateSpirv;
+     std::vector<uint8_t> air;
+     uint32_t specConstantsMask = 0;
++    uint32_t usedTextureMask = 0;
++    bool recoveredPixelShader = false;
++    std::string recoveredEarly;
++    std::string recoveredLate;
+ };
+ 
+ void recompileShader(RecompiledShader& shader, const std::string_view include, std::atomic<uint32_t>& progress, uint32_t numShaders)
+@@ -47,27 +53,33 @@ void recompileShader(RecompiledShader& shader, const std::string_view include, s
+ 
+     thread_local ShaderRecompiler recompiler;
+     recompiler = {};
+-    recompiler.recompile(shader.data, include);
+-
+-    shader.specConstantsMask = recompiler.specConstantsMask;
++    const bool recovered = !shader.recoveredEarly.empty();
++    if (!recovered)
++    {
++        recompiler.recompile(shader.data, include);
++        shader.specConstantsMask = recompiler.specConstantsMask;
++        shader.usedTextureMask = recompiler.usedTextureMask;
++    }
++    const std::string& earlySource = recovered ? shader.recoveredEarly : recompiler.out;
++    const bool isPixelShader = recovered ? shader.recoveredPixelShader : recompiler.isPixelShader;
+ 
+ #ifdef XENOS_RECOMP_DXIL
+     {
+         std::lock_guard lock(dxcCompilerMutex);
+-        shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
++        shader.dxil = dxcCompiler.compile(earlySource, isPixelShader, shader.specConstantsMask != 0, false);
+     }
+     assert(shader.dxil != nullptr);
+     assert(*(reinterpret_cast<uint32_t *>(shader.dxil->GetBufferPointer()) + 1) != 0 && "DXIL was not signed properly!");
+ #endif
+ 
+ #ifdef XENOS_RECOMP_AIR
+-    shader.air = AirCompiler::compile(recompiler.out);
++    shader.air = AirCompiler::compile(earlySource);
+ #endif
+ 
+     IDxcBlob* spirv;
+     {
+         std::lock_guard lock(dxcCompilerMutex);
+-        spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
++        spirv = dxcCompiler.compile(earlySource, isPixelShader, false, true);
+     }
+     assert(spirv != nullptr);
+ 
+@@ -76,16 +88,20 @@ void recompileShader(RecompiledShader& shader, const std::string_view include, s
+ 
+     spirv->Release();
+ 
+-    if (recompiler.isPixelShader &&
+-        (recompiler.specConstantsMask & SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK) == SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK)
++    if (recovered ? !shader.recoveredLate.empty() :
++        (isPixelShader && (shader.specConstantsMask & SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK) == SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK))
+     {
+-        recompiler = {};
+-        recompiler.recompile(shader.data, include, false);
+-        assert((recompiler.specConstantsMask & SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK) == SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK);
++        if (!recovered)
++        {
++            recompiler = {};
++            recompiler.recompile(shader.data, include, false);
++            assert((recompiler.specConstantsMask & SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK) == SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK);
++            assert(recompiler.usedTextureMask == shader.usedTextureMask);
++        }
+ 
+         {
+             std::lock_guard lock(dxcCompilerMutex);
+-            spirv = dxcCompiler.compile(recompiler.out, true, false, true);
++            spirv = dxcCompiler.compile(recovered ? shader.recoveredLate : recompiler.out, true, false, true);
+         }
+         assert(spirv != nullptr);
+ 
+@@ -105,7 +121,8 @@ int main(int argc, char** argv)
+ #ifndef XENOS_RECOMP_INPUT
+     if (argc < 4)
+     {
+-        printf("Usage: XenosRecomp [input path] [output path] [shader common header file path]");
++        printf("Usage: XenosRecomp [input path] [output path] [shader common header file path] "
++               "[--preserve-sources baseline-sources.tsv] [--recovered-sources recovered-sources.tsv]\n");
+         return 0;
+     }
+ #endif
+@@ -134,6 +151,46 @@ int main(int argc, char** argv)
+ #endif
+         ;
+ 
++    PreferredShaderSources preferredSources;
++    std::string preferredSourcePath;
++    std::string recoveredSourcePath;
++    std::map<uint64_t, RecoveredShaderSource> recoveredSources;
++    for (int argument = 4; argument < argc; argument += 2)
++    {
++        const std::string_view flag(argv[argument]);
++        std::string* destination = flag == "--preserve-sources" ? &preferredSourcePath :
++            flag == "--recovered-sources" ? &recoveredSourcePath : nullptr;
++        if (!destination || !destination->empty() || argument + 1 >= argc)
++        {
++            fmt::println(stderr, "Invalid/duplicate shader source option: {}", flag);
++            return 1;
++        }
++        *destination = argv[argument + 1];
++    }
++    if (!preferredSourcePath.empty() || !recoveredSourcePath.empty())
++    {
++        if (!std::filesystem::is_directory(input))
++        {
++            fmt::println(stderr, "Shader preservation requires a complete input directory");
++            return 1;
++        }
++        try
++        {
++            std::ifstream sourceMap(preferredSourcePath);
++            preferredSources = ReadPreferredShaderSources(sourceMap);
++            if (!recoveredSourcePath.empty())
++            {
++                std::ifstream recoveredMap(recoveredSourcePath);
++                recoveredSources = ReadRecoveredShaderSources(recoveredMap, preferredSources);
++            }
++        }
++        catch (const std::exception& error)
++        {
++            fmt::println(stderr, "Cannot load shader-preservation source map: {}", error.what());
++            return 1;
++        }
++    }
++
+     size_t includeSize = 0;
+     auto includeData = readAllBytes(includeInput, includeSize);
+     std::string_view include(reinterpret_cast<const char*>(includeData.get()), includeSize);
+@@ -154,6 +211,7 @@ int main(int argc, char** argv)
+             size_t fileSize = 0;
+             auto fileData = readAllBytes(file.path().string().c_str(), fileSize);
+             bool foundAny = false;
++            const std::string sourceName = ShaderCacheSourceName(file.path().string());
+ 
+             for (size_t i = 0; fileSize > sizeof(ShaderContainer) && i < fileSize - sizeof(ShaderContainer) - 1;)
+             {
+@@ -166,12 +224,18 @@ int main(int argc, char** argv)
+                     shaderContainer->field20 == 0)
+                 {
+                     XXH64_hash_t hash = XXH3_64bits(shaderContainer, dataSize);
+-                    auto shader = shaders.try_emplace(hash);
+-                    if (shader.second)
++                    // A baseline hash is selected only from its original source.
++                    // Continue scanning every file/container, including duplicates;
++                    // no corpus files are removed to influence traversal order.
++                    if (IsPreferredShaderSource(preferredSources, hash, sourceName))
+                     {
+-                        shader.first->second.data = fileData.get() + i;
+-                        foundAny = true;
+-                        shaderFilenames[hash] = file.path().string();
++                        auto shader = shaders.try_emplace(hash);
++                        if (shader.second)
++                        {
++                            shader.first->second.data = fileData.get() + i;
++                            foundAny = true;
++                            shaderFilenames[hash] = sourceName;
++                        }
+                     }
+ 
+                     i += dataSize;
+@@ -188,6 +252,52 @@ int main(int argc, char** argv)
+                 files.emplace_back(std::move(fileData));
+         }
+ 
++        try
++        {
++            const auto recoveryDirectory = std::filesystem::path(recoveredSourcePath).parent_path();
++            const auto loadSource = [&](const std::string& filename, bool pixel)
++            {
++                std::ifstream stream(recoveryDirectory / filename, std::ios::binary);
++                if (!stream)
++                    throw std::runtime_error("cannot read recovered source: " + filename);
++                std::string source((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
++                if (stream.bad() || !HasCurrentRecoveredShaderPrefix(source, include, pixel))
++                    throw std::runtime_error("recovered source has stale/missing stage preamble or common header: " + filename);
++                return source;
++            };
++            for (const auto& [hash, source] : recoveredSources)
++            {
++                // An actual original container always takes precedence over recovery.
++                if (shaders.find(hash) != shaders.end())
++                    continue;
++                auto& shader = shaders[hash];
++                shader.recoveredEarly = loadSource(source.early, source.isPixelShader);
++                if (!source.late.empty())
++                    shader.recoveredLate = loadSource(source.late, source.isPixelShader);
++                shader.recoveredPixelShader = source.isPixelShader;
++                shader.specConstantsMask = source.specConstantsMask;
++                shader.usedTextureMask = source.usedTextureMask;
++                shaderFilenames[hash] = source.filename;
++            }
++        }
++        catch (const std::exception& error)
++        {
++            fmt::println(stderr, "Cannot load recovered shader sources: {}", error.what());
++            return 1;
++        }
++
++        bool missingPreferredSource = false;
++        for (const auto& [hash, filename] : preferredSources)
++        {
++            if (shaders.find(hash) == shaders.end())
++            {
++                fmt::println(stderr, "Missing baseline shader {:016X} from preferred source {}", hash, filename);
++                missingPreferredSource = true;
++            }
++        }
++        if (missingPreferredSource)
++            return 1;
++
+         std::mutex shaderQueueMutex;
+         std::deque<XXH64_hash_t> shaderQueue;
+         for (const auto& [hash, _] : shaders)
+@@ -237,14 +347,7 @@ int main(int argc, char** argv)
+ 
+         for (auto& [hash, shader] : shaders)
+         {
+-            const std::string& fullFilename = shaderFilenames[hash];
+-            std::string filename = fullFilename;
+-            size_t shaderPos = filename.find("shader");
+-            if (shaderPos != std::string::npos) {
+-                filename = filename.substr(shaderPos);
+-                // Prevent bad escape sequences in Windows shader path.
+-                std::replace(filename.begin(), filename.end(), '\\', '/');
+-            }
++            const std::string& filename = shaderFilenames.at(hash);
+             const size_t dxilOffset = dxil.size();
+             const size_t spirvOffset = spirv.size();
+             const size_t airOffset = air.size();
+@@ -264,10 +367,18 @@ int main(int argc, char** argv)
+             const size_t lateSpirvOffset = shader.lateSpirv.empty() ? 0 : spirv.size();
+             spirv.insert(spirv.end(), shader.lateSpirv.begin(), shader.lateSpirv.end());
+ 
++#ifdef GTA4_RECOMP
++            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \"{}\", nullptr, {} }},",
++                hash, dxilOffset, (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0,
++                spirvOffset, shader.spirv.size(), lateSpirvOffset, shader.lateSpirv.size(),
++                airOffset, shader.air.size(), shader.specConstantsMask, filename,
++                shader.usedTextureMask);
++#else
+             f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \"{}\" }},",
+                 hash, dxilOffset, (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0,
+                 spirvOffset, shader.spirv.size(), lateSpirvOffset, shader.lateSpirv.size(),
+                 airOffset, shader.air.size(), shader.specConstantsMask, filename);
++#endif
+         }
+ 
+         f.println("}};");
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 0a47317c8dfa87d7e5ab52209adbecced55a2251..443c530e04c9a7dda3768279c6a753673d80b17a 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -36,6 +36,7 @@ struct PushConstants
+ [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
+ 
+ #ifdef GTA4_RECOMP
++#define GetTextureLodBias(SLOT) vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 752 + (SLOT) * 4)
+ #define g_Booleans                  vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 528)
+ #define g_SwappedTexcoords          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 532)
+ #define g_SwappedNormals            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 536)
+@@ -48,6 +49,9 @@ struct PushConstants
+ #define g_AlphaThreshold            vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 580)
+ #define g_conditionalSurveyIndex    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 584)
+ #define g_conditionalRenderingIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 588)
++#define g_AlphaToMask               vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 736)
++#define g_AlphaToMaskSampleCount    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 740)
++#define g_FragmentCoordinateScale   vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 744)
+ #else
+ #define g_Booleans                  vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 320)
+ #define g_SwappedTexcoords          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 324)
+@@ -89,6 +93,7 @@ struct PushConstants
+ };
+ 
+ #ifdef GTA4_RECOMP
++#define GetTextureLodBias(SLOT) (*(reinterpret_cast<device float*>(g_PushConstants.SharedConstants + 752 + (SLOT) * 4)))
+ #define g_Booleans (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 528)))
+ #define g_SwappedTexcoords (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 532)))
+ #define g_SwappedNormals (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 536)))
+@@ -101,6 +106,7 @@ struct PushConstants
+ #define g_AlphaThreshold (*(reinterpret_cast<device float*>(g_PushConstants.SharedConstants + 580)))
+ #define g_conditionalSurveyIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 584)))
+ #define g_conditionalRenderingIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 588)))
++#define g_FragmentCoordinateScale (*(reinterpret_cast<device float2*>(g_PushConstants.SharedConstants + 744)))
+ #else
+ #define g_Booleans (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 320)))
+ #define g_SwappedTexcoords (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 324)))
+@@ -119,6 +125,7 @@ struct PushConstants
+ #else
+ 
+ #ifdef GTA4_RECOMP
++#define GetTextureLodBias(SLOT) g_TextureLodBias[(SLOT) / 4][(SLOT) % 4]
+ #define DEFINE_SHARED_CONSTANTS() \
+     uint g_Booleans : packoffset(c33.x); \
+     uint g_SwappedTexcoords : packoffset(c33.y); \
+@@ -131,7 +138,9 @@ struct PushConstants
+     bool g_ClipPlaneEnabled : packoffset(c36.x); \
+     float g_AlphaThreshold : packoffset(c36.y); \
+     uint g_conditionalSurveyIndex : packoffset(c36.z); \
+-    uint g_conditionalRenderingIndex : packoffset(c36.w);
++    uint g_conditionalRenderingIndex : packoffset(c36.w); \
++    float2 g_FragmentCoordinateScale : packoffset(c46.z); \
++    float4 g_TextureLodBias[7] : packoffset(c47);
+ #else
+ #define DEFINE_SHARED_CONSTANTS() \
+     uint g_Booleans : packoffset(c20.x); \
+@@ -152,6 +161,52 @@ uint g_SpecConstants();
+ 
+ #endif
+ 
++#if defined(GTA4_RECOMP) && defined(__spirv__)
++uint ComputeXenosAlphaToMask(float alpha, float2 position, uint alphaToMask,
++                             uint sampleCount)
++{
++    if ((alphaToMask & 0x100u) == 0u)
++        return 0xFFFFFFFFu;
++
++    uint offsetIndex = (uint(position.x) & 1u) | ((uint(position.y) & 1u) << 1u);
++    uint offset = (alphaToMask >> (offsetIndex << 1u)) & 3u;
++    float thresholdOffset = float(offset);
++    uint sampleMask = 0u;
++
++    if (sampleCount == 1u)
++    {
++        if (alpha >= 1.0 - thresholdOffset * 0.25)
++            sampleMask |= 1u;
++    }
++    else if (sampleCount == 2u)
++    {
++        // Xenos top and bottom samples map to Vulkan samples 1 and 0.
++        if (alpha >= 0.5 - thresholdOffset * 0.125)
++            sampleMask |= 2u;
++        if (alpha >= 1.0 - thresholdOffset * 0.125)
++            sampleMask |= 1u;
++    }
++    else if (sampleCount == 4u)
++    {
++        // Xenos TL, BL, TR, BR map to Vulkan TL, TR, BL, BR.
++        if (alpha >= 0.75 - thresholdOffset * 0.0625)
++            sampleMask |= 1u;
++        if (alpha >= 0.25 - thresholdOffset * 0.0625)
++            sampleMask |= 4u;
++        if (alpha >= 0.5 - thresholdOffset * 0.0625)
++            sampleMask |= 2u;
++        if (alpha >= 1.0 - thresholdOffset * 0.0625)
++            sampleMask |= 8u;
++    }
++    else
++    {
++        return 0xFFFFFFFFu;
++    }
++
++    return sampleMask;
++}
++#endif
++
+ float4 cube(float4 value)
+ {
+     float3 src = value.zwx;
+@@ -281,46 +336,62 @@ float4 tfetch2D(constant Texture2DDescriptorHeap* textureHeap,
+                 constant SamplerDescriptorHeap* samplerHeap,
+                 uint resourceDescriptorIndex,
+                 uint samplerDescriptorIndex,
+-                float2 texCoord, float2 offset)
++                float2 texCoord, float2 offset, float lodBias = 0.0)
+ {
+     texture2d<float> texture = textureHeap[resourceDescriptorIndex].tex;
+     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
+-    return texture.sample(sampler, texCoord + offset / (float2)getTexture2DDimensions(texture));
++#if defined(GTA4_RECOMP) && !defined(XENOS_RECOMP_PIXEL_SHADER)
++    return texture.sample(sampler, texCoord + offset / (float2)getTexture2DDimensions(texture), level(lodBias));
++#else
++    return texture.sample(sampler, texCoord + offset / (float2)getTexture2DDimensions(texture), bias(lodBias));
++#endif
+ }
+ 
+ float4 tfetch2DArray(constant Texture2DArrayDescriptorHeap* textureHeap,
+                      constant SamplerDescriptorHeap* samplerHeap,
+                      uint resourceDescriptorIndex,
+                      uint samplerDescriptorIndex,
+-                     float3 texCoord, float3 offset)
++                     float3 texCoord, float3 offset, float lodBias = 0.0)
+ {
+     texture2d_array<float> texture = textureHeap[resourceDescriptorIndex].tex;
+     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
+     uint3 dimensions = getTexture2DArrayDimensions(texture);
+-    return texture.sample(sampler, texCoord.xy + offset.xy / float2(dimensions.xy), uint(texCoord.z * dimensions.z));
++#if defined(GTA4_RECOMP) && !defined(XENOS_RECOMP_PIXEL_SHADER)
++    return texture.sample(sampler, texCoord.xy + offset.xy / float2(dimensions.xy), uint(texCoord.z * dimensions.z), level(lodBias));
++#else
++    return texture.sample(sampler, texCoord.xy + offset.xy / float2(dimensions.xy), uint(texCoord.z * dimensions.z), bias(lodBias));
++#endif
+ }
+ 
+ float4 tfetch3D(constant Texture3DDescriptorHeap* textureHeap,
+                 constant SamplerDescriptorHeap* samplerHeap,
+                 uint resourceDescriptorIndex,
+                 uint samplerDescriptorIndex,
+-                float3 texCoord, float3 offset)
++                float3 texCoord, float3 offset, float lodBias = 0.0)
+ {
+     texture3d<float> texture = textureHeap[resourceDescriptorIndex].tex;
+     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
+-    return texture.sample(sampler, texCoord + offset / float3(getTexture3DDimensions(texture)));
++#if defined(GTA4_RECOMP) && !defined(XENOS_RECOMP_PIXEL_SHADER)
++    return texture.sample(sampler, texCoord + offset / float3(getTexture3DDimensions(texture)), level(lodBias));
++#else
++    return texture.sample(sampler, texCoord + offset / float3(getTexture3DDimensions(texture)), bias(lodBias));
++#endif
+ }
+ 
+ float4 tfetchCube(constant TextureCubeDescriptorHeap* textureHeap,
+                   constant SamplerDescriptorHeap* samplerHeap,
+                   uint resourceDescriptorIndex,
+                   uint samplerDescriptorIndex,
+-                  float3 texCoord)
++                  float3 texCoord, float lodBias = 0.0)
+ {
+     texturecube<float> texture = textureHeap[resourceDescriptorIndex].tex;
+     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
+     float3 dir = cubeDir(texCoord);
+-    return texture.sample(sampler, dir);
++#if defined(GTA4_RECOMP) && !defined(XENOS_RECOMP_PIXEL_SHADER)
++    return texture.sample(sampler, dir, level(lodBias));
++#else
++    return texture.sample(sampler, dir, bias(lodBias));
++#endif
+ }
+ 
+ float2 getWeights2D(constant Texture2DDescriptorHeap* textureHeap,
+@@ -389,50 +460,51 @@ uint3 getTexture3DDimensions(Texture3D<float4> texture)
+ 
+ // Pixel shaders need implicit derivatives for authored mip selection,
+ // trilinear filtering and anisotropic footprints. Vertex shaders still use
+-// explicit level zero because implicit derivatives are not available there.
+-float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
++// explicit base level zero because implicit derivatives are not available there.
++// Sampler bias applies to both base LOD modes (Vulkan LOD Operation).
++float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lodBias = 0.0)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+ #ifdef XENOS_RECOMP_PIXEL_SHADER
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lodBias);
+ #else
+-    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), 0);
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lodBias);
+ #endif
+ }
+ 
+-float4 tfetch2DArray(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
++float4 tfetch2DArray(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset, float lodBias = 0.0)
+ {
+     Texture2DArray<float4> texture = g_Texture2DArrayDescriptorHeap[resourceDescriptorIndex];
+     uint3 dimensions = getTexture2DArrayDimensions(texture);
+ #ifdef XENOS_RECOMP_PIXEL_SHADER
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z));
++    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), lodBias);
+ #else
+-    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), 0);
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), lodBias);
+ #endif
+ }
+ 
+-float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
++float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset, float lodBias = 0.0)
+ {
+     Texture3D<float4> texture = g_Texture3DDescriptorHeap[resourceDescriptorIndex];
+     uint3 dimensions = getTexture3DDimensions(texture);
+ #ifdef XENOS_RECOMP_PIXEL_SHADER
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+-                          texCoord + offset / dimensions);
++    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex],
++                          texCoord + offset / dimensions, lodBias);
+ #else
+     return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+-                               texCoord + offset / dimensions, 0);
++                               texCoord + offset / dimensions, lodBias);
+ #endif
+ }
+ 
+-float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
++float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lodBias = 0.0)
+ {
+     float3 dir = cubeDir(texCoord);
+ #ifdef XENOS_RECOMP_PIXEL_SHADER
+-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(
+-        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir);
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleBias(
++        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, lodBias);
+ #else
+     return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(
+-        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, 0);
++        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, lodBias);
+ #endif
+ }
+ 
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index e0b87f9b67b8e8d2f116830d5349916e8ef1706a..7d795437019dfac0d188109e39b870f91407638a 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -423,6 +423,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+             break;
+     }
+ 
++    // Sampler objects use zero hardware bias on the native backend. The guest
++    // slot, not a potentially shared native sampler index, owns this value.
++#ifdef GTA4_RECOMP
++    if (instr.opcode == FetchOpcode::TextureFetch)
++        print(", GetTextureLodBias({})", instr.constIndex);
++#endif
+     out += ").";
+ 
+     printDstSwizzle(instr.dstSwizzle, true);
+@@ -1335,11 +1341,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
+     assert(shaderContainer->constantTableOffset != NULL);
+ 
++    isPixelShader = (shaderContainer->flags & 0x1) == 0;
++
++    if (isPixelShader)
++        out += "#if defined(__air__) && !defined(XENOS_RECOMP_PIXEL_SHADER)\n#define XENOS_RECOMP_PIXEL_SHADER\n#endif\n";
+     out += include;
+     out += '\n';
+ 
+-    isPixelShader = (shaderContainer->flags & 0x1) == 0;
+-
+     const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
+     const bool hasAlphaTestCapability = isPixelShader &&
+         (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0);
+@@ -1445,6 +1453,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    for (uint32_t slot : referencedTfetchSlots)
++    {
++        // TextureFetchInstruction::constIndex is a five-bit Xenos field, so
++        // every possible slot has an exact bit in this 32-bit interface mask.
++        usedTextureMask |= uint32_t{1} << slot;
++    }
++
+     out += "#ifdef __spirv__\n\n";
+ 
+ #ifdef UNLEASHED_RECOMP
+@@ -1866,6 +1881,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR0)
+             out += "\tfloat4 oC0 : SV_Target0;\n";
++#ifdef GTA4_RECOMP
++        if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR0)
++            out += "#ifdef __spirv__\n\tuint oMask : SV_Coverage;\n#endif\n";
++#endif
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR1)
+             out += "\tfloat4 oC1 : SV_Target1;\n";
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR2)
+@@ -2013,6 +2032,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     println("\t{0} output = ({0})0;", outputName);
+     out += "#endif\n";
+ 
++#ifdef GTA4_RECOMP
++    if (hasAlphaTestCapability)
++        out += "#ifdef __spirv__\n\toutput.oMask = 0xFFFFFFFFu;\n#endif\n";
++#endif
++
+ #ifdef UNLEASHED_RECOMP
+     if (hasMtxProjection)
+     {
+@@ -2106,6 +2130,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++#ifdef GTA4_RECOMP
++    if (isPixelShader)
++    {
++        // Scale about the pixel-center origin. Scaling the raw SV_Position value
++        // about zero moves the first center below 0.5 and creates top/left seams.
++        out += "\tfloat2 guestPixelPosition = (input.iPos.xy - 0.5) * g_FragmentCoordinateScale + 0.5;\n";
++    }
++#endif
++
+     if (!isPixelShader)
+     {
+     #ifdef UNLEASHED_RECOMP
+@@ -2126,7 +2159,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             print("\tfloat4 r{} = ", i);
+             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
+             {
++#ifdef GTA4_RECOMP
++                out += "float4((guestPixelPosition - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++#else
+                 out += "float4((input.iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++#endif
+             }
+         #ifdef UNLEASHED_RECOMP
+             else if (!isPixelShader && hasIndexCount && i == 0)
+@@ -2528,6 +2565,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                         indent();
+                         out += "}\n";
+                 #endif
++
++                #ifdef GTA4_RECOMP
++                        indent();
++                        out += "#ifdef __spirv__\n";
++                        indent();
++                        out += "output.oMask = ComputeXenosAlphaToMask(output.oC0.w, guestPixelPosition, g_AlphaToMask, g_AlphaToMaskSampleCount);\n";
++                        indent();
++                        out += "#endif\n";
++                #endif
+                     }
+                 }
+                 else
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index 6c10b2bbcb779977bbdae76f0858e25b9d57ae81..d485264c6b0d754305ceee5426d4ed39e53179fb 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -33,6 +33,7 @@ struct ShaderRecompiler : StringBuffer
+     std::unordered_map<uint32_t, const char*> samplers;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
++    uint32_t usedTextureMask = 0;
+ 
+ #ifdef UNLEASHED_RECOMP
+     bool hasMtxProjection = false;
+diff --git a/XenosRecomp/shader_source_preservation.h b/XenosRecomp/shader_source_preservation.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8c85dada6088cbf82fd5bea6ef8fcff1f347032
+--- /dev/null
++++ b/XenosRecomp/shader_source_preservation.h
+@@ -0,0 +1,151 @@
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <charconv>
++#include <cstdint>
++#include <istream>
++#include <map>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++
++using PreferredShaderSources = std::map<uint64_t, std::string>;
++
++inline std::string ShaderCacheSourceName(std::string filename)
++{
++    const size_t shaderPos = filename.find("shader");
++    if (shaderPos != std::string::npos)
++    {
++        filename = filename.substr(shaderPos);
++        std::replace(filename.begin(), filename.end(), '\\', '/');
++    }
++    return filename;
++}
++
++inline PreferredShaderSources ReadPreferredShaderSources(std::istream& input)
++{
++    constexpr std::string_view prefix = "liberty-shader-sources-v1\t";
++    std::string line;
++    if (!std::getline(input, line) || line.compare(0, prefix.size(), prefix) != 0)
++        throw std::runtime_error("invalid shader-preservation source-map header");
++    size_t expectedCount = 0;
++    const auto count = std::from_chars(line.data() + prefix.size(), line.data() + line.size(), expectedCount);
++    if (count.ec != std::errc{} || count.ptr != line.data() + line.size() || !expectedCount)
++        throw std::runtime_error("invalid shader-preservation source-map count");
++
++    PreferredShaderSources sources;
++    while (std::getline(input, line))
++    {
++        const size_t tab = line.find('\t');
++        if (tab == std::string::npos || tab == 0 || tab == line.size() - 1 ||
++            line.find_first_of("\t\r", tab + 1) != std::string::npos)
++            throw std::runtime_error("malformed shader-preservation source-map row");
++        uint64_t hash = 0;
++        const auto parsed = std::from_chars(line.data(), line.data() + tab, hash, 16);
++        if (parsed.ec != std::errc{} || parsed.ptr != line.data() + tab)
++            throw std::runtime_error("invalid hash in shader-preservation source map");
++        if (!sources.emplace(hash, line.substr(tab + 1)).second)
++            throw std::runtime_error("duplicate hash in shader-preservation source map");
++    }
++    if (input.bad() || sources.size() != expectedCount)
++        throw std::runtime_error("shader-preservation source-map count mismatch");
++    return sources;
++}
++
++inline bool IsPreferredShaderSource(const PreferredShaderSources& sources,
++                                    uint64_t hash, const std::string& filename)
++{
++    const auto preferred = sources.find(hash);
++    return preferred == sources.end() || preferred->second == filename;
++}
++
++struct RecoveredShaderSource
++{
++    bool isPixelShader = false;
++    uint32_t specConstantsMask = 0;
++    uint32_t usedTextureMask = 0;
++    std::string filename;
++    std::string early;
++    std::string late;
++};
++
++inline bool HasCurrentRecoveredShaderPrefix(std::string_view source,
++                                           std::string_view common, bool pixel)
++{
++    constexpr std::string_view pixelPreamble =
++        "#if defined(__air__) && !defined(XENOS_RECOMP_PIXEL_SHADER)\n"
++        "#define XENOS_RECOMP_PIXEL_SHADER\n#endif\n";
++    if (pixel)
++    {
++        if (source.substr(0, pixelPreamble.size()) != pixelPreamble)
++            return false;
++        source.remove_prefix(pixelPreamble.size());
++    }
++    return source.size() > common.size() && source.substr(0, common.size()) == common;
++}
++
++inline std::map<uint64_t, RecoveredShaderSource> ReadRecoveredShaderSources(
++    std::istream& input, const PreferredShaderSources& preferred)
++{
++    constexpr std::string_view prefix = "liberty-recovered-sources-v1\t";
++    std::string line;
++    if (!std::getline(input, line) || line.compare(0, prefix.size(), prefix) != 0)
++        throw std::runtime_error("invalid recovered-source header");
++    size_t expectedCount = 0;
++    const auto count = std::from_chars(line.data() + prefix.size(), line.data() + line.size(), expectedCount);
++    if (count.ec != std::errc{} || count.ptr != line.data() + line.size() || !expectedCount)
++        throw std::runtime_error("invalid recovered-source count");
++    std::map<uint64_t, RecoveredShaderSource> sources;
++    while (std::getline(input, line))
++    {
++        std::array<std::string_view, 7> fields;
++        std::string_view remaining(line);
++        for (size_t i = 0; i < fields.size(); ++i)
++        {
++            const size_t tab = remaining.find('\t');
++            if ((i == fields.size() - 1) != (tab == std::string_view::npos))
++                throw std::runtime_error("invalid recovered-source column count");
++            fields[i] = remaining.substr(0, tab);
++            if (fields[i].empty() || fields[i].find('\r') != std::string_view::npos)
++                throw std::runtime_error("empty/invalid recovered-source field");
++            if (tab != std::string_view::npos)
++                remaining.remove_prefix(tab + 1);
++        }
++        const auto parse = [](std::string_view field, auto& value, int base)
++        {
++            const auto result = std::from_chars(field.data(), field.data() + field.size(), value, base);
++            if (result.ec != std::errc{} || result.ptr != field.data() + field.size())
++                throw std::runtime_error("invalid recovered-source integer");
++        };
++        uint64_t hash = 0;
++        parse(fields[0], hash, 16);
++        RecoveredShaderSource source;
++        if (fields[1] != "pixel" && fields[1] != "vertex")
++            throw std::runtime_error("invalid recovered-source stage");
++        source.isPixelShader = fields[1] == "pixel";
++        parse(fields[2], source.specConstantsMask, 10);
++        parse(fields[3], source.usedTextureMask, 10);
++        source.filename = fields[4];
++        const auto baseline = preferred.find(hash);
++        if (baseline == preferred.end() || baseline->second != source.filename)
++            throw std::runtime_error("recovered source is not an exact baseline hash/filename");
++        for (const auto field : {fields[5], fields[6]})
++            if (field.find_first_of("/\\:") != std::string_view::npos || field == "." || field == "..")
++                throw std::runtime_error("recovered-source paths must be local basenames");
++        source.early = fields[5];
++        if (source.early == "-")
++            throw std::runtime_error("missing recovered early source");
++        if (fields[6] != "-")
++        {
++            if (!source.isPixelShader || fields[5] == fields[6])
++                throw std::runtime_error("invalid recovered late variant");
++            source.late = fields[6];
++        }
++        if (!sources.emplace(hash, std::move(source)).second)
++            throw std::runtime_error("duplicate recovered shader hash");
++    }
++    if (input.bad() || sources.size() != expectedCount)
++        throw std::runtime_error("recovered-source count mismatch");
++    return sources;
++}
+diff --git a/shader_override_compiler.py b/shader_override_compiler.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..83ee6673656395126b073843fdceb6f01d8113f5
+--- /dev/null
++++ b/shader_override_compiler.py
+@@ -0,0 +1,677 @@
++#!/usr/bin/env python3
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import os
++from pathlib import Path
++import re
++import struct
++import subprocess
++import sys
++import tempfile
++from typing import Any, Iterable, Sequence
++
++
++SPIRV_MAGIC = 0x07230203
++SPIRV_HEADER_WORDS = 5
++SPIRV_OP_ENTRY_POINT = 15
++SPIRV_OP_EXECUTION_MODE = 16
++SPIRV_OP_DECORATE = 71
++SPIRV_EXECUTION_MODE_EARLY_FRAGMENT_TESTS = 9
++SPIRV_DECORATION_BUILT_IN = 11
++SPIRV_BUILT_IN_SAMPLE_MASK = 20
++SPIRV_EXECUTION_MODELS = {"vertex": 0, "pixel": 4}
++SHADER_OVERRIDE_STAGES = {"pixel": 0, "vertex": 1}
++SHADER_OVERRIDE_ACTIVATIONS = {"stage": 0, "pipeline_pair": 1}
++SUPPORTED_BUILT_INS = {"SampleMask": SPIRV_BUILT_IN_SAMPLE_MASK}
++SPEC_CONSTANT_ALPHA_TEST = 0x00000002
++USE_STOCK_TEXTURE_MASK = 0xFFFFFFFF
++HASH_PATTERN = re.compile(r"0x[0-9A-Fa-f]{16}\Z")
++MASK_PATTERN = re.compile(r"0x[0-9A-Fa-f]{8}\Z")
++ENTRY_POINT_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
++DEFINE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:=[A-Za-z0-9_+.,-]+)?\Z")
++TOP_LEVEL_KEYS = {"version", "overrides"}
++ENTRY_KEYS = {
++    "stage",
++    "hash",
++    "language",
++    "source",
++    "entry_point",
++    "specialization_constants_mask",
++    "defines",
++    "activation",
++    "pipeline_pair_id",
++    "counterpart_hashes",
++    "used_texture_mask",
++    "support_radius_bits",
++    "required_builtins",
++    "require_early_fragment_tests",
++}
++
++
++class ManifestError(ValueError):
++    pass
++
++
++def _require_exact_keys(value: dict[str, Any], allowed: set[str], context: str) -> None:
++    unknown = sorted(set(value) - allowed)
++    if unknown:
++        raise ManifestError(f"{context} contains unknown keys: {', '.join(unknown)}")
++
++
++def _parse_hex(value: Any, pattern: re.Pattern[str], context: str) -> int:
++    if not isinstance(value, str) or not pattern.fullmatch(value):
++        raise ManifestError(f"{context} must match {pattern.pattern!r}")
++    return int(value, 16)
++
++
++def _resolve_source(source_root: Path, source_value: Any, context: str) -> tuple[Path, str]:
++    if not isinstance(source_value, str) or not source_value:
++        raise ManifestError(f"{context}.source must be a non-empty relative path")
++    relative = Path(source_value)
++    if relative.is_absolute():
++        raise ManifestError(f"{context}.source must be relative to the source root")
++    root = source_root.resolve(strict=True)
++    source = (root / relative).resolve(strict=False)
++    try:
++        canonical_relative = source.relative_to(root).as_posix()
++    except ValueError as error:
++        raise ManifestError(f"{context}.source escapes the source root") from error
++    if not source.is_file():
++        raise ManifestError(f"{context}.source does not exist: {canonical_relative}")
++    return source, canonical_relative
++
++
++def load_manifest(manifest_path: Path, source_root: Path) -> list[dict[str, Any]]:
++    try:
++        document = json.loads(manifest_path.read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError) as error:
++        raise ManifestError(f"failed to read manifest {manifest_path}: {error}") from error
++    if not isinstance(document, dict):
++        raise ManifestError("manifest root must be an object")
++    _require_exact_keys(document, TOP_LEVEL_KEYS, "manifest")
++    if document.get("version") != 1:
++        raise ManifestError("manifest.version must be 1")
++    raw_entries = document.get("overrides")
++    if not isinstance(raw_entries, list):
++        raise ManifestError("manifest.overrides must be an array")
++
++    entries: list[dict[str, Any]] = []
++    identities: set[tuple[int, int]] = set()
++    for index, raw_entry in enumerate(raw_entries):
++        context = f"manifest.overrides[{index}]"
++        if not isinstance(raw_entry, dict):
++            raise ManifestError(f"{context} must be an object")
++        _require_exact_keys(raw_entry, ENTRY_KEYS, context)
++
++        stage_name = raw_entry.get("stage")
++        if stage_name not in SHADER_OVERRIDE_STAGES:
++            raise ManifestError(f"{context}.stage must be 'pixel' or 'vertex'")
++        language = raw_entry.get("language")
++        if language not in {"hlsl", "glsl"}:
++            raise ManifestError(f"{context}.language must be 'hlsl' or 'glsl'")
++        source, source_name = _resolve_source(source_root, raw_entry.get("source"), context)
++        expected_suffix = f".{language}"
++        if source.suffix.lower() != expected_suffix:
++            raise ManifestError(f"{context}.source must use the {expected_suffix} extension")
++
++        entry_point = raw_entry.get("entry_point")
++        if not isinstance(entry_point, str) or not ENTRY_POINT_PATTERN.fullmatch(entry_point):
++            raise ManifestError(f"{context}.entry_point is not a valid shader entry point")
++        if language == "glsl" and entry_point != "main":
++            raise ManifestError(f"{context}.entry_point must be 'main' for GLSL")
++        shader_hash = _parse_hex(raw_entry.get("hash"), HASH_PATTERN, f"{context}.hash")
++        mask = _parse_hex(
++            raw_entry.get("specialization_constants_mask"),
++            MASK_PATTERN,
++            f"{context}.specialization_constants_mask",
++        )
++
++        raw_defines = raw_entry.get("defines", [])
++        if not isinstance(raw_defines, list) or any(
++            not isinstance(define, str) or not DEFINE_PATTERN.fullmatch(define)
++            for define in raw_defines
++        ):
++            raise ManifestError(f"{context}.defines must be an array of NAME or NAME=value strings")
++        if len(set(raw_defines)) != len(raw_defines):
++            raise ManifestError(f"{context}.defines contains a duplicate")
++
++        activation_name = raw_entry.get("activation", "stage")
++        if activation_name not in SHADER_OVERRIDE_ACTIVATIONS:
++            raise ManifestError(f"{context}.activation must be 'stage' or 'pipeline_pair'")
++        activation = SHADER_OVERRIDE_ACTIVATIONS[activation_name]
++
++        raw_pair_id = raw_entry.get("pipeline_pair_id", 0)
++        if not isinstance(raw_pair_id, int) or isinstance(raw_pair_id, bool):
++            raise ManifestError(f"{context}.pipeline_pair_id must be an integer")
++        if raw_pair_id < 0 or raw_pair_id > 0xFFFFFFFF:
++            raise ManifestError(f"{context}.pipeline_pair_id is outside uint32 range")
++
++        raw_counterparts = raw_entry.get("counterpart_hashes", [])
++        if not isinstance(raw_counterparts, list):
++            raise ManifestError(f"{context}.counterpart_hashes must be an array")
++        counterpart_hashes = [
++            _parse_hex(value, HASH_PATTERN, f"{context}.counterpart_hashes[{item_index}]")
++            for item_index, value in enumerate(raw_counterparts)
++        ]
++        if len(set(counterpart_hashes)) != len(counterpart_hashes):
++            raise ManifestError(f"{context}.counterpart_hashes contains a duplicate")
++
++        if activation_name == "pipeline_pair":
++            if raw_pair_id == 0:
++                raise ManifestError(f"{context}.pipeline_pair_id must be nonzero for pipeline_pair")
++            if not counterpart_hashes:
++                raise ManifestError(f"{context}.counterpart_hashes must not be empty for pipeline_pair")
++        elif raw_pair_id or counterpart_hashes:
++            raise ManifestError(
++                f"{context} may only declare pipeline_pair_id/counterpart_hashes for pipeline_pair"
++            )
++
++        used_texture_mask = USE_STOCK_TEXTURE_MASK
++        if "used_texture_mask" in raw_entry:
++            used_texture_mask = _parse_hex(
++                raw_entry["used_texture_mask"], MASK_PATTERN, f"{context}.used_texture_mask"
++            )
++
++        support_radius_bits = 0
++        if "support_radius_bits" in raw_entry:
++            support_radius_bits = _parse_hex(
++                raw_entry["support_radius_bits"], MASK_PATTERN, f"{context}.support_radius_bits"
++            )
++            support_radius = struct.unpack("<f", struct.pack("<I", support_radius_bits))[0]
++            if not math.isfinite(support_radius) or support_radius <= 0.0:
++                raise ManifestError(f"{context}.support_radius_bits must encode a finite positive float")
++
++        raw_required_builtins = raw_entry.get("required_builtins", [])
++        if not isinstance(raw_required_builtins, list) or any(
++            not isinstance(name, str) or name not in SUPPORTED_BUILT_INS
++            for name in raw_required_builtins
++        ):
++            raise ManifestError(
++                f"{context}.required_builtins must contain only: {', '.join(SUPPORTED_BUILT_INS)}"
++            )
++        if len(set(raw_required_builtins)) != len(raw_required_builtins):
++            raise ManifestError(f"{context}.required_builtins contains a duplicate")
++        if raw_required_builtins and stage_name != "pixel":
++            raise ManifestError(f"{context}.required_builtins is only valid for pixel shaders")
++
++        require_early_fragment_tests = raw_entry.get("require_early_fragment_tests", False)
++        if not isinstance(require_early_fragment_tests, bool):
++            raise ManifestError(f"{context}.require_early_fragment_tests must be a boolean")
++        if require_early_fragment_tests and stage_name != "pixel":
++            raise ManifestError(
++                f"{context}.require_early_fragment_tests is only valid for pixel shaders"
++            )
++
++        identity = (SHADER_OVERRIDE_STAGES[stage_name], shader_hash)
++        if identity in identities:
++            raise ManifestError(
++                f"{context} duplicates the {stage_name} shader identity {raw_entry['hash']}"
++            )
++        identities.add(identity)
++        entries.append(
++            {
++                "stage_name": stage_name,
++                "stage": SHADER_OVERRIDE_STAGES[stage_name],
++                "execution_model": SPIRV_EXECUTION_MODELS[stage_name],
++                "hash": shader_hash,
++                "language": language,
++                "source": source,
++                "source_name": source_name,
++                "entry_point": entry_point,
++                "specialization_constants_mask": mask,
++                "defines": sorted(raw_defines),
++                "activation_name": activation_name,
++                "activation": activation,
++                "pipeline_pair_id": raw_pair_id,
++                "counterpart_hashes": sorted(counterpart_hashes),
++                "used_texture_mask": used_texture_mask,
++                "support_radius_bits": support_radius_bits,
++                "required_builtins": tuple(sorted(raw_required_builtins)),
++                "require_early_fragment_tests": require_early_fragment_tests,
++            }
++        )
++
++    entries_by_pair: dict[int, list[dict[str, Any]]] = {}
++    for entry in entries:
++        if entry["activation_name"] == "pipeline_pair":
++            entries_by_pair.setdefault(entry["pipeline_pair_id"], []).append(entry)
++
++    for pair_id, pair_entries in sorted(entries_by_pair.items()):
++        context = f"pipeline_pair_id {pair_id}"
++        if len(pair_entries) != 2:
++            raise ManifestError(f"{context} must contain exactly one vertex and one pixel override")
++        by_stage = {entry["stage_name"]: entry for entry in pair_entries}
++        if set(by_stage) != {"vertex", "pixel"}:
++            raise ManifestError(f"{context} must contain exactly one vertex and one pixel override")
++        vertex = by_stage["vertex"]
++        pixel = by_stage["pixel"]
++        if pixel["hash"] not in vertex["counterpart_hashes"]:
++            raise ManifestError(f"{context} vertex override does not permit its pixel counterpart")
++        if vertex["hash"] not in pixel["counterpart_hashes"]:
++            raise ManifestError(f"{context} pixel override does not permit its vertex counterpart")
++        if not vertex["support_radius_bits"] or not pixel["support_radius_bits"]:
++            raise ManifestError(f"{context} must declare support_radius_bits on both overrides")
++        vertex_radius = struct.unpack("<f", struct.pack("<I", vertex["support_radius_bits"]))[0]
++        pixel_radius = struct.unpack("<f", struct.pack("<I", pixel["support_radius_bits"]))[0]
++        if vertex_radius < pixel_radius:
++            raise ManifestError(
++                f"{context} vertex support radius must contain the pixel nonzero support radius"
++            )
++
++    return sorted(entries, key=lambda entry: (entry["stage"], entry["hash"]))
++
++
++def _run_tool(command: Sequence[str], environment: dict[str, str] | None = None) -> None:
++    result = subprocess.run(
++        command,
++        check=False,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        text=True,
++        env=environment,
++    )
++    if result.returncode:
++        rendered = " ".join(command)
++        raise ManifestError(f"shader tool failed ({rendered}):\n{result.stdout}")
++
++
++def _compiler_environment(library_path: str | None) -> dict[str, str]:
++    environment = dict(os.environ)
++    if not library_path:
++        return environment
++    variable = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
++    existing = environment.get(variable)
++    environment[variable] = (
++        library_path if not existing else os.pathsep.join((library_path, existing))
++    )
++    return environment
++
++
++def requires_late_fragment_tests(entry: dict[str, Any]) -> bool:
++    return (
++        entry["stage_name"] == "pixel"
++        and entry["specialization_constants_mask"] & SPEC_CONSTANT_ALPHA_TEST
++    ) != 0
++
++
++def compile_shader(
++    entry: dict[str, Any],
++    output_path: Path,
++    source_root: Path,
++    dxc: str | None,
++    dxc_library_path: str | None,
++    glslang_validator: str | None,
++    additional_defines: Sequence[str] = (),
++) -> None:
++    source = entry["source"]
++    if entry["language"] == "hlsl":
++        if not dxc:
++            raise ManifestError(f"DXC is required by {entry['source_name']}")
++        target = "vs_6_0" if entry["stage_name"] == "vertex" else "ps_6_0"
++        command = [
++            dxc,
++            "-spirv",
++            "-fspv-target-env=vulkan1.0",
++            "-HV",
++            "2021",
++            "-T",
++            target,
++            "-E",
++            entry["entry_point"],
++            "-all-resources-bound",
++            "-fvk-use-dx-layout",
++            "-O3",
++            "-Qstrip_debug",
++            "-WX",
++            "-I",
++            str(source_root),
++            "-I",
++            str(source.parent),
++        ]
++        if entry["stage_name"] == "vertex":
++            command.append("-fvk-invert-y")
++        else:
++            # Match XenosRecomp's stock pixel-shader compilation. Its shared
++            # sampling helpers select implicit derivatives only with this
++            # stage define; without it, overrides silently force mip level 0.
++            command.append("-DXENOS_RECOMP_PIXEL_SHADER")
++        command.extend(f"-D{define}" for define in entry["defines"])
++        command.extend(f"-D{define}" for define in additional_defines)
++        command.extend(("-Fo", str(output_path), str(source)))
++        _run_tool(command, _compiler_environment(dxc_library_path))
++        return
++
++    if not glslang_validator:
++        raise ManifestError(f"glslangValidator is required by {entry['source_name']}")
++    shader_stage = "vert" if entry["stage_name"] == "vertex" else "frag"
++    command = [
++        glslang_validator,
++        "-V",
++        "--target-env",
++        "vulkan1.0",
++        "-S",
++        shader_stage,
++        "-e",
++        entry["entry_point"],
++        "-g0",
++        "-Os",
++        "-I" + str(source_root),
++        "-I" + str(source.parent),
++    ]
++    for define in entry["defines"]:
++        command.extend(("--define-macro", define))
++    for define in additional_defines:
++        command.extend(("--define-macro", define))
++    command.extend(("-o", str(output_path), str(source)))
++    _run_tool(command)
++
++
++def _decode_spirv_string(words: Sequence[int]) -> tuple[str, int]:
++    encoded = b"".join(struct.pack("<I", word) for word in words)
++    terminator = encoded.find(b"\0")
++    if terminator < 0:
++        raise ManifestError("SPIR-V OpEntryPoint name is not null-terminated")
++    try:
++        value = encoded[:terminator].decode("utf-8")
++    except UnicodeDecodeError as error:
++        raise ManifestError("SPIR-V OpEntryPoint name is not UTF-8") from error
++    consumed_words = (terminator + 1 + struct.calcsize("<I") - 1) // struct.calcsize("<I")
++    return value, consumed_words
++
++
++def validate_spirv(
++    blob: bytes,
++    expected_execution_model: int,
++    expected_entry_point: str,
++    forbid_early_fragment_tests: bool = False,
++    required_builtins: Sequence[str] = (),
++    require_early_fragment_tests: bool = False,
++) -> tuple[int, ...]:
++    if len(blob) < SPIRV_HEADER_WORDS * struct.calcsize("<I"):
++        raise ManifestError("SPIR-V module is shorter than its header")
++    if len(blob) % struct.calcsize("<I"):
++        raise ManifestError("SPIR-V byte size is not a multiple of four")
++    word_count = len(blob) // struct.calcsize("<I")
++    words = struct.unpack(f"<{word_count}I", blob)
++    if words[0] != SPIRV_MAGIC:
++        raise ManifestError("SPIR-V module has an invalid magic number")
++
++    matching_entry_points: set[int] = set()
++    matching_interfaces: set[int] = set()
++    early_fragment_test_entries: set[int] = set()
++    builtins_by_id: dict[int, int] = {}
++    index = SPIRV_HEADER_WORDS
++    while index < len(words):
++        instruction = words[index]
++        instruction_word_count = instruction >> 16
++        opcode = instruction & 0xFFFF
++        if not instruction_word_count:
++            raise ManifestError("SPIR-V instruction has a zero word count")
++        instruction_end = index + instruction_word_count
++        if instruction_end > len(words):
++            raise ManifestError("SPIR-V instruction extends past the module")
++        if opcode == SPIRV_OP_ENTRY_POINT:
++            if instruction_word_count < 4:
++                raise ManifestError("SPIR-V OpEntryPoint is truncated")
++            execution_model = words[index + 1]
++            entry_point_id = words[index + 2]
++            entry_point, name_word_count = _decode_spirv_string(
++                words[index + 3 : instruction_end]
++            )
++            if execution_model == expected_execution_model and entry_point == expected_entry_point:
++                matching_entry_points.add(entry_point_id)
++                interface_start = index + 3 + name_word_count
++                matching_interfaces.update(words[interface_start:instruction_end])
++        elif opcode == SPIRV_OP_EXECUTION_MODE and instruction_word_count >= 3:
++            if words[index + 2] == SPIRV_EXECUTION_MODE_EARLY_FRAGMENT_TESTS:
++                early_fragment_test_entries.add(words[index + 1])
++        elif (
++            opcode == SPIRV_OP_DECORATE
++            and instruction_word_count >= 4
++            and words[index + 2] == SPIRV_DECORATION_BUILT_IN
++        ):
++            builtins_by_id[words[index + 1]] = words[index + 3]
++        index = instruction_end
++
++    if not matching_entry_points:
++        raise ManifestError(
++            f"SPIR-V does not contain the requested stage/entry point {expected_entry_point!r}"
++        )
++    has_early_fragment_tests = bool(matching_entry_points & early_fragment_test_entries)
++    if forbid_early_fragment_tests and has_early_fragment_tests:
++        raise ManifestError("late SPIR-V unexpectedly enables EarlyFragmentTests")
++    if require_early_fragment_tests and not has_early_fragment_tests:
++        raise ManifestError("SPIR-V entry point is missing required EarlyFragmentTests")
++
++    interface_builtins = {
++        builtins_by_id[interface_id]
++        for interface_id in matching_interfaces
++        if interface_id in builtins_by_id
++    }
++    for builtin_name in required_builtins:
++        builtin = SUPPORTED_BUILT_INS[builtin_name]
++        if builtin not in interface_builtins:
++            raise ManifestError(
++                f"SPIR-V entry point is missing required BuiltIn {builtin_name}"
++            )
++    return words
++
++
++def _format_words(words: Iterable[int]) -> str:
++    return "\n".join(f"    0x{word:08X}u," for word in words)
++
++
++def generate_cpp(compiled_entries: Sequence[dict[str, Any]]) -> str:
++    output = [
++        '#include <shader_overrides/shader_override_cache.h>',
++        "",
++        "namespace {",
++    ]
++    for index, entry in enumerate(compiled_entries):
++        if entry["counterpart_hashes"]:
++            output.extend(
++                (
++                    f"constexpr uint64_t kShaderOverrideCounterparts{index}[] = {{",
++                    "\n".join(
++                        f"    0x{counterpart_hash:016X}ull,"
++                        for counterpart_hash in entry["counterpart_hashes"]
++                    ),
++                    "};",
++                    "",
++                )
++            )
++        output.extend(
++            (
++                f"constexpr uint32_t kShaderOverrideSpirv{index}[] = {{",
++                _format_words(entry["words"]),
++                "};",
++                "",
++            )
++        )
++        if entry.get("late_words") is not None:
++            output.extend(
++                (
++                    f"constexpr uint32_t kShaderOverrideLateSpirv{index}[] = {{",
++                    _format_words(entry["late_words"]),
++                    "};",
++                    "",
++                )
++            )
++    output.append("}  // namespace")
++    output.append("")
++    if compiled_entries:
++        output.append("const ShaderOverrideCacheEntry g_shaderOverrideEntries[] = {")
++        for index, entry in enumerate(compiled_entries):
++            stage_constant = (
++                "kShaderOverrideStageVertex"
++                if entry["stage_name"] == "vertex"
++                else "kShaderOverrideStagePixel"
++            )
++            filename = json.dumps(entry["source_name"], ensure_ascii=True)
++            if entry.get("late_words") is None:
++                late_spirv = "nullptr"
++                late_spirv_size = "0"
++            else:
++                late_spirv = f"kShaderOverrideLateSpirv{index}"
++                late_spirv_size = f"sizeof(kShaderOverrideLateSpirv{index})"
++            activation_constant = (
++                "kShaderOverrideActivationPipelinePair"
++                if entry["activation_name"] == "pipeline_pair"
++                else "kShaderOverrideActivationStage"
++            )
++            if entry["counterpart_hashes"]:
++                counterparts = f"kShaderOverrideCounterparts{index}"
++                counterpart_count = (
++                    f"sizeof(kShaderOverrideCounterparts{index}) / "
++                    f"sizeof(kShaderOverrideCounterparts{index}[0])"
++                )
++            else:
++                counterparts = "nullptr"
++                counterpart_count = "0"
++            output.append(
++                "    {"
++                f"0x{entry['hash']:016X}ull, {stage_constant}, "
++                f"0x{entry['specialization_constants_mask']:08X}u, "
++                f"{activation_constant}, {entry['pipeline_pair_id']}u, "
++                f"0x{entry['used_texture_mask']:08X}u, "
++                f"0x{entry['support_radius_bits']:08X}u, "
++                f"{counterparts}, {counterpart_count}, "
++                f"kShaderOverrideSpirv{index}, sizeof(kShaderOverrideSpirv{index}), "
++                f"{late_spirv}, {late_spirv_size}, {filename}"
++                "},"
++            )
++        output.append("};")
++        output.append(
++            "const size_t g_shaderOverrideEntryCount = "
++            "sizeof(g_shaderOverrideEntries) / sizeof(g_shaderOverrideEntries[0]);"
++        )
++    else:
++        output.extend(
++            (
++                "const ShaderOverrideCacheEntry g_shaderOverrideEntries[1] = {};",
++                "const size_t g_shaderOverrideEntryCount = 0;",
++            )
++        )
++    output.append("")
++    return "\n".join(output)
++
++
++def _write_if_changed(path: Path, content: str) -> None:
++    encoded = content.encode("utf-8")
++    if path.is_file() and path.read_bytes() == encoded:
++        return
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_name(path.name + ".tmp")
++    temporary.write_bytes(encoded)
++    temporary.replace(path)
++
++
++def _escape_depfile_path(path: Path) -> str:
++    return str(path).replace("$", "$$").replace("#", "\\#").replace(" ", "\\ ")
++
++
++def generate_depfile(output: Path, dependencies: Sequence[Path]) -> str:
++    target = _escape_depfile_path(output.resolve())
++    dependency_list = " ".join(
++        _escape_depfile_path(dependency.resolve()) for dependency in dependencies
++    )
++    return f"{target}: {dependency_list}\n"
++
++
++def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Compile hash-specific GTA IV native shader overrides into a C++ SPIR-V table."
++    )
++    parser.add_argument("--manifest", required=True, type=Path)
++    parser.add_argument("--source-root", required=True, type=Path)
++    parser.add_argument("--output", required=True, type=Path)
++    parser.add_argument("--depfile", type=Path)
++    parser.add_argument("--dxc")
++    parser.add_argument("--dxc-library-path")
++    parser.add_argument("--glslang-validator")
++    parser.add_argument("--spirv-val")
++    return parser.parse_args(arguments)
++
++
++def main(arguments: Sequence[str] | None = None) -> int:
++    options = parse_arguments(arguments)
++    try:
++        entries = load_manifest(options.manifest, options.source_root)
++        if entries and not options.spirv_val:
++            raise ManifestError("spirv-val is required when the override manifest is not empty")
++
++        compiled_entries: list[dict[str, Any]] = []
++        with tempfile.TemporaryDirectory(prefix="gta4-shader-overrides-") as temporary_directory:
++            temporary_root = Path(temporary_directory)
++            for index, entry in enumerate(entries):
++                spirv_path = temporary_root / f"override-{index}.spv"
++                compile_shader(
++                    entry,
++                    spirv_path,
++                    options.source_root.resolve(strict=True),
++                    options.dxc,
++                    options.dxc_library_path,
++                    options.glslang_validator,
++                )
++                _run_tool(
++                    (
++                        options.spirv_val,
++                        "--target-env",
++                        "vulkan1.0",
++                        str(spirv_path),
++                    )
++                )
++                compiled_entry = dict(entry)
++                compiled_entry["words"] = validate_spirv(
++                    spirv_path.read_bytes(),
++                    entry["execution_model"],
++                    entry["entry_point"],
++                    required_builtins=entry["required_builtins"],
++                    require_early_fragment_tests=entry["require_early_fragment_tests"],
++                )
++                compiled_entry["late_words"] = None
++                if requires_late_fragment_tests(entry):
++                    late_spirv_path = temporary_root / f"override-{index}-late.spv"
++                    compile_shader(
++                        entry,
++                        late_spirv_path,
++                        options.source_root.resolve(strict=True),
++                        options.dxc,
++                        options.dxc_library_path,
++                        options.glslang_validator,
++                        ("XENOS_RECOMP_LATE_FRAGMENT_TESTS",),
++                    )
++                    _run_tool(
++                        (
++                            options.spirv_val,
++                            "--target-env",
++                            "vulkan1.0",
++                            str(late_spirv_path),
++                        )
++                    )
++                    compiled_entry["late_words"] = validate_spirv(
++                        late_spirv_path.read_bytes(),
++                        entry["execution_model"],
++                        entry["entry_point"],
++                        forbid_early_fragment_tests=True,
++                        required_builtins=entry["required_builtins"],
++                    )
++                compiled_entries.append(compiled_entry)
++
++        _write_if_changed(options.output, generate_cpp(compiled_entries))
++        if options.depfile:
++            dependencies = [options.manifest, Path(__file__)]
++            dependencies.extend(entry["source"] for entry in entries)
++            _write_if_changed(options.depfile, generate_depfile(options.output, dependencies))
++    except ManifestError as error:
++        print(f"shader override compiler: {error}", file=sys.stderr)
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/shader_overrides/example_pixel.glsl b/tests/shader_overrides/example_pixel.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc91b6348e318dfbae881f76255f9b788848d4ee
+--- /dev/null
++++ b/tests/shader_overrides/example_pixel.glsl
+@@ -0,0 +1,7 @@
++#version 450
++
++layout(location = 0) out vec4 output_color;
++
++void main() {
++    output_color = vec4(1.0);
++}
+diff --git a/tests/shader_overrides/example_vertex.hlsl b/tests/shader_overrides/example_vertex.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c79c3cf12ccd03576b82b457c26eb78e9b946a8
+--- /dev/null
++++ b/tests/shader_overrides/example_vertex.hlsl
+@@ -0,0 +1,9 @@
++struct VertexOutput {
++    float4 position : SV_Position;
++};
++
++VertexOutput main(uint vertex_id : SV_VertexID) {
++    VertexOutput output;
++    output.position = float4(float(vertex_id), 0.0, 0.0, 1.0);
++    return output;
++}
+diff --git a/tests/shader_overrides/manifest.json b/tests/shader_overrides/manifest.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b58a4bcd553485fee35f67601a62fca00d954792
+--- /dev/null
++++ b/tests/shader_overrides/manifest.json
+@@ -0,0 +1,21 @@
++{
++  "version": 1,
++  "overrides": [
++    {
++      "stage": "vertex",
++      "hash": "0x0000000000000001",
++      "language": "hlsl",
++      "source": "example_vertex.hlsl",
++      "entry_point": "main",
++      "specialization_constants_mask": "0x00000000"
++    },
++    {
++      "stage": "pixel",
++      "hash": "0x0000000000000002",
++      "language": "glsl",
++      "source": "example_pixel.glsl",
++      "entry_point": "main",
++      "specialization_constants_mask": "0x00000000"
++    }
++  ]
++}
+diff --git a/tests/test_override_sampler_lod_bias.py b/tests/test_override_sampler_lod_bias.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0be4a0bc0132add45b27e047f5d80d00517d6502
+--- /dev/null
++++ b/tests/test_override_sampler_lod_bias.py
+@@ -0,0 +1,136 @@
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import re
++import unittest
++
++
++SOURCE_ROOT = Path(__file__).resolve().parents[3] / "LibertyRecompLib" / "shader_overrides"
++TFETCH = re.compile(r"\btfetch(?:2DBicubic|2DArray|2D|3D|Cube)\(")
++SAMPLER_SLOT = re.compile(
++    r"#define (\w+)_SamplerDescriptorIndex vk::RawBufferLoad<uint>"
++    r"\(g_PushConstants.SharedConstants \+ (\d+)\)"
++)
++
++
++def arguments_at(source: str, opening: int) -> str:
++    depth = 1
++    position = opening + 1
++    while depth:
++        if source[position] == "(":
++            depth += 1
++        elif source[position] == ")":
++            depth -= 1
++        position += 1
++    return source[opening + 1 : position - 1]
++
++
++class OverrideSamplerLodBiasTest(unittest.TestCase):
++    def setUp(self) -> None:
++        manifest = json.loads((SOURCE_ROOT / "manifest.json").read_text())
++        self.sources = {
++            entry["source"]: (SOURCE_ROOT / entry["source"]).read_text()
++            for entry in manifest["overrides"]
++        }
++
++    def test_every_texture_fetch_uses_its_guest_slot_not_its_descriptor_index(self) -> None:
++        checked = 0
++        for name, source in self.sources.items():
++            slots = {
++                sampler: (int(offset) - 416) // 4
++                for sampler, offset in SAMPLER_SLOT.findall(source)
++            }
++            for match in TFETCH.finditer(source):
++                arguments = arguments_at(source, match.end() - 1)
++                if "uint resourceDescriptorIndex" in arguments:
++                    continue
++                with self.subTest(source=name, call=arguments):
++                    sampler = re.search(r"\b(\w+)_SamplerDescriptorIndex\b", arguments)
++                    self.assertIsNotNone(sampler)
++                    expected_slot = slots[sampler.group(1)]
++                    self.assertGreaterEqual(expected_slot, 0)
++                    self.assertLess(expected_slot, 26)
++                    bias_slots = re.findall(r"GetTextureLodBias\((\d+)\)", arguments)
++                    self.assertEqual(bias_slots, [str(expected_slot)])
++                    checked += 1
++        self.assertGreater(checked, 0)
++
++    def test_implicit_sampling_carries_bias_through_every_embedded_common_copy(self) -> None:
++        sources = dict(self.sources)
++        sources["xenos_shader_common.h"] = (SOURCE_ROOT / "xenos_shader_common.h").read_text()
++        for name, source in sources.items():
++            with self.subTest(source=name):
++                self.assertNotRegex(source, r"\.Sample\(")
++                for match in re.finditer(r"\.SampleBias\(", source):
++                    arguments = arguments_at(source, match.end() - 1)
++                    if name.startswith("bloom/"):
++                        self.assertIn(
++                            "const float lod_bias = vk::RawBufferLoad<float>"
++                            "(g_PushConstants.SharedConstants + 752);", source
++                        )
++                        self.assertTrue(arguments.endswith(", lod_bias"), arguments)
++                    else:
++                        self.assertTrue(arguments.endswith(", lodBias"), arguments)
++
++    def test_bias_payload_matches_the_appended_shared_constant_registers(self) -> None:
++        header = (SOURCE_ROOT / "xenos_shader_common.h").read_text()
++        self.assertIn("g_PushConstants.SharedConstants + 752 + (SLOT) * 4", header)
++        self.assertIn("float4 g_TextureLodBias[7] : packoffset(c47);", header)
++        self.assertEqual(47 * 16, 752)
++        self.assertEqual((26 + 2) * 4, 7 * 16)
++
++    def test_explicit_helpers_add_bias_without_changing_sampling_mode(self) -> None:
++        sources = dict(self.sources)
++        sources["xenos_shader_common.h"] = (SOURCE_ROOT / "xenos_shader_common.h").read_text()
++        for name, source in sources.items():
++            if "float lodBias = 0.0" not in source:
++                continue
++            with self.subTest(source=name):
++                helpers = 0
++                slots = {
++                    sampler: (int(offset) - 416) // 4
++                    for sampler, offset in SAMPLER_SLOT.findall(source)
++                }
++                for match in re.finditer(r"\.SampleLevel\(", source):
++                    arguments = arguments_at(source, match.end() - 1)
++                    if "g_SamplerDescriptorHeap[samplerDescriptorIndex]" in arguments:
++                        self.assertTrue(arguments.endswith(", 0.0 + lodBias"), arguments)
++                        helpers += 1
++                    else:
++                        sampler = re.search(r"\b(\w+)_SamplerDescriptorIndex\b", arguments)
++                        self.assertIsNotNone(sampler)
++                        expected_slot = slots[sampler.group(1)]
++                        self.assertTrue(
++                            arguments.endswith(f", 0.0 + GetTextureLodBias({expected_slot})"),
++                            arguments,
++                        )
++                self.assertEqual(helpers, 4)
++
++    def test_fog_explicit_sampling_adds_the_corresponding_guest_slot_bias(self) -> None:
++        source = self.sources["fog/rage_postfx_exponential_height_fog.hlsl"]
++        for sampler in ("hdr", "depth"):
++            descriptor = re.search(
++                rf"const uint {sampler}_sampler_index =\s*"
++                r"vk::RawBufferLoad<uint>\(g_PushConstants.SharedConstants \+ (0x[0-9A-F]+)\)",
++                source,
++            )
++            bias = re.search(
++                rf"const float {sampler}_sampler_lod_bias =\s*"
++                r"vk::RawBufferLoad<float>\(g_PushConstants.SharedConstants \+ (\d+)\)",
++                source,
++            )
++            self.assertIsNotNone(descriptor)
++            self.assertIsNotNone(bias)
++            slot = (int(descriptor.group(1), 16) - 416) // 4
++            self.assertEqual(int(bias.group(1)), 752 + slot * 4)
++            self.assertIn(
++                f"{sampler}_texture.SampleLevel({sampler}_sampler, r0.xy, "
++                f"0.0 + {sampler}_sampler_lod_bias)", source
++            )
++        self.assertEqual(source.count(".SampleLevel("), 2)
++        self.assertNotIn(".SampleBias(", source)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_shader_override_compiler.py b/tests/test_shader_override_compiler.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7300e93684219b065bbbaf5bf207c1db7165ed9
+--- /dev/null
++++ b/tests/test_shader_override_compiler.py
+@@ -0,0 +1,363 @@
++from __future__ import annotations
++
++import importlib.util
++import json
++from pathlib import Path
++import struct
++import tempfile
++import unittest
++from unittest import mock
++
++
++COMPILER_PATH = Path(__file__).resolve().parents[1] / "shader_override_compiler.py"
++EXAMPLE_ROOT = Path(__file__).resolve().parent / "shader_overrides"
++SPEC = importlib.util.spec_from_file_location("shader_override_compiler", COMPILER_PATH)
++assert SPEC is not None and SPEC.loader is not None
++COMPILER = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(COMPILER)
++
++
++class ShaderOverrideCompilerTest(unittest.TestCase):
++    def test_checked_in_example_is_sorted_by_stage_then_hash(self) -> None:
++        entries = COMPILER.load_manifest(EXAMPLE_ROOT / "manifest.json", EXAMPLE_ROOT)
++        self.assertEqual(
++            [(entry["stage_name"], entry["hash"]) for entry in entries],
++            [("pixel", 2), ("vertex", 1)],
++        )
++
++    def test_empty_manifest_generates_deterministic_table(self) -> None:
++        with tempfile.TemporaryDirectory() as temporary_directory:
++            root = Path(temporary_directory)
++            manifest = root / "manifest.json"
++            manifest.write_text(json.dumps({"version": 1, "overrides": []}), encoding="utf-8")
++            entries = COMPILER.load_manifest(manifest, root)
++            first = COMPILER.generate_cpp(entries)
++            second = COMPILER.generate_cpp(entries)
++            self.assertEqual(first, second)
++            self.assertIn("g_shaderOverrideEntryCount = 0", first)
++
++    def test_manifest_rejects_source_path_escape(self) -> None:
++        with tempfile.TemporaryDirectory() as temporary_directory:
++            root = Path(temporary_directory)
++            manifest = root / "manifest.json"
++            manifest.write_text(
++                json.dumps(
++                    {
++                        "version": 1,
++                        "overrides": [
++                            {
++                                "stage": "pixel",
++                                "hash": "0x0000000000000001",
++                                "language": "hlsl",
++                                "source": "../escape.hlsl",
++                                "entry_point": "main",
++                                "specialization_constants_mask": "0x00000000",
++                            }
++                        ],
++                    }
++                ),
++                encoding="utf-8",
++            )
++            with self.assertRaises(COMPILER.ManifestError):
++                COMPILER.load_manifest(manifest, root)
++
++    def test_spirv_stage_and_entry_point_are_checked(self) -> None:
++        name = b"main\0"
++        name += bytes((-len(name)) % struct.calcsize("<I"))
++        name_words = struct.unpack(f"<{len(name) // struct.calcsize('<I')}I", name)
++        instruction_word_count = 3 + len(name_words)
++        words = (
++            COMPILER.SPIRV_MAGIC,
++            0x00010000,
++            0,
++            2,
++            0,
++            (instruction_word_count << 16) | COMPILER.SPIRV_OP_ENTRY_POINT,
++            COMPILER.SPIRV_EXECUTION_MODELS["pixel"],
++            1,
++            *name_words,
++        )
++        blob = struct.pack(f"<{len(words)}I", *words)
++        COMPILER.validate_spirv(blob, COMPILER.SPIRV_EXECUTION_MODELS["pixel"], "main")
++        with self.assertRaises(COMPILER.ManifestError):
++            COMPILER.validate_spirv(blob, COMPILER.SPIRV_EXECUTION_MODELS["vertex"], "main")
++
++        early_fragment_tests = (
++            (3 << 16) | COMPILER.SPIRV_OP_EXECUTION_MODE,
++            1,
++            COMPILER.SPIRV_EXECUTION_MODE_EARLY_FRAGMENT_TESTS,
++        )
++        early_blob = struct.pack(
++            f"<{len(words) + len(early_fragment_tests)}I",
++            *words,
++            *early_fragment_tests,
++        )
++        with self.assertRaisesRegex(COMPILER.ManifestError, "EarlyFragmentTests"):
++            COMPILER.validate_spirv(
++                early_blob,
++                COMPILER.SPIRV_EXECUTION_MODELS["pixel"],
++                "main",
++                forbid_early_fragment_tests=True,
++            )
++
++    def test_alpha_capable_pixel_shader_requires_late_variant(self) -> None:
++        self.assertTrue(
++            COMPILER.requires_late_fragment_tests(
++                {
++                    "stage_name": "pixel",
++                    "specialization_constants_mask": COMPILER.SPEC_CONSTANT_ALPHA_TEST,
++                }
++            )
++        )
++        self.assertFalse(
++            COMPILER.requires_late_fragment_tests(
++                {
++                    "stage_name": "pixel",
++                    "specialization_constants_mask": 0,
++                }
++            )
++        )
++        self.assertFalse(
++            COMPILER.requires_late_fragment_tests(
++                {
++                    "stage_name": "vertex",
++                    "specialization_constants_mask": COMPILER.SPEC_CONSTANT_ALPHA_TEST,
++                }
++            )
++        )
++
++    def test_hlsl_pixel_compilation_matches_xenos_stage_define(self) -> None:
++        entry = {
++            "language": "hlsl",
++            "stage_name": "pixel",
++            "entry_point": "shaderMain",
++            "source": EXAMPLE_ROOT / "example_vertex.hlsl",
++            "source_name": "example_vertex.hlsl",
++            "defines": (),
++        }
++        with mock.patch.object(COMPILER, "_run_tool") as run_tool:
++            COMPILER.compile_shader(entry, Path("output.spv"), EXAMPLE_ROOT, "dxc", None, None)
++        command = run_tool.call_args.args[0]
++        self.assertIn("-DXENOS_RECOMP_PIXEL_SHADER", command)
++
++    def test_hlsl_late_compilation_adds_late_fragment_tests_define(self) -> None:
++        entry = {
++            "language": "hlsl",
++            "stage_name": "pixel",
++            "entry_point": "shaderMain",
++            "source": EXAMPLE_ROOT / "example_vertex.hlsl",
++            "source_name": "example_vertex.hlsl",
++            "defines": (),
++        }
++        with mock.patch.object(COMPILER, "_run_tool") as run_tool:
++            COMPILER.compile_shader(
++                entry,
++                Path("output.spv"),
++                EXAMPLE_ROOT,
++                "dxc",
++                None,
++                None,
++                ("XENOS_RECOMP_LATE_FRAGMENT_TESTS",),
++            )
++        command = run_tool.call_args.args[0]
++        self.assertIn("-DXENOS_RECOMP_LATE_FRAGMENT_TESTS", command)
++
++    def test_hlsl_vertex_compilation_does_not_define_pixel_stage(self) -> None:
++        entry = {
++            "language": "hlsl",
++            "stage_name": "vertex",
++            "entry_point": "shaderMain",
++            "source": EXAMPLE_ROOT / "example_vertex.hlsl",
++            "source_name": "example_vertex.hlsl",
++            "defines": (),
++        }
++        with mock.patch.object(COMPILER, "_run_tool") as run_tool:
++            COMPILER.compile_shader(entry, Path("output.spv"), EXAMPLE_ROOT, "dxc", None, None)
++        command = run_tool.call_args.args[0]
++        self.assertNotIn("-DXENOS_RECOMP_PIXEL_SHADER", command)
++
++
++    @staticmethod
++    def _make_spirv(
++        *,
++        execution_model: int,
++        entry_point: str = "main",
++        interface_ids: tuple[int, ...] = (),
++        builtins: tuple[tuple[int, int], ...] = (),
++        early_fragment_tests: bool = False,
++    ) -> bytes:
++        name = entry_point.encode("utf-8") + b"\0"
++        name += bytes((-len(name)) % struct.calcsize("<I"))
++        name_words = struct.unpack(f"<{len(name) // struct.calcsize('<I')}I", name)
++        entry_point_id = 1
++        entry_words = (
++            ((3 + len(name_words) + len(interface_ids)) << 16) | COMPILER.SPIRV_OP_ENTRY_POINT,
++            execution_model,
++            entry_point_id,
++            *name_words,
++            *interface_ids,
++        )
++        instructions: list[int] = list(entry_words)
++        if early_fragment_tests:
++            instructions.extend(
++                (
++                    (3 << 16) | COMPILER.SPIRV_OP_EXECUTION_MODE,
++                    entry_point_id,
++                    COMPILER.SPIRV_EXECUTION_MODE_EARLY_FRAGMENT_TESTS,
++                )
++            )
++        for target_id, builtin in builtins:
++            instructions.extend(
++                (
++                    (4 << 16) | COMPILER.SPIRV_OP_DECORATE,
++                    target_id,
++                    COMPILER.SPIRV_DECORATION_BUILT_IN,
++                    builtin,
++                )
++            )
++        bound = max((entry_point_id, *interface_ids, *(target for target, _ in builtins))) + 1
++        words = (
++            COMPILER.SPIRV_MAGIC,
++            0x00010000,
++            0,
++            bound,
++            0,
++            *instructions,
++        )
++        return struct.pack(f"<{len(words)}I", *words)
++
++    def test_spirv_contract_checks_sample_mask_and_early_tests(self) -> None:
++        sample_mask_id = 2
++        blob = self._make_spirv(
++            execution_model=COMPILER.SPIRV_EXECUTION_MODELS["pixel"],
++            interface_ids=(sample_mask_id,),
++            builtins=((sample_mask_id, COMPILER.SPIRV_BUILT_IN_SAMPLE_MASK),),
++            early_fragment_tests=True,
++        )
++        COMPILER.validate_spirv(
++            blob,
++            COMPILER.SPIRV_EXECUTION_MODELS["pixel"],
++            "main",
++            required_builtins=("SampleMask",),
++            require_early_fragment_tests=True,
++        )
++        missing_mask = self._make_spirv(
++            execution_model=COMPILER.SPIRV_EXECUTION_MODELS["pixel"],
++            early_fragment_tests=True,
++        )
++        with self.assertRaisesRegex(COMPILER.ManifestError, "SampleMask"):
++            COMPILER.validate_spirv(
++                missing_mask,
++                COMPILER.SPIRV_EXECUTION_MODELS["pixel"],
++                "main",
++                required_builtins=("SampleMask",),
++            )
++        missing_early = self._make_spirv(
++            execution_model=COMPILER.SPIRV_EXECUTION_MODELS["pixel"],
++            interface_ids=(sample_mask_id,),
++            builtins=((sample_mask_id, COMPILER.SPIRV_BUILT_IN_SAMPLE_MASK),),
++        )
++        with self.assertRaisesRegex(COMPILER.ManifestError, "EarlyFragmentTests"):
++            COMPILER.validate_spirv(
++                missing_early,
++                COMPILER.SPIRV_EXECUTION_MODELS["pixel"],
++                "main",
++                require_early_fragment_tests=True,
++            )
++
++    def test_pipeline_pair_manifest_requires_reciprocal_contract(self) -> None:
++        with tempfile.TemporaryDirectory() as temporary_directory:
++            root = Path(temporary_directory)
++            (root / "vertex.hlsl").write_text("void shaderMain() {}", encoding="utf-8")
++            (root / "pixel.hlsl").write_text("void shaderMain() {}", encoding="utf-8")
++            manifest = root / "manifest.json"
++            manifest.write_text(
++                json.dumps(
++                    {
++                        "version": 1,
++                        "overrides": [
++                            {
++                                "stage": "vertex",
++                                "hash": "0x0000000000000001",
++                                "language": "hlsl",
++                                "source": "vertex.hlsl",
++                                "entry_point": "shaderMain",
++                                "specialization_constants_mask": "0x00000000",
++                                "activation": "pipeline_pair",
++                                "pipeline_pair_id": 7,
++                                "counterpart_hashes": ["0x0000000000000002"],
++                                "used_texture_mask": "0x00000000",
++                                "support_radius_bits": "0x3F59999A",
++                            },
++                            {
++                                "stage": "pixel",
++                                "hash": "0x0000000000000002",
++                                "language": "hlsl",
++                                "source": "pixel.hlsl",
++                                "entry_point": "shaderMain",
++                                "specialization_constants_mask": "0x00000002",
++                                "activation": "pipeline_pair",
++                                "pipeline_pair_id": 7,
++                                "counterpart_hashes": ["0x0000000000000001"],
++                                "used_texture_mask": "0x00000001",
++                                "support_radius_bits": "0x3F59999A",
++                                "required_builtins": ["SampleMask"],
++                                "require_early_fragment_tests": True,
++                            },
++                        ],
++                    }
++                ),
++                encoding="utf-8",
++            )
++            entries = COMPILER.load_manifest(manifest, root)
++            self.assertEqual(len(entries), 2)
++            self.assertTrue(all(entry["pipeline_pair_id"] == 7 for entry in entries))
++            generated_entries = []
++            for entry in entries:
++                compiled = dict(entry)
++                compiled["words"] = (COMPILER.SPIRV_MAGIC,)
++                compiled["late_words"] = None
++                generated_entries.append(compiled)
++            generated = COMPILER.generate_cpp(generated_entries)
++            self.assertIn("kShaderOverrideActivationPipelinePair", generated)
++            self.assertIn("kShaderOverrideCounterparts", generated)
++            self.assertIn("0x3F59999Au", generated)
++
++            document = json.loads(manifest.read_text(encoding="utf-8"))
++            document["overrides"][1]["counterpart_hashes"] = ["0x0000000000000003"]
++            manifest.write_text(json.dumps(document), encoding="utf-8")
++            with self.assertRaisesRegex(COMPILER.ManifestError, "counterpart"):
++                COMPILER.load_manifest(manifest, root)
++
++    def test_pipeline_pair_rejects_fragment_support_outside_geometry(self) -> None:
++        with tempfile.TemporaryDirectory() as temporary_directory:
++            root = Path(temporary_directory)
++            (root / "vertex.hlsl").write_text("void shaderMain() {}", encoding="utf-8")
++            (root / "pixel.hlsl").write_text("void shaderMain() {}", encoding="utf-8")
++            entries = []
++            for stage, hash_value, counterpart, source_name, radius in (
++                ("vertex", "0x0000000000000001", "0x0000000000000002", "vertex.hlsl", "0x3F000000"),
++                ("pixel", "0x0000000000000002", "0x0000000000000001", "pixel.hlsl", "0x3F59999A"),
++            ):
++                entries.append(
++                    {
++                        "stage": stage,
++                        "hash": hash_value,
++                        "language": "hlsl",
++                        "source": source_name,
++                        "entry_point": "shaderMain",
++                        "specialization_constants_mask": "0x00000000",
++                        "activation": "pipeline_pair",
++                        "pipeline_pair_id": 9,
++                        "counterpart_hashes": [counterpart],
++                        "support_radius_bits": radius,
++                    }
++                )
++            manifest = root / "manifest.json"
++            manifest.write_text(json.dumps({"version": 1, "overrides": entries}), encoding="utf-8")
++            with self.assertRaisesRegex(COMPILER.ManifestError, "contain"):
++                COMPILER.load_manifest(manifest, root)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_ssaa_fragment_coordinate_mapping.py b/tests/test_ssaa_fragment_coordinate_mapping.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..17c74f6743d2fab990e4393951393f76f6d50f6f
+--- /dev/null
++++ b/tests/test_ssaa_fragment_coordinate_mapping.py
+@@ -0,0 +1,37 @@
++from __future__ import annotations
++
++from pathlib import Path
++import unittest
++
++
++TRANSLATOR_PATH = Path(__file__).resolve().parents[1] / "XenosRecomp" / "shader_recompiler.cpp"
++CENTER_PRESERVING_EXPRESSION = (
++    "float2 guestPixelPosition = (input.iPos.xy - 0.5) * "
++    "g_FragmentCoordinateScale + 0.5;"
++)
++OLD_ORIGIN_SCALED_EXPRESSION = (
++    "float2 guestPixelPosition = input.iPos.xy * g_FragmentCoordinateScale;"
++)
++
++
++def map_physical_center_to_logical(position: float, scale: float) -> float:
++    return (position - 0.5) * scale + 0.5
++
++
++class SsaaFragmentCoordinateMappingTest(unittest.TestCase):
++    def test_first_pixel_center_is_preserved(self) -> None:
++        self.assertEqual(map_physical_center_to_logical(0.5, 0.5), 0.5)
++        self.assertEqual(map_physical_center_to_logical(0.5, 1.0), 0.5)
++
++    def test_identity_mapping_is_unchanged(self) -> None:
++        for position in (0.5, 1.5, 63.5, 1919.5):
++            self.assertEqual(map_physical_center_to_logical(position, 1.0), position)
++
++    def test_translator_uses_center_preserving_mapping(self) -> None:
++        source = TRANSLATOR_PATH.read_text(encoding="utf-8")
++        self.assertIn(CENTER_PRESERVING_EXPRESSION, source)
++        self.assertNotIn(OLD_ORIGIN_SCALED_EXPRESSION, source)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/validate_smaa_pipeline.py b/validate_smaa_pipeline.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6804e486256c330d8fd7a037e45c4433cf20ac8
+--- /dev/null
++++ b/validate_smaa_pipeline.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python3
++"""Validate canonical SMAA assets and reproducibly emit embedded SPIR-V."""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import re
++import shutil
++import struct
++import subprocess
++import tempfile
++from pathlib import Path
++
++
++UPSTREAM_HASHES = {
++    "SMAA.hlsl": "4db53d92ef0b45661f8450303589ffabce93c352cae4282a6f32dd2b80efbeb9",
++    "AreaTex.h": "1933bf43ce86ba71f7ed5f0fa94b148610c634dc3395b9bc67a817d51ee73af2",
++    "SearchTex.h": "1fac315ab5f87b60083c9b8387af17f056204d3d1bf21500f2acc5b3e8c1a37a",
++}
++QUALITY_PRESETS = ("LOW", "MEDIUM", "HIGH", "ULTRA")
++
++
++def sha256(path: Path) -> str:
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def parse_byte_array(path: Path, name: str) -> bytes:
++    source = path.read_text(encoding="utf-8")
++    match = re.search(
++        rf"static const unsigned char\s+{re.escape(name)}\[\]\s*=\s*\{{(.*?)\}};",
++        source,
++        flags=re.DOTALL,
++    )
++    if not match:
++        raise ValueError(f"{path}: missing {name}")
++    return bytes(int(value, 16) for value in re.findall(r"0x([0-9a-fA-F]{2})", match.group(1)))
++
++
++def compile_shader(
++    compiler: str,
++    validator: str | None,
++    source: Path,
++    include_root: Path,
++    preset: str,
++    output: Path,
++) -> None:
++    subprocess.run(
++        [
++            compiler,
++            "-V",
++            "--target-env",
++            "vulkan1.1",
++            f"-I{include_root}",
++            f"-DSMAA_PRESET_{preset}=1",
++            "-S",
++            "frag",
++            str(source),
++            "-o",
++            str(output),
++        ],
++        check=True,
++    )
++    if validator:
++        subprocess.run([validator, "--target-env", "vulkan1.1", str(output)], check=True)
++
++
++def format_words(symbol: str, payload: bytes) -> str:
++    if len(payload) % struct.calcsize("<I"):
++        raise ValueError(f"{symbol}: SPIR-V byte count is not uint32 aligned")
++    words = [word[0] for word in struct.iter_unpack("<I", payload)]
++    lines = [f"inline constexpr uint32_t {symbol}[] = {{"]
++    row = []
++    for word in words:
++        row.append(f"0x{word:08X}")
++        if len(row) == 8:
++            lines.append("    " + ", ".join(row) + ",")
++            row.clear()
++    if row:
++        lines.append("    " + ", ".join(row) + ",")
++    lines.append("};")
++    return "\n".join(lines)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--repo-root", type=Path, required=True)
++    parser.add_argument("--glslang-validator", default=shutil.which("glslangValidator"))
++    parser.add_argument("--spirv-val", default=shutil.which("spirv-val"))
++    parser.add_argument("--output", type=Path)
++    parser.add_argument("--check", type=Path)
++    args = parser.parse_args()
++
++    if not args.glslang_validator:
++        parser.error("glslangValidator was not found")
++
++    asset_root = args.repo_root / "LibertyRecompLib/postfx/smaa"
++    shader_root = args.repo_root / "glue/rexglue-sdk-main/src/graphics/gta4_native/smaa"
++    for name, expected_hash in UPSTREAM_HASHES.items():
++        path = asset_root / name
++        actual_hash = sha256(path)
++        if actual_hash != expected_hash:
++            raise ValueError(f"{path}: sha256 {actual_hash}, expected {expected_hash}")
++
++    area = parse_byte_array(asset_root / "AreaTex.h", "areaTexBytes")
++    search = parse_byte_array(asset_root / "SearchTex.h", "searchTexBytes")
++    expected_area_size = 160 * 560 * 2
++    expected_search_size = 64 * 16
++    if len(area) != expected_area_size:
++        raise ValueError(f"AreaTex byte count {len(area)}, expected {expected_area_size}")
++    if len(search) != expected_search_size:
++        raise ValueError(f"SearchTex byte count {len(search)}, expected {expected_search_size}")
++
++    shader_payloads: list[tuple[str, bytes]] = []
++    with tempfile.TemporaryDirectory(prefix="liberty-smaa-") as temporary:
++        temporary_root = Path(temporary)
++        for preset in QUALITY_PRESETS:
++            for pass_name in ("edge", "weight"):
++                source = shader_root / f"smaa_{pass_name}_ps.glsl"
++                output = temporary_root / f"{pass_name}_{preset.lower()}.spv"
++                compile_shader(
++                    args.glslang_validator,
++                    args.spirv_val,
++                    source,
++                    asset_root,
++                    preset,
++                    output,
++                )
++                shader_payloads.append((f"smaa_{pass_name}_{preset.lower()}_ps", output.read_bytes()))
++        neighborhood_output = temporary_root / "neighborhood.spv"
++        compile_shader(
++            args.glslang_validator,
++            args.spirv_val,
++            shader_root / "smaa_neighborhood_ps.glsl",
++            asset_root,
++            "HIGH",
++            neighborhood_output,
++        )
++        shader_payloads.append(("smaa_neighborhood_ps", neighborhood_output.read_bytes()))
++
++    generated = "// Generated by tools/XenosRecomp/validate_smaa_pipeline.py.\n"
++    generated += "// Canonical SMAA source: iryoku/smaa commit 71c806a838bdd7d517df19192a20f0c61b3ca29d.\n\n"
++    generated += "\n\n".join(format_words(symbol, payload) for symbol, payload in shader_payloads)
++    generated += "\n"
++
++    if args.output:
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        args.output.write_text(generated, encoding="utf-8")
++    if args.check:
++        if args.check.read_text(encoding="utf-8") != generated:
++            raise ValueError(f"{args.check}: generated SPIR-V is stale")
++
++    print(
++        f"validated AreaTex={len(area)} bytes SearchTex={len(search)} bytes "
++        f"shaders={len(shader_payloads)}"
++    )
++
++
++if __name__ == "__main__":
++    main()

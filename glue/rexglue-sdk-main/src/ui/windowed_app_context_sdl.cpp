@@ -57,10 +57,8 @@ bool SDLWindowedAppContext::Initialize() {
   // drawable to cover the auxiliary regions beside the camera housing.
   // NSPrefersDisplaySafeAreaCompatibilityMode=false in the app bundle prevents
   // macOS from shrinking those display bounds back to compatibility mode.
-  if (!SDL_SetHintWithPriority(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0",
-                               SDL_HINT_OVERRIDE)) {
-    REXLOG_ERROR("Failed to select full-display macOS fullscreen: {}",
-                 SDL_GetError());
+  if (!SDL_SetHintWithPriority(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0", SDL_HINT_OVERRIDE)) {
+    REXLOG_ERROR("Failed to select full-display macOS fullscreen: {}", SDL_GetError());
     return false;
   }
 #endif
@@ -91,6 +89,7 @@ void SDLWindowedAppContext::NotifyUILoopOfPendingFunctions() {
 }
 
 void SDLWindowedAppContext::PlatformQuitFromUIThread() {
+  REXLOG_INFO("app-quit-trace: source=quit-from-ui-thread");
   // RunMainMessageLoop re-checks HasQuitFromUIThread after every event; a
   // wakeup guarantees SDL_WaitEvent returns promptly if the queue is empty.
   NotifyUILoopOfPendingFunctions();
@@ -120,6 +119,10 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
     return;
   }
   if (event.type >= SDL_EVENT_WINDOW_FIRST && event.type <= SDL_EVENT_WINDOW_LAST) {
+    if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+      REXLOG_INFO("app-quit-trace: source=sdl-window-close-requested window={}",
+                  event.window.windowID);
+    }
     if (WindowSDL* window = GetWindow(event.window.windowID)) {
       window->HandleWindowEvent(event);
     }
@@ -127,6 +130,7 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
   }
   switch (event.type) {
     case SDL_EVENT_QUIT: {
+      REXLOG_INFO("app-quit-trace: source=sdl-quit windows={}", windows_.size());
       if (windows_.empty()) {
         QuitFromUIThread();
         break;

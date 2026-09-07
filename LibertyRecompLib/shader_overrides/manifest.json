@@ -8,7 +8,9 @@
       "source": "motion_blur/gta_composite_mb.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -17,7 +19,9 @@
       "source": "motion_blur/gta_composite_mb_high_dof.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -26,7 +30,9 @@
       "source": "motion_blur/gta_composite_mb_dof_debug.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -35,7 +41,9 @@
       "source": "motion_blur/gta_composite_mb_high_dof_debug.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -44,7 +52,9 @@
       "source": "film_grain/tlad_composite_noise.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -53,7 +63,9 @@
       "source": "film_grain/tlad_composite_mb_noise.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -62,7 +74,9 @@
       "source": "film_grain/tlad_composite_high_dof_noise.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -71,7 +85,9 @@
       "source": "film_grain/tlad_composite_mb_high_dof_noise.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -80,7 +96,9 @@
       "source": "bloom/rage_postfx_scalable_bloom.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["BLOOM_HORIZONTAL"]
+      "defines": [
+        "BLOOM_HORIZONTAL"
+      ]
     },
     {
       "stage": "pixel",
@@ -89,7 +107,9 @@
       "source": "bloom/rage_postfx_scalable_bloom.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["BLOOM_VERTICAL"]
+      "defines": [
+        "BLOOM_VERTICAL"
+      ]
     },
     {
       "stage": "pixel",
@@ -98,7 +118,9 @@
       "source": "water/water_ps1_smooth_shorelines.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "vertex",
@@ -107,7 +129,47 @@
       "source": "light_volume/deferred_lighting_vs7_smooth.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000000",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP",
+        "GTA4_LIGHT_VOLUME_SUPPORT_BITS=0x3F59999A"
+      ],
+      "activation": "pipeline_pair",
+      "pipeline_pair_id": 1,
+      "counterpart_hashes": [
+        "0x458818340E2283DE"
+      ],
+      "used_texture_mask": "0x00000000",
+      "support_radius_bits": "0x3F59999A",
+      "supported_sample_counts": [
+        1,
+        2,
+        4
+      ],
+      "expected_input_locations": [
+        0
+      ],
+      "expected_output_locations": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17
+      ],
+      "expected_descriptor_bindings": [],
+      "expected_spec_ids": []
     },
     {
       "stage": "pixel",
@@ -116,7 +178,41 @@
       "source": "light_volume/deferred_lighting_ps20_smooth.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP",
+        "GTA4_LIGHT_VOLUME_SUPPORT_BITS=0x3F59999A"
+      ],
+      "activation": "pipeline_pair",
+      "pipeline_pair_id": 1,
+      "counterpart_hashes": [
+        "0xDF64C22EC010C136"
+      ],
+      "used_texture_mask": "0x00000001",
+      "support_radius_bits": "0x3F59999A",
+      "required_builtins": [
+        "SampleMask"
+      ],
+      "require_early_fragment_tests": true,
+      "supported_sample_counts": [
+        1,
+        2,
+        4
+      ],
+      "expected_input_locations": [
+        0,
+        1,
+        2
+      ],
+      "expected_output_locations": [
+        0
+      ],
+      "expected_descriptor_bindings": [
+        "0:0",
+        "4:0"
+      ],
+      "expected_spec_ids": [
+        0
+      ]
     },
     {
       "stage": "vertex",
@@ -125,7 +221,9 @@
       "source": "fog/rage_postfx_fog_vs.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000000",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -134,7 +232,9 @@
       "source": "fog/rage_postfx_exponential_height_fog.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "vertex",
@@ -143,7 +243,9 @@
       "source": "bink/vs_bink.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000000",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -152,7 +254,9 @@
       "source": "bink/ps_bink.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     },
     {
       "stage": "pixel",
@@ -161,7 +265,9 @@
       "source": "bink/ps_bink_no_alpha.hlsl",
       "entry_point": "shaderMain",
       "specialization_constants_mask": "0x00000702",
-      "defines": ["GTA4_RECOMP"]
+      "defines": [
+        "GTA4_RECOMP"
+      ]
     }
   ]
 }

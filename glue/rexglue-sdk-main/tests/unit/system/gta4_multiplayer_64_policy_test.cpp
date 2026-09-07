@@ -668,6 +668,9 @@ TEST_CASE("GTA IV network endpoint sidecars support sparse peer reuse",
   CHECK_FALSE(registry.Set(kFirstObject, 15, 0xA6000000));
   CHECK_FALSE(registry.Set(kFirstObject, 16, 0));
   REQUIRE(registry.Set(kFirstObject, 16, 0xA6000040));
+  CHECK_FALSE(registry.Set(kFirstObject, 16, 0xA60000C0));
+  CHECK(registry.Get(kFirstObject, 16) == 0xA6000040);
+  REQUIRE(registry.Set(kFirstObject, 16, 0xA6000040));
   REQUIRE(registry.Set(kFirstObject, 63, 0xA6000080));
   REQUIRE(registry.Set(kSecondObject, 16, 0xA7000040));
   CHECK(registry.Get(kFirstObject, 16) == 0xA6000040);
@@ -716,6 +719,26 @@ TEST_CASE("GTA IV network object peer flags cover sparse high recipients",
   registry.RemoveObject(kFirstObject);
   CHECK(registry.Get(kFirstObject, 16) == mp64::NetworkObjectPeerFlags{});
   CHECK(registry.Get(kSecondObject, 16) == mp64::NetworkObjectPeerFlags{0, 0, 1});
+}
+
+TEST_CASE("GTA IV ped network state sidecars isolate extended recipients",
+          "[gta4][multiplayer][64-player]") {
+  mp64::PedNetworkPeerStateRegistry registry;
+  constexpr uint32_t kGuestObject = 0xA5200000;
+  mp64::PedNetworkPeerState first{};
+  mp64::PedNetworkPeerState last{};
+  first.front() = 0x11;
+  first.back() = 0x22;
+  last.front() = 0x33;
+  last.back() = 0x44;
+
+  CHECK_FALSE(registry.Set(kGuestObject, 15, first));
+  REQUIRE(registry.Set(kGuestObject, 16, first));
+  REQUIRE(registry.Set(kGuestObject, 63, last));
+  CHECK(registry.Get(kGuestObject, 16) == first);
+  CHECK(registry.Get(kGuestObject, 63) == last);
+  registry.RemoveObject(kGuestObject);
+  CHECK(registry.Get(kGuestObject, 16) == mp64::PedNetworkPeerState{});
 }
 
 TEST_CASE("GTA IV extended network peer masks preserve peers 16 and 63 on wire",

@@ -40,6 +40,23 @@ option(SPIRV_CROSS_ENABLE_CPP "" OFF)
 option(SPIRV_CROSS_SKIP_INSTALL "" ON)
 add_subdirectory(SPIRV-Cross)
 
+# Use the same header-only Cereal revision as this MoltenVK pin. Without it,
+# vkGetPipelineCacheData cannot serialize the application's compiled MSL cache.
+if(NOT TARGET cereal::cereal)
+    include(FetchContent)
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/ExternalRevisions/cereal_repo_revision"
+        MVK_CEREAL_REVISION LIMIT_COUNT 1)
+    FetchContent_Declare(mvk_cereal
+        GIT_REPOSITORY https://github.com/USCiLab/cereal.git
+        GIT_TAG "${MVK_CEREAL_REVISION}"
+        # Populate only the headers; do not configure Cereal's tests or tools.
+        SOURCE_SUBDIR include)
+    FetchContent_MakeAvailable(mvk_cereal)
+    add_library(mvk_cereal_headers INTERFACE)
+    target_include_directories(mvk_cereal_headers SYSTEM INTERFACE "${mvk_cereal_SOURCE_DIR}/include")
+    add_library(cereal::cereal ALIAS mvk_cereal_headers)
+endif()
+
 # Common
 set(MVK_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/Common)
 file(GLOB_RECURSE MVK_COMMON_SOURCES CONFIGURE_DEPENDS
@@ -84,5 +101,16 @@ target_compile_options(MoltenVK PRIVATE -w -Wno-elaborated-enum-base)
 target_link_options(MoltenVK PRIVATE -L/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++ -lc++)
 target_link_libraries(MoltenVK PRIVATE
     ${APPKIT_LIBRARY} ${FOUNDATION_LIBRARY} ${IOKIT_LIBRARY} ${IOSURFACE_LIBRARY} ${METAL_LIBRARY} ${QUARTZCORE_LIBRARY}
-    spirv-cross-msl MoltenVKCommon MoltenVKShaderConverter)
-target_compile_definitions(MoltenVK PRIVATE MVK_FRAMEWORK_VERSION=${MVK_VERSION} MVK_USE_CEREAL=0)
+    spirv-cross-msl MoltenVKCommon MoltenVKShaderConverter cereal::cereal)
+target_compile_definitions(MoltenVK PRIVATE MVK_FRAMEWORK_VERSION=${MVK_VERSION} MVK_USE_CEREAL=1)
+
+# Opt-in ownership regression test. It exercises the actual retention helper
+# with completion-handler test doubles, without launching the game or using a GPU.
+add_executable(MoltenVKBufferRetentionTest EXCLUDE_FROM_ALL
+    tests/mtl_buffer_retention_test.mm
+    ${MVK_DIR}/MoltenVK/Commands/MVKMTLBufferRetention.mm)
+target_include_directories(MoltenVKBufferRetentionTest PRIVATE ${MVK_DIR}/MoltenVK/Commands)
+target_compile_options(MoltenVKBufferRetentionTest PRIVATE -fno-objc-arc -fblocks -Wall -Wextra -Werror)
+target_link_options(MoltenVKBufferRetentionTest PRIVATE
+    -L/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++ -lc++)
+target_link_libraries(MoltenVKBufferRetentionTest PRIVATE ${FOUNDATION_LIBRARY} ${METAL_LIBRARY})

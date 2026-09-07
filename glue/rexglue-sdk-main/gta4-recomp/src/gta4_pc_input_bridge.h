@@ -7,8 +7,8 @@
 namespace gta4::input {
 
 // Called by the existing sub_82163CE0 override after the retail predicate has
-// run. Direct weapon keys use the retail action-8 eligibility path and only
-// force the exact call site that feeds the retail weapon selector.
+// run. Number keys and vehicle Q/Z use the retail on-foot action-8 or vehicle
+// action-42 eligibility path, only at the call sites feeding the selector.
 void MaybeForceDirectWeaponAction(PPCContext& ctx, uint8_t* base,
                                   uint32_t action_record, uint32_t caller);
 

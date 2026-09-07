@@ -222,19 +222,19 @@ PixelShaderOutput shaderMain(
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		YPlaneSampler_Texture2DDescriptorIndex, YPlaneSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0)).x;
+		YPlaneSampler_Texture2DDescriptorIndex, YPlaneSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0), GetTextureLodBias(0)).x;
 	r1.y = tfetch2D(
 #ifdef __air__
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		cBPlaneSampler_Texture2DDescriptorIndex, cBPlaneSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0)).x;
+		cBPlaneSampler_Texture2DDescriptorIndex, cBPlaneSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0), GetTextureLodBias(2)).x;
 	r1.z = tfetch2D(
 #ifdef __air__
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		cRPlaneSampler_Texture2DDescriptorIndex, cRPlaneSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0)).x;
+		cRPlaneSampler_Texture2DDescriptorIndex, cRPlaneSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0), GetTextureLodBias(1)).x;
 	r0.x = (float)((YUVtoRGB(0).w * YUVtoRGB(3).x));
 	r0.z = (float)((dot(r1.yxz, YUVtoRGB(0).zxy)));
 	ps = max(YUVtoRGB(2).w, YUVtoRGB(2).w);

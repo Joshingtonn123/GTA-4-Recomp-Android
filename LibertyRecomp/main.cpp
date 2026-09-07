@@ -81,6 +81,10 @@
 #include <rex/kernel/crt/heap.h>
 #include <rex/chrono/clock.h>
 #include <rex/input/input_system.h>
+#if !REX_PLATFORM_CONSOLE
+#include <rex/input/mnk/controller_compatibility.h>
+#include <rex/ui/sdl_virtual_key.h>
+#endif
 #if defined(LIBERTY_RECOMP_PS4)
 #include "../glue/rexglue-sdk-main/src/audio/orbis/orbis_audio_system.h"
 #elif REX_PLATFORM_NX
@@ -545,6 +549,35 @@ int main(int argc, char *argv[])
     }
 
     Config::Load();
+
+#if !REX_PLATFORM_CONSOLE
+    // Native PC input owns GTA's action records, but retail code also reads
+    // digital controller buttons directly for pause/cutscene/frontend paths.
+    // Preserve the user's configured Xbox meanings as a button-only overlay;
+    // WASD and mouse axes intentionally remain native-only.
+    rex::input::mnk::SetNativeControllerCompatibilityBindings({
+        .a = rex::ui::TranslateSDLScancode(Config::Key_A.Value),
+        // The PC layout's Space key is the PlayStation Cross / Xbox A
+        // compatibility action used by retail cutscene and accept consumers.
+        .a_alias = rex::ui::TranslateSDLScancode(Config::Key_X.Value),
+        .b = rex::ui::TranslateSDLScancode(Config::Key_B.Value),
+        .y = rex::ui::TranslateSDLScancode(Config::Key_Y.Value),
+        .dpad_up = rex::ui::TranslateSDLScancode(Config::Key_DPadUp.Value),
+        .dpad_down = rex::ui::TranslateSDLScancode(Config::Key_DPadDown.Value),
+        .dpad_left = rex::ui::TranslateSDLScancode(Config::Key_DPadLeft.Value),
+        .dpad_right = rex::ui::TranslateSDLScancode(Config::Key_DPadRight.Value),
+        .start = rex::ui::TranslateSDLScancode(Config::Key_Start.Value),
+        .back = rex::ui::TranslateSDLScancode(Config::Key_Back.Value),
+        .left_shoulder =
+            rex::ui::TranslateSDLScancode(Config::Key_LeftBumper.Value),
+        .right_shoulder =
+            rex::ui::TranslateSDLScancode(Config::Key_RightBumper.Value),
+        .left_trigger =
+            rex::ui::TranslateSDLScancode(Config::Key_LeftTrigger.Value),
+        .right_trigger =
+            rex::ui::TranslateSDLScancode(Config::Key_RightTrigger.Value),
+    });
+#endif
 
     // RexGlue logging init happens inside os::logger::Init() (see C4 refactor):
     // os::logger::Init() now calls rex::InitLogging() + registers platform sinks.

@@ -39,6 +39,7 @@ class SDLInputDriver final : public InputDriver,
 
   X_STATUS Setup() override;
   const char* trace_name() const override { return "sdl-gamepad"; }
+  const char* input_trace_name() const override { return "sdl-input"; }
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                            X_INPUT_CAPABILITIES* out_caps) override;

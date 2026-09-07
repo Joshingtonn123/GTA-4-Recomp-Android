@@ -45,7 +45,8 @@ class NativeFrameContextRing final {
   };
 
   // Query pools and their host-visible result storage are permanent properties
-  // of a slot. Their identities must be nonzero and unique across both slots.
+  // of a configured slot. Their identities must be nonzero and unique across
+  // both slots. Slots that do not use GPU queries may remain unconfigured.
   struct QueryReadbackResources {
     uint64_t query_pool = 0;
     uint64_t readback = 0;
@@ -74,10 +75,13 @@ class NativeFrameContextRing final {
     size_t layout_prediction_count = 0;
   };
 
-  // Slot resources are configured once and stay owned by that slot for the
-  // lifetime of the ring. This prevents a query pool or readback allocation
-  // from silently moving to another in-flight frame.
+  // Slot resources are configured after the renderer creates the real Vulkan
+  // objects and stay owned by that slot until renderer teardown. This prevents
+  // a query pool or readback allocation from silently moving to another
+  // in-flight frame. Release requires the exact resources and an available
+  // slot so stale teardown cannot detach a later configuration.
   bool ConfigureSlot(uint32_t slot, QueryReadbackResources resources);
+  bool ReleaseSlot(uint32_t slot, QueryReadbackResources resources);
   std::optional<QueryReadbackResources> GetSlotResources(uint32_t slot) const;
 
   // Only one slot may be in the CPU recording/prepared transaction at a time.

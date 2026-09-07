@@ -51,6 +51,7 @@ REXCVAR_DECLARE(bool, vulkan_log_debug_messages);
 REXCVAR_DECLARE(bool, vulkan_allow_present_mode_immediate);
 REXCVAR_DECLARE(bool, vulkan_allow_present_mode_mailbox);
 REXCVAR_DECLARE(bool, vulkan_allow_present_mode_fifo_relaxed);
+REXCVAR_DECLARE(bool, vulkan_prefer_present_mode_fifo);
 REXCVAR_DECLARE(bool, vulkan_validation_enabled);
 REXCVAR_DECLARE(int32_t, vulkan_device);
 REXCVAR_DECLARE(bool, vulkan_prefer_geometry_shader);

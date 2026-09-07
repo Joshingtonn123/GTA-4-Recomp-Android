@@ -17,6 +17,7 @@
 
 #include <rex/cvar.h>
 #include <rex/diagnostics/policy.h>
+#include <rex/diagnostics/gpu_flight_recorder.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
@@ -504,11 +505,16 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 
   // Create the debug messenger if requested and available.
 
-  if (rex::diagnostics::IsEnabled(rex::diagnostics::Category::kVulkan) &&
+  if ((rex::diagnostics::IsEnabled(rex::diagnostics::Category::kVulkan) ||
+       rex::diagnostics::gpu_flight::IsEnabled()) &&
       vulkan_instance->extensions_.ext_EXT_debug_utils &&
       REXCVAR_GET(vulkan_log_debug_messages)) {
     VkDebugUtilsMessengerCreateInfoEXT debug_utils_messenger_create_info = {
         VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    if (rex::diagnostics::gpu_flight::IsEnabled()) {
+      debug_utils_messenger_create_info.messageSeverity |=
+          VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    }
     auto gpu_logger = rex::GetLogger(rex::log::gpu());
     if (gpu_logger) {
       if (gpu_logger->should_log(spdlog::level::debug)) {
@@ -590,6 +596,17 @@ VkBool32 VulkanInstance::DebugUtilsMessengerCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
     VkDebugUtilsMessageTypeFlagsEXT message_types,
     const VkDebugUtilsMessengerCallbackDataEXT* callback_data, [[maybe_unused]] void* user_data) {
+  if (callback_data && callback_data->pMessage &&
+      message_severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+    const std::string_view message(callback_data->pMessage);
+    // MoltenVK reports the original Metal command-buffer error here before
+    // later fence/present calls report the resulting lost logical device.
+    if (message.find("Lost VkDevice") != std::string_view::npos ||
+        message.find("VK_ERROR_DEVICE_LOST") != std::string_view::npos) {
+      rex::diagnostics::gpu_flight::Fail("driver.device-lost", VK_ERROR_DEVICE_LOST,
+                                        uint64_t(uintptr_t(user_data)));
+    }
+  }
   std::ostringstream log_str;
 
   log_str << "Vulkan " << vk::to_string(vk::DebugUtilsMessageSeverityFlagBitsEXT(message_severity))

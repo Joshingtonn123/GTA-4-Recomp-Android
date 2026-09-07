@@ -21,7 +21,6 @@ enum class Category : std::size_t {
   kNativeMemoryProfiler,
   kPresenter,
   kGuestHooks,
-  kPhysics,
   kLegal,
   kAudio,
   kVulkan,

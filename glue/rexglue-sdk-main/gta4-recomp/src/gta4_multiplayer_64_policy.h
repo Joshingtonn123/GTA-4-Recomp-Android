@@ -176,6 +176,9 @@ constexpr uint32_t kNetworkArrayHandlerNodeValueOffset = 4;
 constexpr uint32_t kNetworkArrayHandlerNodeNextOffset = 8;
 constexpr uint32_t kLegacyNetworkEndpointTableOffset = 92;
 constexpr uint32_t kFirstOverlappingNetworkEndpointOffset = 156;
+constexpr uint32_t kPedNetworkPeerStateOffset = 320;
+constexpr uint32_t kPedNetworkPeerStateStride = 48;
+constexpr uint32_t kPedNetworkBlenderFactoryAddress = 0x82711E78;
 constexpr uint32_t kNetworkObjectEndpointStateOffset = 4;
 constexpr uint32_t kNetworkObjectAuthoritativeOffset = 14;
 constexpr uint32_t kNetworkObjectOwnerPeerOffset = 15;
@@ -197,7 +200,7 @@ constexpr uint32_t kNetworkObjectPeerDepartedVtableOffset = 132;
 constexpr uint32_t kNetworkObjectRecipientAllowedVtableOffset = 92;
 constexpr uint32_t kNetworkObjectExpiredVtableOffset = 76;
 constexpr uint32_t kNetworkObjectPrepareSyncVtableOffset = 140;
-constexpr uint32_t kNetworkObjectEndpointFactoryVtableOffset = 64;
+constexpr uint32_t kNetworkObjectBlenderFactoryVtableOffset = 64;
 constexpr uint32_t kNetworkObjectOwnershipEligibleVtableOffset = 72;
 constexpr uint32_t kNetworkObjectComponentCountVtableOffset = 196;
 constexpr uint32_t kNetworkObjectFillOwnershipCommandVtableOffset = 236;
@@ -293,11 +296,15 @@ constexpr uint32_t kObjectPeerMatrixThresholdOffset = 333968;
 constexpr uint32_t kObjectManagerInitializedFlagOffset = 334015;
 constexpr uint32_t kObjectManagerReassignmentOffset = 108248;
 constexpr size_t kObjectRemovalBatchCapacity = 200;
-constexpr uint32_t kVehicleSyncPoolAddress = 0x8318E944;
-constexpr uint32_t kPlayerSyncPoolAddress = 0x8318E958;
-constexpr uint32_t kDummyPedSyncPoolAddress = 0x8318EBB8;
-constexpr uint32_t kPedSyncPoolAddress = 0x8318E6E4;
-constexpr uint32_t kObjectSyncPoolAddress = 0x8318E954;
+// These are the guest addresses of GTA's global pool-pointer slots, not the
+// pool objects themselves. Extended endpoints use the retail descriptor's
+// element stride while keeping the fixed pool itself at its retail capacity.
+constexpr uint32_t kVehicleSyncPoolPointerAddress = 0x8318E944;
+constexpr uint32_t kPlayerSyncPoolPointerAddress = 0x8318E958;
+constexpr uint32_t kDummyPedSyncPoolPointerAddress = 0x8318EBB8;
+constexpr uint32_t kPedSyncPoolPointerAddress = 0x8318E6E4;
+constexpr uint32_t kObjectSyncPoolPointerAddress = 0x8318E954;
+constexpr uint32_t kFixedPoolElementStrideOffset = 12;
 constexpr uint32_t kReassignmentCommandRecordStride = 20;
 constexpr uint32_t kReassignmentCommandRecordSize = 24;
 constexpr uint32_t kReassignmentObjectListBias = 42;
@@ -1224,7 +1231,11 @@ class NetworkEndpointRegistry {
       return false;
     }
     std::scoped_lock lock(mutex_);
-    objects_[guest_object][peer_id] = guest_endpoint;
+    uint32_t& registered_endpoint = objects_[guest_object][peer_id];
+    if (registered_endpoint != 0 && registered_endpoint != guest_endpoint) {
+      return false;
+    }
+    registered_endpoint = guest_endpoint;
     return true;
   }
 
@@ -1277,6 +1288,38 @@ class NetworkEndpointRegistry {
 };
 
 using NetworkObjectPeerFlags = std::array<uint8_t, kNetworkObjectPeerFlagsStride>;
+
+using PedNetworkPeerState = std::array<uint8_t, kPedNetworkPeerStateStride>;
+
+class PedNetworkPeerStateRegistry {
+ public:
+  PedNetworkPeerState Get(uint32_t guest_object, uint8_t peer_id) const {
+    if (guest_object == 0 || ClassifyPeerId(peer_id) != PeerIdClass::kExtended) {
+      return {};
+    }
+    std::scoped_lock lock(mutex_);
+    const auto it = objects_.find(guest_object);
+    return it == objects_.end() ? PedNetworkPeerState{} : it->second[peer_id];
+  }
+
+  bool Set(uint32_t guest_object, uint8_t peer_id, PedNetworkPeerState state) {
+    if (guest_object == 0 || ClassifyPeerId(peer_id) != PeerIdClass::kExtended) {
+      return false;
+    }
+    std::scoped_lock lock(mutex_);
+    objects_[guest_object][peer_id] = state;
+    return true;
+  }
+
+  void RemoveObject(uint32_t guest_object) {
+    std::scoped_lock lock(mutex_);
+    objects_.erase(guest_object);
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::unordered_map<uint32_t, std::array<PedNetworkPeerState, kExtendedPeerCapacity>> objects_;
+};
 
 class NetworkObjectPeerFlagsRegistry {
  public:

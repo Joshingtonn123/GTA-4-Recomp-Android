@@ -150,6 +150,32 @@ TEST_CASE("GTA IV native performance CPU ranges and counters aggregate without a
   CHECK(sample.counters[size_t(Counter::kSurfaceImagesLive)] == 9);
 }
 
+TEST_CASE("GTA IV native performance housekeeping detail leaves parent totals independent") {
+  FrameBuilder builder;
+  builder.Begin(99);
+  builder.AddCpuRange(CpuRange::kHousekeeping, 61);
+  builder.AddCpuRange(CpuRange::kHousekeepingSurfaceRelease, 7);
+  builder.AddCpuRange(CpuRange::kHousekeepingTextureReclamation, 4);
+  builder.AddCpuRange(CpuRange::kHousekeepingTextureRetirement, 19);
+  builder.AddCpuRange(CpuRange::kHousekeepingBufferReclamation, 20);
+  builder.AddCpuRange(CpuRange::kHousekeepingPersistentBufferReclamation, 11);
+  builder.AddCounter(Counter::kPipelineRequestReuses, 3);
+  const FrameSample sample = builder.Finish();
+  CHECK(sample.cpu_ticks[size_t(CpuRange::kHousekeeping)] == 61);
+  CHECK(sample.cpu_ticks[size_t(CpuRange::kHousekeepingSurfaceRelease)] == 7);
+  CHECK(sample.cpu_ticks[size_t(CpuRange::kHousekeepingTextureReclamation)] == 4);
+  CHECK(sample.cpu_ticks[size_t(CpuRange::kHousekeepingTextureRetirement)] == 19);
+  CHECK(sample.cpu_ticks[size_t(CpuRange::kHousekeepingBufferReclamation)] == 20);
+  CHECK(sample.cpu_ticks[size_t(CpuRange::kHousekeepingPersistentBufferReclamation)] == 11);
+  CHECK(sample.counters[size_t(Counter::kPipelineRequestReuses)] == 3);
+  builder.Begin(100);
+  CHECK(builder.sample().cpu_ticks[size_t(CpuRange::kHousekeepingTextureRetirement)] == 0);
+  CHECK(builder.sample().counters[size_t(Counter::kPipelineRequestReuses)] == 0);
+  CHECK(std::string_view(CpuRangeName(CpuRange::kHousekeepingPersistentBufferReclamation)) ==
+        "housekeeping-persistent-buffer-reclamation");
+  CHECK(std::string_view(CounterName(Counter::kPipelineRequestReuses)) == "pipeline-request-reuses");
+}
+
 TEST_CASE("GTA IV native performance exclusive GPU slices aggregate additively") {
   FrameBuilder builder;
   builder.Begin(101);
@@ -203,6 +229,40 @@ TEST_CASE("GTA IV native performance ring clears without exposing stale samples"
   ring.Push(sample);
   REQUIRE(ring.CopyOldest(0, &sample));
   CHECK(sample.frame == 42);
+}
+
+TEST_CASE("GTA IV native completed slot samples publish in capture order without overwrite") {
+  FrameSampleCompletionQueue completed;
+  FrameSample slot_zero{};
+  slot_zero.frame = 41;
+  slot_zero.counters[size_t(Counter::kUploadBytes)] = 4100;
+  FrameSample slot_one{};
+  slot_one.frame = 42;
+  slot_one.counters[size_t(Counter::kUploadBytes)] = 4200;
+
+  REQUIRE(completed.Complete(1, 2, true, slot_one));
+  CHECK(completed.occupied(1));
+  CHECK_FALSE(completed.Complete(1, 3, true, slot_zero));
+  CHECK_FALSE(completed.Complete(0, 2, true, slot_zero));
+  bool publish = false;
+  FrameSample published{};
+  CHECK_FALSE(completed.PopNext(1, &publish, &published));
+
+  REQUIRE(completed.Complete(0, 1, true, slot_zero));
+  REQUIRE(completed.PopNext(1, &publish, &published));
+  CHECK(publish);
+  CHECK(published.frame == 41);
+  CHECK(published.counters[size_t(Counter::kUploadBytes)] == 4100);
+  REQUIRE(completed.PopNext(2, &publish, &published));
+  CHECK(publish);
+  CHECK(published.frame == 42);
+  CHECK(published.counters[size_t(Counter::kUploadBytes)] == 4200);
+  CHECK(completed.size() == 0);
+
+  slot_one.frame = 43;
+  REQUIRE(completed.Complete(1, 3, true, slot_one));
+  REQUIRE(completed.PopNext(3, &publish, &published));
+  CHECK(published.frame == 43);
 }
 
 TEST_CASE("GTA IV native performance names cover streaming validation and memory pressure") {

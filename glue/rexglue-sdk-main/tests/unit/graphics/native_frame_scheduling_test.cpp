@@ -41,7 +41,7 @@ TEST_CASE("GTA IV native buffer capture reuses only clean matching metadata") {
   REQUIRE_FALSE(gta4::CanReuseNativeBufferCapture(true, false, false));
 }
 
-TEST_CASE("GTA IV native buffer shadow sampling validates complete selected payloads") {
+TEST_CASE("GTA IV native buffer shadow range validation covers complete selected ranges") {
   std::array<uint8_t, 1024> captured{};
   for (size_t index = 0; index < captured.size(); ++index) {
     captured[index] = uint8_t(index);
@@ -60,15 +60,64 @@ TEST_CASE("GTA IV native buffer shadow sampling validates complete selected payl
   REQUIRE_FALSE(gta4::NativeBufferShadowPayloadMatches(nullptr, small.data(), small.size()));
 }
 
-TEST_CASE("GTA IV native buffer shadow validation cadence is deterministic") {
-  REQUIRE(gta4::ShouldValidateNativeBufferShadow(1));
-  REQUIRE_FALSE(gta4::ShouldValidateNativeBufferShadow(2));
-  REQUIRE_FALSE(gta4::ShouldValidateNativeBufferShadow(64));
-  REQUIRE(gta4::ShouldValidateNativeBufferShadow(65));
-  REQUIRE(gta4::ShouldValidateNativeBufferShadow(129));
+TEST_CASE("GTA IV native buffer shadow validation is a bounded complete sweep") {
+  std::array<uint8_t, 1024> captured{};
+  for (size_t index = 0; index < captured.size(); ++index) {
+    captured[index] = uint8_t(index);
+  }
+  auto guest = captured;
+  size_t offset = 0;
+  size_t validated_bytes = 0;
+  size_t range_count = 0;
+  do {
+    const auto range = gta4::GetNativeBufferShadowValidationRange(captured.size(), offset);
+    REQUIRE(range.offset == validated_bytes);
+    REQUIRE(range.length > 0);
+    REQUIRE(gta4::NativeBufferShadowPayloadRangeMatches(
+        guest.data(), captured.data(), captured.size(), range));
+    validated_bytes += range.length;
+    ++range_count;
+    offset = range.next_offset;
+    if (range.completes_sweep) {
+      break;
+    }
+  } while (true);
+  REQUIRE(validated_bytes == captured.size());
+  REQUIRE(range_count == gta4::kNativeBufferShadowValidationSlices);
+
+  guest[777] ^= 1;
+  const auto mismatch_range = gta4::GetNativeBufferShadowValidationRange(captured.size(), 768);
+  REQUIRE_FALSE(gta4::NativeBufferShadowPayloadRangeMatches(
+      guest.data(), captured.data(), captured.size(), mismatch_range));
+  const auto wrapped_range = gta4::GetNativeBufferShadowValidationRange(captured.size(), 2048);
+  REQUIRE(wrapped_range.offset == 0);
+  REQUIRE_FALSE(gta4::NativeBufferShadowPayloadRangeMatches(
+      nullptr, captured.data(), captured.size(), wrapped_range));
   REQUIRE(gta4::ShouldDisableNativeBufferFastPath(true, false));
   REQUIRE_FALSE(gta4::ShouldDisableNativeBufferFastPath(true, true));
   REQUIRE_FALSE(gta4::ShouldDisableNativeBufferFastPath(false, false));
+}
+
+TEST_CASE("GTA IV native maintenance schedules are phase separated and reset safe") {
+  gta4::NativePeriodicWorkSchedule texture_schedule(
+      gta4::kNativeTextureBudgetPollPhaseFrames);
+  gta4::NativePeriodicWorkSchedule buffer_schedule(
+      gta4::kNativeBufferCachePollPhaseFrames);
+
+  REQUIRE_FALSE(texture_schedule.ShouldRun(1, gta4::kNativeTextureBudgetPollFrames));
+  REQUIRE_FALSE(buffer_schedule.ShouldRun(1, gta4::kNativeBufferCachePollFrames));
+  REQUIRE_FALSE(texture_schedule.ShouldRun(40, gta4::kNativeTextureBudgetPollFrames));
+  REQUIRE(texture_schedule.ShouldRun(41, gta4::kNativeTextureBudgetPollFrames));
+  REQUIRE_FALSE(buffer_schedule.ShouldRun(41, gta4::kNativeBufferCachePollFrames));
+  REQUIRE(buffer_schedule.ShouldRun(81, gta4::kNativeBufferCachePollFrames));
+  REQUIRE_FALSE(texture_schedule.ShouldRun(81, gta4::kNativeTextureBudgetPollFrames));
+  REQUIRE(texture_schedule.ShouldRun(161, gta4::kNativeTextureBudgetPollFrames));
+  REQUIRE(buffer_schedule.ShouldRun(201, gta4::kNativeBufferCachePollFrames));
+
+  REQUIRE_FALSE(texture_schedule.ShouldRun(0, gta4::kNativeTextureBudgetPollFrames));
+  REQUIRE(texture_schedule.ShouldRun(0, 0));
+  texture_schedule.Reset();
+  REQUIRE_FALSE(texture_schedule.ShouldRun(9, gta4::kNativeTextureBudgetPollFrames));
 }
 
 TEST_CASE("GTA IV native texture eviction protects references and handles frame resets") {
@@ -88,6 +137,27 @@ TEST_CASE("GTA IV native buffer cache reclaims only unreferenced old or over-bud
   REQUIRE(gta4::ShouldReclaimNativeBuffer(true, false, 1601, 1000, 600));
   REQUIRE(gta4::ShouldReclaimNativeBuffer(true, true, 1000, 1000, 600));
   REQUIRE_FALSE(gta4::ShouldReclaimNativeBuffer(true, false, 999, 1000, 600));
+}
+
+TEST_CASE("GTA IV native buffer reclamation sorts only under budget pressure") {
+  REQUIRE_FALSE(gta4::ShouldSortNativeBufferReclamation(0, 0));
+  REQUIRE_FALSE(gta4::ShouldSortNativeBufferReclamation(255, 256));
+  REQUIRE_FALSE(gta4::ShouldSortNativeBufferReclamation(256, 256));
+  REQUIRE(gta4::ShouldSortNativeBufferReclamation(257, 256));
+  REQUIRE(gta4::ShouldSortNativeBufferReclamation(UINT64_MAX, 256));
+
+  // Every permutation must reclaim the same aged entries when not over budget,
+  // including an entry at the retention boundary and a future/reset timestamp.
+  std::array<uint32_t, 5> stamps{0, 1000, 1400, 2000, 3000};
+  do {
+    std::unordered_set<uint32_t> reclaimed;
+    for (uint32_t stamp : stamps) {
+      if (gta4::ShouldReclaimNativeBuffer(true, false, 2000, stamp, 600)) {
+        reclaimed.insert(stamp);
+      }
+    }
+    REQUIRE(reclaimed == std::unordered_set<uint32_t>{0, 1000});
+  } while (std::next_permutation(stamps.begin(), stamps.end()));
 }
 
 TEST_CASE("GTA IV native upload buffer shrink uses capacity and time hysteresis") {

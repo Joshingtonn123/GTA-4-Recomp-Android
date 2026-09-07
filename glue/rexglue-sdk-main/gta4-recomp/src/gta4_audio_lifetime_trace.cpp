@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -106,6 +107,14 @@ std::atomic<size_t> g_replacement_cursor{0};
 std::atomic<uint64_t> g_party_transition_epoch{0};
 std::atomic<uint64_t> g_last_publish_epoch{0};
 std::atomic<uint64_t> g_last_worker_epoch{0};
+
+bool IsAudioLifetimeTraceLoggingEnabled() {
+  // Audio lifetime diagnostics are intentionally compiled out for renderer
+  // investigation builds. Keep the publication locks and retail audio calls,
+  // but emit no audio-lifetime records even if an inherited environment variable
+  // requests them.
+  return false;
+}
 
 // The retail XAudio wrappers serialize source calls with one global critical
 // section, but audVoiceXenon reads its published source slot before entering
@@ -337,6 +346,9 @@ void LogRecord(std::string_view point, uint32_t function, uint32_t caller,
                const LifetimeRecord& record, const GuestSnapshot& snapshot, uint32_t argument0 = 0,
                uint32_t argument1 = 0, uint32_t argument2 = 0, uint32_t argument3 = 0,
                uint32_t argument4 = 0, uint32_t argument5 = 0) {
+  if (!IsAudioLifetimeTraceLoggingEnabled()) {
+    return;
+  }
   const uint64_t sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
   REXSYS_INFO(
       "audio-lifetime seq={} point={} thread={} function={:08X} caller={:08X} "
@@ -361,6 +373,9 @@ void LogRecord(std::string_view point, uint32_t function, uint32_t caller, uint8
                const LifetimeRecord& record, uint32_t argument0 = 0, uint32_t argument1 = 0,
                uint32_t argument2 = 0, uint32_t argument3 = 0, uint32_t argument4 = 0,
                uint32_t argument5 = 0) {
+  if (!IsAudioLifetimeTraceLoggingEnabled()) {
+    return;
+  }
   LogRecord(point, function, caller, record, CaptureSnapshot(base, record), argument0, argument1,
             argument2, argument3, argument4, argument5);
 }
@@ -368,6 +383,9 @@ void LogRecord(std::string_view point, uint32_t function, uint32_t caller, uint8
 void LogCheckpoint(std::string_view point, uint32_t function, uint32_t caller,
                    uint32_t argument0 = 0, uint32_t argument1 = 0, uint32_t argument2 = 0,
                    uint32_t argument3 = 0, uint32_t argument4 = 0, uint32_t argument5 = 0) {
+  if (!IsAudioLifetimeTraceLoggingEnabled()) {
+    return;
+  }
   LogRecord(point, function, caller, LifetimeRecord{}, GuestSnapshot{}, argument0, argument1,
             argument2, argument3, argument4, argument5);
 }
@@ -860,6 +878,15 @@ extern "C" void sub_8218F700(PPCContext& ctx, uint8_t* base) {
   if (record) {
     LogRecord("outer-source-published", 0x8218F700, caller, base, *record, output_slot, source);
   }
+}
+
+extern "C" void sub_8292FAB8(PPCContext& ctx, uint8_t* base) {
+  // This initializer publishes outer+316 through sub_8218F700 and then
+  // immediately reloads and uses the published source. It must participate in
+  // the same domain as cleanup and every consumer; locking sub_8218F700 alone
+  // would still leave the post-publication use exposed to concurrent cleanup.
+  AudVoiceSourcePublicationLock publication_lock;
+  __imp__sub_8292FAB8(ctx, base);
 }
 
 extern "C" void sub_8292F0E8(PPCContext& ctx, uint8_t* base) {

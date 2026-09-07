@@ -35,6 +35,7 @@ mp64::PeerMaskPairRegistry g_dispatch_masks;
 mp64::DispatchPeerStateRegistry g_dispatch_peer_states;
 mp64::NetworkEndpointRegistry g_network_endpoints;
 mp64::NetworkObjectPeerFlagsRegistry g_network_peer_flags;
+mp64::PedNetworkPeerStateRegistry g_ped_network_peer_states;
 mp64::EventPeerBufferRegistry g_event_peer_buffers;
 mp64::EventScopeRegistry g_event_scopes;
 mp64::PlayerTickStateRegistry g_player_tick_states;
@@ -393,6 +394,36 @@ thread_local NetworkPeerMaskSnapshot g_network_peer_mask_snapshot;
 
 uint8_t GuestPeerId(uint64_t value) noexcept {
   return static_cast<uint8_t>(value);
+}
+
+uint8_t CanonicalNetworkEndpointPeerId(uint32_t guest_object, uint8_t presented_peer_id) {
+  if (g_network_peer_alias.active && g_network_peer_alias.guest_object == guest_object &&
+      g_network_peer_alias.alias_peer_id == presented_peer_id &&
+      mp64::ClassifyPeerId(g_network_peer_alias.actual_peer_id) ==
+          mp64::PeerIdClass::kExtended) {
+    return g_network_peer_alias.actual_peer_id;
+  }
+  return presented_peer_id;
+}
+
+bool PublishActiveNetworkAliasEndpoint(uint8_t* base, uint32_t guest_object,
+                                       uint8_t actual_peer_id, uint32_t guest_endpoint) {
+  if (!g_network_peer_alias.active || g_network_peer_alias.guest_object != guest_object ||
+      g_network_peer_alias.actual_peer_id != actual_peer_id) {
+    return true;
+  }
+  const auto endpoint_table =
+      mp64::CheckedGuestAddress(guest_object, mp64::kLegacyNetworkEndpointTableOffset);
+  const auto alias_endpoint = endpoint_table
+                                  ? mp64::CheckedGuestArrayAddress(
+                                        *endpoint_table, g_network_peer_alias.alias_peer_id,
+                                        mp64::kGuestPointerSize)
+                                  : std::nullopt;
+  if (!alias_endpoint) {
+    return false;
+  }
+  REX_STORE_U32(*alias_endpoint, guest_endpoint);
+  return true;
 }
 
 PlayerInfoLease PlayerInfoForId(uint8_t* base, uint8_t player_id) {
@@ -995,6 +1026,32 @@ bool WithExtendedNetworkPeer(PPCContext& ctx, uint8_t* base, uint32_t guest_obje
   }
   const uint32_t alias_flags = flag_addresses[alias_id];
   const uint32_t alias_endpoint = endpoint_addresses[alias_id];
+  const auto guest_vtable_address = mp64::CheckedGuestAddress(guest_object, 0);
+  const uint32_t guest_vtable = guest_vtable_address ? REX_LOAD_U32(*guest_vtable_address) : 0;
+  const auto blender_factory_address =
+      mp64::CheckedGuestAddress(guest_vtable, mp64::kNetworkObjectBlenderFactoryVtableOffset);
+  const bool project_ped_state =
+      blender_factory_address &&
+      REX_LOAD_U32(*blender_factory_address) == mp64::kPedNetworkBlenderFactoryAddress;
+  const auto ped_state_table = project_ped_state
+                                   ? mp64::CheckedGuestAddress(
+                                         guest_object, mp64::kPedNetworkPeerStateOffset)
+                                   : std::nullopt;
+  const auto alias_ped_state =
+      ped_state_table
+          ? mp64::CheckedGuestArrayAddress(*ped_state_table, alias_id,
+                                           mp64::kPedNetworkPeerStateStride)
+          : std::nullopt;
+  if (project_ped_state && !alias_ped_state) {
+    return false;
+  }
+  mp64::PedNetworkPeerState saved_ped_state{};
+  if (alias_ped_state) {
+    std::memcpy(saved_ped_state.data(), base + *alias_ped_state, saved_ped_state.size());
+    const mp64::PedNetworkPeerState extended_ped_state =
+        g_ped_network_peer_states.Get(guest_object, actual_peer_id);
+    std::memcpy(base + *alias_ped_state, extended_ped_state.data(), extended_ped_state.size());
+  }
   const mp64::NetworkObjectPeerFlags extended_flags =
       g_network_peer_flags.Get(guest_object, actual_peer_id);
   std::memcpy(base + alias_flags, extended_flags.data(), extended_flags.size());
@@ -1006,26 +1063,52 @@ bool WithExtendedNetworkPeer(PPCContext& ctx, uint8_t* base, uint32_t guest_obje
   g_network_peer_alias.guest_peer = guest_peer;
   g_network_peer_alias.actual_peer_id = actual_peer_id;
   g_network_peer_alias.alias_peer_id = alias_id;
+  const auto saved_override =
+      GetAliasOverride(mp64::kGlobalPeerManagerAddress, alias_id);
   SetAliasOverride(mp64::kGlobalPeerManagerAddress, alias_id, guest_peer);
   callback(alias_id);
 
   mp64::NetworkObjectPeerFlags captured_flags{};
   std::memcpy(captured_flags.data(), base + alias_flags, captured_flags.size());
   g_network_peer_flags.Set(guest_object, actual_peer_id, captured_flags);
-  const uint32_t captured_endpoint = REX_LOAD_U32(alias_endpoint);
-  if (captured_endpoint != 0) {
-    g_network_endpoints.Set(guest_object, actual_peer_id, captured_endpoint);
-  } else {
-    g_network_endpoints.Remove(guest_object, actual_peer_id);
+  if (alias_ped_state) {
+    mp64::PedNetworkPeerState captured_ped_state{};
+    std::memcpy(captured_ped_state.data(), base + *alias_ped_state,
+                captured_ped_state.size());
+    g_ped_network_peer_states.Set(guest_object, actual_peer_id, captured_ped_state);
+    std::memcpy(base + *alias_ped_state, saved_ped_state.data(), saved_ped_state.size());
   }
+  // Endpoint ownership is maintained only by the hooked factory/destructor
+  // pair. Never import a raw pointer from the projected retail slot: the
+  // original function may have replaced it with storage owned by a fixed
+  // retail pool, which is not safe to release through SystemHeapFree.
   for (uint8_t peer_id = 0; peer_id < mp64::kLegacyPeerCapacity; ++peer_id) {
     std::memcpy(base + flag_addresses[peer_id], saved_flags[peer_id].data(),
                 saved_flags[peer_id].size());
     REX_STORE_U32(endpoint_addresses[peer_id], saved_endpoints[peer_id]);
   }
-  ClearAliasOverride(mp64::kGlobalPeerManagerAddress, alias_id);
+  if (saved_override) {
+    SetAliasOverride(mp64::kGlobalPeerManagerAddress, alias_id, *saved_override);
+  } else {
+    ClearAliasOverride(mp64::kGlobalPeerManagerAddress, alias_id);
+  }
   g_network_peer_alias = saved_context;
   return true;
+}
+
+template <typename Callback>
+bool WithNetworkEndpointVirtualPeer(PPCContext& ctx, uint8_t* base, uint32_t guest_object,
+                                    uint8_t actual_peer_id, Callback&& callback) {
+  if (g_network_peer_alias.active && g_network_peer_alias.guest_object == guest_object &&
+      g_network_peer_alias.actual_peer_id == actual_peer_id) {
+    callback(g_network_peer_alias.alias_peer_id);
+    return true;
+  }
+  const uint32_t guest_peer =
+      g_peer_managers.GetPeer(mp64::kGlobalPeerManagerAddress, actual_peer_id);
+  return guest_peer != 0 &&
+         WithExtendedNetworkPeer(ctx, base, guest_object, guest_peer, actual_peer_id, false,
+                                 std::forward<Callback>(callback));
 }
 
 mp64::EventPeerBuffers EnsureEventPeerBuffers(PPCContext& ctx, uint8_t* base,
@@ -1938,19 +2021,38 @@ void RemoveEventScopesForManager(uint8_t* base, uint32_t guest_event_manager) {
   }
 }
 
-uint32_t AllocateNetworkEndpoint(PPCContext& parent_ctx, uint8_t* base, uint32_t guest_pool,
+uint32_t AllocateNetworkEndpoint(PPCContext& parent_ctx, uint8_t* base,
+                                 uint32_t guest_pool_pointer_address,
                                  GuestFunction* constructor) {
-  PPCContext nested_ctx = parent_ctx;
-  nested_ctx.r3.u64 = guest_pool;
-  __imp__sub_8244C388(nested_ctx, base);
-  const uint32_t guest_endpoint_storage = nested_ctx.r3.u32;
+  // Keep GTA's fixed endpoint pools at their retail capacities. Extended
+  // recipients are sidecar-owned, so allocate their endpoint storage on
+  // demand from the runtime system heap while retaining the exact retail
+  // element stride and constructor.
+  const uint32_t guest_pool = REX_LOAD_U32(guest_pool_pointer_address);
+  if (guest_pool == 0) {
+    return 0;
+  }
+
+  const uint32_t endpoint_size =
+      REX_LOAD_U32(guest_pool + mp64::kFixedPoolElementStrideOffset);
+  rex::Runtime* runtime = rex::Runtime::instance();
+  if (runtime == nullptr || endpoint_size == 0) {
+    return 0;
+  }
+
+  const uint32_t guest_endpoint_storage = runtime->memory()->SystemHeapAlloc(endpoint_size);
   if (guest_endpoint_storage == 0) {
     return 0;
   }
-  nested_ctx = parent_ctx;
+
+  PPCContext nested_ctx = parent_ctx;
   nested_ctx.r3.u64 = guest_endpoint_storage;
   constructor(nested_ctx, base);
-  return nested_ctx.r3.u32;
+  if (nested_ctx.r3.u32 != guest_endpoint_storage) {
+    runtime->memory()->SystemHeapFree(guest_endpoint_storage);
+    return 0;
+  }
+  return guest_endpoint_storage;
 }
 
 bool CallNetworkObjectVirtual(PPCContext& ctx, uint8_t* base, uint32_t guest_object,
@@ -1973,20 +2075,54 @@ bool CallNetworkObjectVirtual(PPCContext& ctx, uint8_t* base, uint32_t guest_obj
   return true;
 }
 
+void DestroyNetworkEndpoint(PPCContext& parent_ctx, uint8_t* base, uint32_t guest_endpoint) {
+  if (guest_endpoint == 0) {
+    return;
+  }
+  PPCContext destroy_ctx = parent_ctx;
+  destroy_ctx.r3.u64 = guest_endpoint;
+  // Each endpoint's vfunc zero returns the object to its retail fixed pool
+  // only when the deleting flag is set. Sidecar endpoints are system-heap
+  // owned, so run the non-deleting destructor and release them here.
+  destroy_ctx.r4.u64 = 0;
+  if (!CallNetworkObjectVirtual(destroy_ctx, base, guest_endpoint, 0)) {
+    REXLOG_WARN("gta4-multiplayer64: extended endpoint destructor unavailable endpoint={:08X}",
+                guest_endpoint);
+  }
+  if (rex::Runtime* runtime = rex::Runtime::instance()) {
+    runtime->memory()->SystemHeapFree(guest_endpoint);
+  }
+}
+
 void FinishExtendedEndpointCreation(PPCContext& ctx, uint8_t* base, uint32_t guest_object,
                                     uint8_t peer_id, uint32_t guest_endpoint,
                                     uint32_t create_argument) {
   if (!g_network_endpoints.Set(guest_object, peer_id, guest_endpoint)) {
+    DestroyNetworkEndpoint(ctx, base, guest_endpoint);
     return;
   }
-  ctx.r3.u64 = guest_object;
-  ctx.r4.u64 = peer_id;
-  ctx.r5.u64 = 1;
-  CallNetworkObjectVirtual(ctx, base, guest_object, mp64::kNetworkObjectCreateSyncVtableOffset);
-  ctx.r3.u64 = guest_object;
-  ctx.r4.u64 = peer_id;
-  ctx.r5.u64 = create_argument;
-  CallNetworkObjectVirtual(ctx, base, guest_object, mp64::kNetworkObjectSerializeSyncVtableOffset);
+  if (!PublishActiveNetworkAliasEndpoint(base, guest_object, peer_id, guest_endpoint)) {
+    g_network_endpoints.Remove(guest_object, peer_id);
+    DestroyNetworkEndpoint(ctx, base, guest_endpoint);
+    return;
+  }
+  const bool initialized = WithNetworkEndpointVirtualPeer(
+      ctx, base, guest_object, peer_id, [&](uint8_t presented_peer_id) {
+        ctx.r3.u64 = guest_object;
+        ctx.r4.u64 = presented_peer_id;
+        ctx.r5.u64 = 1;
+        CallNetworkObjectVirtual(ctx, base, guest_object,
+                                 mp64::kNetworkObjectCreateSyncVtableOffset);
+        ctx.r3.u64 = guest_object;
+        ctx.r4.u64 = presented_peer_id;
+        ctx.r5.u64 = create_argument;
+        CallNetworkObjectVirtual(ctx, base, guest_object,
+                                 mp64::kNetworkObjectSerializeSyncVtableOffset);
+      });
+  if (!initialized) {
+    g_network_endpoints.Remove(guest_object, peer_id);
+    DestroyNetworkEndpoint(ctx, base, guest_endpoint);
+  }
 }
 
 bool InsertExtendedPeerAtFreeListHead(uint8_t* base, uint32_t guest_manager, uint32_t guest_peer) {
@@ -8117,9 +8253,18 @@ extern "C" void sub_82703D08(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_82702C58(PPCContext& ctx, uint8_t* base) {
   const uint32_t guest_object = ctx.r3.u32;
+  std::vector<uint32_t> extended_endpoints;
+  g_network_endpoints.VisitExtended(guest_object, [&](uint8_t, uint32_t guest_endpoint) {
+    extended_endpoints.push_back(guest_endpoint);
+    return true;
+  });
+  for (const uint32_t guest_endpoint : extended_endpoints) {
+    DestroyNetworkEndpoint(ctx, base, guest_endpoint);
+  }
   __imp__sub_82702C58(ctx, base);
   g_network_endpoints.RemoveObject(guest_object);
   g_network_peer_flags.RemoveObject(guest_object);
+  g_ped_network_peer_states.RemoveObject(guest_object);
 }
 
 // CNetworkObject owns only sixteen inline per-recipient endpoint pointers at
@@ -8127,7 +8272,8 @@ extern "C" void sub_82702C58(PPCContext& ctx, uint8_t* base) {
 // forwarding helpers must never evaluate object + (peer+23)*4 for those IDs.
 extern "C" void sub_82702DE8(PPCContext& ctx, uint8_t* base) {
   const uint32_t guest_object = ctx.r3.u32;
-  const uint8_t peer_id = GuestPeerId(ctx.r4.u64);
+  const uint8_t peer_id =
+      CanonicalNetworkEndpointPeerId(guest_object, GuestPeerId(ctx.r4.u64));
   if (mp64::ClassifyPeerId(peer_id) == mp64::PeerIdClass::kExtended) {
     ctx.r3.u64 = g_network_endpoints.Get(guest_object, peer_id);
     return;
@@ -8141,7 +8287,8 @@ extern "C" void sub_82702DE8(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_82702E00(PPCContext& ctx, uint8_t* base) {
   const uint32_t guest_object = ctx.r3.u32;
-  const uint8_t peer_id = GuestPeerId(ctx.r4.u64);
+  const uint8_t peer_id =
+      CanonicalNetworkEndpointPeerId(guest_object, GuestPeerId(ctx.r4.u64));
   if (mp64::ClassifyPeerId(peer_id) == mp64::PeerIdClass::kLegacy) {
     __imp__sub_82702E00(ctx, base);
     return;
@@ -8150,12 +8297,15 @@ extern "C" void sub_82702E00(PPCContext& ctx, uint8_t* base) {
     return;
   }
   const uint32_t guest_endpoint = g_network_endpoints.Remove(guest_object, peer_id);
+  if (!PublishActiveNetworkAliasEndpoint(base, guest_object, peer_id, 0)) {
+    REXLOG_WARN(
+        "gta4-multiplayer64: unable to clear projected endpoint object={:08X} peer={}",
+        guest_object, peer_id);
+  }
   if (guest_endpoint == 0) {
     return;
   }
-  ctx.r3.u64 = guest_endpoint;
-  ctx.r4.u64 = 1;
-  CallNetworkObjectVirtual(ctx, base, guest_endpoint, 0);
+  DestroyNetworkEndpoint(ctx, base, guest_endpoint);
 }
 
 extern "C" void sub_82702E98(PPCContext& ctx, uint8_t* base) {
@@ -8174,6 +8324,7 @@ extern "C" void sub_82702E98(PPCContext& ctx, uint8_t* base) {
   }
   g_network_endpoints.RemoveObject(guest_object);
   g_network_peer_flags.RemoveObject(guest_object);
+  g_ped_network_peer_states.RemoveObject(guest_object);
 }
 
 extern "C" void sub_82702EF0(PPCContext& ctx, uint8_t* base) {
@@ -8406,12 +8557,14 @@ extern "C" void sub_82701F88(PPCContext& ctx, uint8_t* base) {
   }
 }
 
-// Per-class vfunc[16] endpoint factories. Their guest endpoint types have no
-// embedded peer ID, so the original pool allocator/constructor is reusable;
-// only the owning pointer moves into the sidecar.
+// Per-class vtable slot 17 (byte offset 68) endpoint factories. Their guest
+// endpoint types have no embedded peer ID. Extended recipients use the exact
+// retail constructor over system-heap storage and keep ownership in the
+// sidecar; an active projected alias is only a temporary view of that pointer.
 extern "C" void sub_82729AC0(PPCContext& ctx, uint8_t* base) {
   const uint32_t guest_object = ctx.r3.u32;
-  const uint8_t peer_id = GuestPeerId(ctx.r4.u64);
+  const uint8_t peer_id =
+      CanonicalNetworkEndpointPeerId(guest_object, GuestPeerId(ctx.r4.u64));
   if (mp64::IsLegacyPeerId(peer_id)) {
     __imp__sub_82729AC0(ctx, base);
     return;
@@ -8422,13 +8575,15 @@ extern "C" void sub_82729AC0(PPCContext& ctx, uint8_t* base) {
   }
   const uint32_t create_argument = ctx.r5.u32;
   const uint32_t endpoint =
-      AllocateNetworkEndpoint(ctx, base, mp64::kVehicleSyncPoolAddress, __imp__sub_82726AA8);
+      AllocateNetworkEndpoint(ctx, base, mp64::kVehicleSyncPoolPointerAddress,
+                              __imp__sub_82726AA8);
   FinishExtendedEndpointCreation(ctx, base, guest_object, peer_id, endpoint, create_argument);
 }
 
 extern "C" void sub_827788E0(PPCContext& ctx, uint8_t* base) {
   const uint32_t guest_object = ctx.r3.u32;
-  const uint8_t peer_id = GuestPeerId(ctx.r4.u64);
+  const uint8_t peer_id =
+      CanonicalNetworkEndpointPeerId(guest_object, GuestPeerId(ctx.r4.u64));
   if (mp64::IsLegacyPeerId(peer_id)) {
     __imp__sub_827788E0(ctx, base);
     return;
@@ -8439,13 +8594,15 @@ extern "C" void sub_827788E0(PPCContext& ctx, uint8_t* base) {
   }
   const uint32_t create_argument = ctx.r5.u32;
   const uint32_t endpoint =
-      AllocateNetworkEndpoint(ctx, base, mp64::kPlayerSyncPoolAddress, __imp__sub_82778050);
+      AllocateNetworkEndpoint(ctx, base, mp64::kPlayerSyncPoolPointerAddress,
+                              __imp__sub_82778050);
   FinishExtendedEndpointCreation(ctx, base, guest_object, peer_id, endpoint, create_argument);
 }
 
 extern "C" void sub_82789678(PPCContext& ctx, uint8_t* base) {
   const uint32_t guest_object = ctx.r3.u32;
-  const uint8_t peer_id = GuestPeerId(ctx.r4.u64);
+  const uint8_t peer_id =
+      CanonicalNetworkEndpointPeerId(guest_object, GuestPeerId(ctx.r4.u64));
   if (mp64::IsLegacyPeerId(peer_id)) {
     __imp__sub_82789678(ctx, base);
     return;
@@ -8456,13 +8613,15 @@ extern "C" void sub_82789678(PPCContext& ctx, uint8_t* base) {
   }
   const uint32_t create_argument = ctx.r5.u32;
   const uint32_t endpoint =
-      AllocateNetworkEndpoint(ctx, base, mp64::kDummyPedSyncPoolAddress, __imp__sub_82789010);
+      AllocateNetworkEndpoint(ctx, base, mp64::kDummyPedSyncPoolPointerAddress,
+                              __imp__sub_82789010);
   FinishExtendedEndpointCreation(ctx, base, guest_object, peer_id, endpoint, create_argument);
 }
 
 extern "C" void sub_82711A28(PPCContext& ctx, uint8_t* base) {
   const uint32_t guest_object = ctx.r3.u32;
-  const uint8_t peer_id = GuestPeerId(ctx.r4.u64);
+  const uint8_t peer_id =
+      CanonicalNetworkEndpointPeerId(guest_object, GuestPeerId(ctx.r4.u64));
   if (mp64::IsLegacyPeerId(peer_id)) {
     __imp__sub_82711A28(ctx, base);
     return;
@@ -8472,17 +8631,26 @@ extern "C" void sub_82711A28(PPCContext& ctx, uint8_t* base) {
     return;
   }
   const uint32_t create_argument = ctx.r5.u32;
-  ctx.r3.u64 = guest_object;
-  ctx.r4.u64 = peer_id;
-  CallNetworkObjectVirtual(ctx, base, guest_object, mp64::kNetworkObjectPrepareSyncVtableOffset);
+  if (!WithNetworkEndpointVirtualPeer(
+          ctx, base, guest_object, peer_id, [&](uint8_t presented_peer_id) {
+            ctx.r3.u64 = guest_object;
+            ctx.r4.u64 = presented_peer_id;
+            CallNetworkObjectVirtual(ctx, base, guest_object,
+                                     mp64::kNetworkObjectPrepareSyncVtableOffset);
+          })) {
+    ctx.r3.u64 = guest_object;
+    return;
+  }
   const uint32_t endpoint =
-      AllocateNetworkEndpoint(ctx, base, mp64::kPedSyncPoolAddress, __imp__sub_8270C9A8);
+      AllocateNetworkEndpoint(ctx, base, mp64::kPedSyncPoolPointerAddress,
+                              __imp__sub_8270C9A8);
   FinishExtendedEndpointCreation(ctx, base, guest_object, peer_id, endpoint, create_argument);
 }
 
 extern "C" void sub_8272E098(PPCContext& ctx, uint8_t* base) {
   const uint32_t guest_object = ctx.r3.u32;
-  const uint8_t peer_id = GuestPeerId(ctx.r4.u64);
+  const uint8_t peer_id =
+      CanonicalNetworkEndpointPeerId(guest_object, GuestPeerId(ctx.r4.u64));
   if (mp64::IsLegacyPeerId(peer_id)) {
     __imp__sub_8272E098(ctx, base);
     return;
@@ -8493,7 +8661,8 @@ extern "C" void sub_8272E098(PPCContext& ctx, uint8_t* base) {
   }
   const uint32_t create_argument = ctx.r5.u32;
   const uint32_t endpoint =
-      AllocateNetworkEndpoint(ctx, base, mp64::kObjectSyncPoolAddress, __imp__sub_8272C3A0);
+      AllocateNetworkEndpoint(ctx, base, mp64::kObjectSyncPoolPointerAddress,
+                              __imp__sub_8272C3A0);
   FinishExtendedEndpointCreation(ctx, base, guest_object, peer_id, endpoint, create_argument);
 }
 

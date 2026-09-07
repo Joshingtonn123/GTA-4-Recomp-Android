@@ -7,6 +7,7 @@ add_executable(unit_tests
     core/diagnostics_policy_test.cpp
     core/fiber_test.cpp
     core/gta4_transition_test.cpp
+    core/gpu_flight_recorder_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
     core/byte_order_test.cpp
@@ -17,18 +18,40 @@ add_executable(unit_tests
     graphics/postfx_resource_pool_test.cpp
     graphics/depth_handoff_util_test.cpp
     graphics/alpha_to_coverage_util_test.cpp
+    graphics/native_clip_control_test.cpp
+    graphics/native_fixed_function_policy_test.cpp
+    graphics/native_pipeline_policy_test.cpp
+    graphics/native_pipeline_recipe_test.cpp
+    graphics/native_pipeline_compiler_test.cpp
+    graphics/native_pipeline_lookup_memo_test.cpp
+    graphics/native_draw_state_cache_test.cpp
+    graphics/native_resource_content_policy_test.cpp
+    graphics/native_sampler_cache_key_test.cpp
+    graphics/native_sampler_lod_bias_test.cpp
+    graphics/smaa_source_sync_test.cpp
+    graphics/lighting_semantics_test.cpp
+    graphics/native_lighting_transport_test.cpp
+    graphics/native_spirv_reflection_test.cpp
+    graphics/shader_override_policy_test.cpp
     graphics/dirty_state_delta_test.cpp
     graphics/native_frame_scheduling_test.cpp
     graphics/native_msaa_policy_test.cpp
+    graphics/hdr_policy_test.cpp
     graphics/texture_filtering_policy_test.cpp
     graphics/anisotropic_filtering_policy_test.cpp
     graphics/native_black_anomaly_test.cpp
     graphics/native_buffer_arena_test.cpp
+    graphics/native_owner_retirement_test.cpp
+    graphics/native_buffer_metadata_test.cpp
     graphics/native_descriptor_backend_test.cpp
+    graphics/native_descriptor_tuple_cache_test.cpp
     graphics/native_frame_context_test.cpp
+    graphics/native_gpu_attribution_test.cpp
     graphics/native_reflection_registry_test.cpp
     graphics/native_resolve_policy_test.cpp
     graphics/native_submission_lifetime_test.cpp
+    graphics/vulkan_submission_completion_test.cpp
+    graphics/native_virtual_resource_registry_test.cpp
     graphics/shadow_distance_util_test.cpp
     graphics/gta4_native_surface_view_test.cpp
     graphics/native_performance_samples_test.cpp
@@ -36,11 +59,17 @@ add_executable(unit_tests
     graphics/pipeline_cache_file_test.cpp
     graphics/primitive_restart_test.cpp
     input/absolute_pointer_test.cpp
+    input/controller_compatibility_test.cpp
     input/encoded_action_test.cpp
     input/gta4_input_action_routing_test.cpp
+    input/gta4_keyboard_controller_test.cpp
+    input/gta4_vehicle_weapon_policy_test.cpp
+    input/gta4_vehicle_mouse_policy_test.cpp
     input/context_touch_layout_test.cpp
     input/input_rumble_routing_test.cpp
     input/input_state_polling_test.cpp
+    input/mnk_input_driver_test.cpp
+    input/sdl_axis_policy_test.cpp
     input/pointer_motion_test.cpp
     input/sdl_hotplug_policy_test.cpp
     input/sdl_rumble_policy_test.cpp
@@ -50,6 +79,7 @@ add_executable(unit_tests
     ppc/stack_test.cpp
     system/guest_path_test.cpp
     system/gta4_frontend_menu_policy_test.cpp
+    system/gta4_draw_distance_policy_test.cpp
     system/gta4_frame_limiter_test.cpp
     system/gta4_touch_policy_test.cpp
     system/gta4_loading_parallax_fix_test.cpp
@@ -103,6 +133,7 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/gta4_native/native_buffer_arena.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/gta4_native/native_descriptor_backend.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/gta4_native/native_frame_context.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/gta4_native/native_gpu_attribution.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/gta4_native/native_submission_lifetime.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/commands/migration_scan.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
@@ -121,7 +152,37 @@ target_link_libraries(unit_tests PRIVATE
     rexruntime
     rexinput
     Catch2::Catch2WithMain
+    xxHash::xxhash
 )
+
+# Exercise the lighting command/transport policies without a running game or GPU.
+# Normal application builds still compile the production hook and renderer users.
+if(REXGLUE_USE_VULKAN)
+add_executable(native_lighting_tests
+    graphics/lighting_semantics_test.cpp
+    graphics/native_lighting_transport_test.cpp
+    graphics/native_fixed_function_policy_test.cpp
+    graphics/native_clip_control_test.cpp
+    graphics/native_resolve_policy_test.cpp
+    graphics/shader_override_policy_test.cpp
+    graphics/gta4_native_surface_view_test.cpp
+)
+target_include_directories(native_lighting_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/thirdparty/simde
+    ${PROJECT_SOURCE_DIR}/thirdparty/fmt/include
+)
+target_link_libraries(native_lighting_tests PRIVATE Catch2::Catch2WithMain volk_headers)
+endif()
+
+# Keep the failure recorder testable without linking the game or a GPU driver.
+add_executable(gpu_flight_recorder_tests
+    core/gpu_flight_recorder_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/core/gpu_flight_recorder.cpp
+)
+target_include_directories(gpu_flight_recorder_tests PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(gpu_flight_recorder_tests PRIVATE Catch2::Catch2WithMain)
 
 # ReXApp is shipped as source for recomp projects, rather than compiled into
 # rexui. Keep its SDK-consumer compilation path covered by the test build.
@@ -217,6 +278,12 @@ endif()
 
 # Discover tests
 include(Catch)
+if(TARGET native_lighting_tests)
+catch_discover_tests(native_lighting_tests
+    TEST_PREFIX "unit.native-lighting."
+    PROPERTIES LABELS "unit;native-lighting" TIMEOUT 60
+)
+endif()
 catch_discover_tests(unit_tests
     TEST_PREFIX "unit."
     PROPERTIES

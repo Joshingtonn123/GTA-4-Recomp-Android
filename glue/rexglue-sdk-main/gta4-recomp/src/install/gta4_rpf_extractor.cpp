@@ -36,6 +36,7 @@ constexpr size_t kEntrySize = 16;
 constexpr size_t kAesKeySize = 32;
 constexpr size_t kMaximumEntryCount = 1000000;
 constexpr size_t kMaximumArchiveDepth = 32;
+constexpr size_t kMaximumDirectoryDepth = 256;
 constexpr size_t kMaximumNestedArchiveCount = 100000;
 constexpr uint64_t kMaximumExtractedFileSize = 2147483648;
 constexpr size_t kIoBufferSize = 1048576;
@@ -243,7 +244,12 @@ std::optional<Archive> ParseArchive(const std::filesystem::path& path, std::span
 
 bool ValidateDirectoryGraph(const Archive& archive, size_t index,
                             const std::filesystem::path& archive_path, std::vector<bool>& active,
-                            std::vector<bool>& visited, std::string& error) {
+                            std::vector<bool>& visited, size_t depth, std::string& error) {
+  if (depth > kMaximumDirectoryDepth) {
+    error = "The RPF2 directory graph exceeds the supported nesting depth: " +
+            archive_path.string();
+    return false;
+  }
   if (index >= archive.entries.size() || active[index] || visited[index]) {
     error =
         "The RPF2 directory graph contains a cycle or duplicate entry: " + archive_path.string();
@@ -273,7 +279,8 @@ bool ValidateDirectoryGraph(const Archive& archive, size_t index,
       return false;
     }
     if (entry.is_directory) {
-      if (!ValidateDirectoryGraph(archive, child, archive_path, active, visited, error)) {
+      if (!ValidateDirectoryGraph(archive, child, archive_path, active, visited, depth + 1,
+                                  error)) {
         return false;
       }
     } else {
@@ -288,7 +295,7 @@ bool ValidateArchiveGraph(const Archive& archive, const std::filesystem::path& a
                           std::string& error) {
   std::vector<bool> active(archive.entries.size());
   std::vector<bool> visited(archive.entries.size());
-  if (!ValidateDirectoryGraph(archive, 0, archive_path, active, visited, error)) {
+  if (!ValidateDirectoryGraph(archive, 0, archive_path, active, visited, 0, error)) {
     return false;
   }
   if (!std::all_of(visited.begin(), visited.end(), [](bool value) { return value; })) {
@@ -439,7 +446,12 @@ bool ExtractDirectory(const std::filesystem::path& archive_path, const Archive& 
                       size_t index, const std::filesystem::path& output_root,
                       std::vector<bool>& active, std::vector<bool>& visited,
                       std::vector<std::filesystem::path>& nested_archives,
-                      const RpfExtractionProgress& progress, std::string& error) {
+                      const RpfExtractionProgress& progress, size_t depth, std::string& error) {
+  if (depth > kMaximumDirectoryDepth) {
+    error = "The RPF2 directory graph exceeds the supported nesting depth: " +
+            archive_path.string();
+    return false;
+  }
   if (index >= archive.entries.size() || active[index] || visited[index]) {
     error =
         "The RPF2 directory graph contains a cycle or duplicate entry: " + archive_path.string();
@@ -466,7 +478,7 @@ bool ExtractDirectory(const std::filesystem::path& archive_path, const Archive& 
       std::error_code fs_error;
       std::filesystem::create_directories(output_path, fs_error);
       if (fs_error || !ExtractDirectory(archive_path, archive, child, output_path, active, visited,
-                                        nested_archives, progress, error)) {
+                                        nested_archives, progress, depth + 1, error)) {
         if (error.empty()) {
           error = "Could not create an RPF extraction directory: " + fs_error.message();
         }
@@ -521,7 +533,7 @@ bool ExtractOne(const std::filesystem::path& archive_path, const std::filesystem
   std::vector<bool> active(archive->entries.size());
   std::vector<bool> visited(archive->entries.size());
   if (!ExtractDirectory(archive_path, *archive, 0, output_root, active, visited, nested_archives,
-                        progress, error)) {
+                        progress, 0, error)) {
     return false;
   }
   return true;

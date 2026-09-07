@@ -49,6 +49,10 @@ class WindowInputListener {
  public:
   virtual ~WindowInputListener() = default;
 
+  // Stable diagnostic identity used by the end-to-end input trace. The
+  // default keeps third-party listeners source-compatible.
+  virtual const char* input_trace_name() const { return "window-input-listener"; }
+
   virtual void OnKeyDown(KeyEvent&) {}
   virtual void OnKeyUp(KeyEvent&) {}
   virtual void OnKeyChar(KeyEvent&) {}

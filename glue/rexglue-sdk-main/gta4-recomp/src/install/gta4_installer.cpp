@@ -5,6 +5,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -28,6 +29,7 @@
 #include <rex/system/util/xex2_info.h>
 #include <rex/system/xcontent.h>
 #include <rex/system/xtypes.h>
+#include <xxhash.h>
 
 #include "TinySHA1.hpp"
 #include "gta4_rpf_extractor.h"
@@ -43,6 +45,7 @@ using namespace rex::literals;
 
 constexpr uint32_t kGta4TitleId = 0x545407F2;
 constexpr uint32_t kRequiredTargetVersion = 0x00000805;
+constexpr uint64_t kRequiredBaseXexXxh3 = 2823947441600373906ULL;
 constexpr std::string_view kRequiredPatchSha256 =
     "480aee5e2b42707791e7571bb8407c5bb3f6c7534f07f9beb426db4cfc648fd3";
 constexpr std::string_view kEmbeddedTargetXexSha256 =
@@ -863,6 +866,11 @@ bool ValidateInstalledPair(const std::filesystem::path& game_root, std::string& 
     return true;
   }
 
+  if (XXH3_64bits(base_bytes.data(), base_bytes.size()) != kRequiredBaseXexXxh3) {
+    reason = "default.xex does not match GTA IV USA retail 1.00.";
+    return false;
+  }
+
   const auto patch_path = game_root / "default.xexp";
   std::vector<uint8_t> patch_bytes;
   if (!ReadHostFile(patch_path, patch_bytes, reason)) {
@@ -913,6 +921,7 @@ Result VerifyInstall(const std::filesystem::path& game_root,
 
 Result Install(const Selection& selection, const std::filesystem::path& install_root,
                Progress& progress) {
+  try {
   Result result;
   progress.copied_bytes = 0;
   progress.total_bytes = 0;
@@ -1116,6 +1125,13 @@ Result Install(const Selection& selection, const std::filesystem::path& install_
   std::filesystem::remove_all(staging_root, fs_error);
   result.success = true;
   return result;
+  } catch (const std::filesystem::filesystem_error& exception) {
+    return Result{false, "The selected source changed or became unreadable during installation: " +
+                             std::string(exception.what())};
+  } catch (const std::exception& exception) {
+    return Result{false, "The selected Xbox content package is malformed: " +
+                             std::string(exception.what())};
+  }
 }
 
 }  // namespace gta4::install

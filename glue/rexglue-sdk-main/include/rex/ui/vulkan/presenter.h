@@ -80,8 +80,8 @@ class VulkanPresenter final : public Presenter {
   // being refreshed for the first time, it's in VK_IMAGE_LAYOUT_UNDEFINED (but
   // it's safe, and preferred, to transition it from VK_IMAGE_LAYOUT_UNDEFINED
   // when writing to it in general).
-  static constexpr VkPipelineStageFlagBits kGuestOutputInternalStageMask =
-      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  static constexpr VkPipelineStageFlags kGuestOutputInternalStageMask =
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
   static constexpr VkAccessFlags kGuestOutputInternalAccessMask = VK_ACCESS_SHADER_READ_BIT;
   static constexpr VkImageLayout kGuestOutputInternalLayout =
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -309,6 +309,30 @@ class VulkanPresenter final : public Presenter {
   struct PaintContext {
     class Submission {
      public:
+      static constexpr uint32_t kDiagnosticSwapchainProbeGridWidth = 16;
+      static constexpr uint32_t kDiagnosticSwapchainProbeGridHeight = 16;
+      static constexpr uint32_t kDiagnosticSwapchainProbeSampleCount =
+          kDiagnosticSwapchainProbeGridWidth * kDiagnosticSwapchainProbeGridHeight;
+      static constexpr VkDeviceSize kDiagnosticSwapchainProbeBufferSize =
+          VkDeviceSize(kDiagnosticSwapchainProbeSampleCount) * 8;
+
+      struct DiagnosticSwapchainProbe {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        uint32_t memory_type = UINT32_MAX;
+        VkDeviceSize memory_size = 0;
+        uint8_t* mapping = nullptr;
+        bool pending = false;
+        GuestOutputProvenance provenance{};
+        uint64_t paint_attempt = 0;
+        uint64_t paint_submission = 0;
+        uint32_t swapchain_epoch = 0;
+        uint32_t swapchain_image = UINT32_MAX;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        bool guest_pass = false;
+        bool full_black_fallback = false;
+      };
+
       static std::unique_ptr<Submission> Create(const VulkanDevice* const vulkan_device) {
         auto submission = std::unique_ptr<Submission>(new Submission(vulkan_device));
         if (!submission->Initialize()) {
@@ -324,6 +348,10 @@ class VulkanPresenter final : public Presenter {
       VkSemaphore acquire_semaphore() const { return acquire_semaphore_; }
       VkCommandPool draw_command_pool() const { return draw_command_pool_; }
       VkCommandBuffer draw_command_buffer() const { return draw_command_buffer_; }
+      bool InitializeDiagnosticSwapchainProbe();
+      DiagnosticSwapchainProbe& diagnostic_swapchain_probe() {
+        return diagnostic_swapchain_probe_;
+      }
 
      private:
       explicit Submission(const VulkanDevice* const vulkan_device)
@@ -334,6 +362,7 @@ class VulkanPresenter final : public Presenter {
       VkSemaphore acquire_semaphore_ = VK_NULL_HANDLE;
       VkCommandPool draw_command_pool_ = VK_NULL_HANDLE;
       VkCommandBuffer draw_command_buffer_ = VK_NULL_HANDLE;
+      DiagnosticSwapchainProbe diagnostic_swapchain_probe_;
     };
 
     static constexpr uint32_t kSubmissionCount = 3;
@@ -397,9 +426,10 @@ class VulkanPresenter final : public Presenter {
     // be destroyed externally no matter what the result is.
     static VkSwapchainKHR CreateSwapchainForVulkanSurface(
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
-        VkSwapchainKHR old_swapchain, bool hdr_requested, uint32_t& present_queue_family_out,
-        VkFormat& image_format_out, VkColorSpaceKHR& image_color_space_out,
-        VkExtent2D& image_extent_out, bool& is_fifo_out, bool& is_hdr_out,
+        VkSwapchainKHR old_swapchain, bool hdr_requested, bool swapchain_probe_requested,
+        uint32_t& present_queue_family_out, VkFormat& image_format_out,
+        VkColorSpaceKHR& image_color_space_out, VkExtent2D& image_extent_out,
+        bool& is_fifo_out, bool& is_hdr_out, bool& swapchain_probe_enabled_out,
         bool& ui_surface_unusable_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
@@ -455,12 +485,15 @@ class VulkanPresenter final : public Presenter {
     VkRenderPass swapchain_render_pass = VK_NULL_HANDLE;
     VkFormat swapchain_render_pass_format = VK_FORMAT_UNDEFINED;
     bool swapchain_render_pass_clear_load_op = false;
+    bool swapchain_render_pass_transfer_source = false;
 
     VkSurfaceKHR vulkan_surface = VK_NULL_HANDLE;
     uint32_t present_queue_family = UINT32_MAX;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D swapchain_extent = {};
     bool swapchain_is_fifo = false;
+    bool swapchain_probe_requested = false;
+    bool swapchain_probe_enabled = false;
     VkColorSpaceKHR swapchain_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     bool swapchain_is_hdr = false;
     bool swapchain_hdr_requested = false;
@@ -537,6 +570,14 @@ class VulkanPresenter final : public Presenter {
   uint64_t guest_output_image_next_version_ = 0;
   std::array<GuestOutputImageInstance, kGuestOutputMailboxSize> guest_output_images_;
   VulkanSubmissionTracker guest_output_image_refresher_submission_tracker_;
+
+  // Bounded diagnostic carry-over for host paint attempts that return before
+  // consuming the mailbox (for example, submission backpressure). The most
+  // recent traced provenance is a fixed-size value, never a retained image.
+  GuestOutputProvenance diagnostic_tv_provenance_{};
+  uint32_t diagnostic_tv_paint_carry_remaining_ = 0;
+  uint64_t diagnostic_tv_paint_sequence_ = 0;
+  uint64_t diagnostic_swapchain_epoch_ = 0;
 
   // UI submission tracker with the submission index that can be given to UI
   // drawers (accessible from the UI thread only, at any time).

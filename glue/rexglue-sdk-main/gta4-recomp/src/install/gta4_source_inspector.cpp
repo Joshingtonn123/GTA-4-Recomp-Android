@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include <xxhash.h>
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
@@ -39,6 +40,10 @@ constexpr uint32_t kGta4UsaMediaId = 0x6AC07221;
 constexpr uint32_t kRequiredRegion = rex::XEX_REGION_NTSCU;
 // Derived from the pinned v8 XEXP delta descriptor's source_version_value.
 constexpr uint32_t kRequiredBaseVersion = 0x00000005;
+// Full-file XXH3-64 recorded by the official Liberty installer for the GTA IV
+// USA retail 1.00 default.xex. This complements the XEXP signature digest:
+// retaining a valid header/signature is not sufficient if the XEX body changed.
+constexpr uint64_t kRequiredBaseXexXxh3 = 2823947441600373906ULL;
 // SHA-1 of the 0x100-byte RSA signature required by the pinned v8 XEXP's
 // digest_source. Derived from the payload, not from a patched executable.
 constexpr std::array<uint8_t, 20> kRequiredRsaSignatureSha1 = {
@@ -388,6 +393,8 @@ const char* GameSourceStatusName(GameSourceStatus status) {
       return "wrong-revision";
     case GameSourceStatus::kWrongSignature:
       return "wrong-signature";
+    case GameSourceStatus::kWrongExecutable:
+      return "wrong-executable";
     case GameSourceStatus::kMissingDefaultXex:
       return "missing-default-xex";
     case GameSourceStatus::kAmbiguousDefaultXex:
@@ -488,7 +495,14 @@ GameSourceInspection InspectGameXex(std::span<const uint8_t> bytes) {
   if (!ParseGameXex(bytes, metadata, error)) {
     return Rejected(GameSourceStatus::kCorruptImage, GameSourceKind::kUnknown, std::move(error));
   }
-  return ClassifyGameSourceMetadata(metadata);
+  GameSourceInspection result = ClassifyGameSourceMetadata(metadata);
+  if (result.supported() && XXH3_64bits(bytes.data(), bytes.size()) != kRequiredBaseXexXxh3) {
+    result.status = GameSourceStatus::kWrongExecutable;
+    result.release_label.clear();
+    result.rejection_reason =
+        "The complete default.xex does not match GTA IV USA retail 1.00.";
+  }
+  return result;
 }
 
 GameSourceInspection InspectGameSource(const std::filesystem::path& path) {

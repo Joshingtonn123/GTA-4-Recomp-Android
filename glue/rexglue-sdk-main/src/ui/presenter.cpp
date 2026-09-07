@@ -597,7 +597,8 @@ void Presenter::PaintFromUIThread(bool force_paint) {
 bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
     uint32_t display_aspect_ratio_y,
-    std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+    std::function<bool(GuestOutputRefreshContext& context)> refresher,
+    GuestOutputProvenance provenance) {
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
@@ -605,6 +606,7 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
+  writable_properties.provenance = provenance;
   bool is_active = writable_properties.IsActive();
   if (is_active) {
     if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
@@ -612,6 +614,17 @@ bool Presenter::RefreshGuestOutput(
       // If failed to refresh, don't send the currently writable image to the
       // mailbox as it may be in an undefined state. Don't disable the guest
       // output either though because the failure may be something transient.
+      if (provenance.diagnostic_trace) {
+        REXLOG_INFO(
+            "gta4-tv-mailbox-publish: session={} present={} frame={} origin={} "
+            "caller={:08X} published=false reason=refresh-failed writable={} "
+            "size={}x{} selected={:08X}@{} commands={}",
+            provenance.tv_session_id, provenance.title_present_id,
+            provenance.submitted_frame, provenance.present_origin,
+            provenance.guest_caller, guest_output_mailbox_writable_, frontbuffer_width,
+            frontbuffer_height, provenance.selected_texture,
+            provenance.selected_generation, provenance.native_command_count);
+      }
       return false;
     }
     guest_output_active_last_refresh_ = true;
@@ -660,6 +673,19 @@ bool Presenter::RefreshGuestOutput(
     // Take the image other than the last acquired one and the new one,
     // currently not accessible to the host presentation.
     guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
+  }
+
+  if (provenance.diagnostic_trace) {
+    REXLOG_INFO(
+        "gta4-tv-mailbox-publish: session={} present={} frame={} origin={} caller={:08X} "
+        "published={} previous-state={:08X} previous-acquired={} previous-ready={} "
+        "next-writable={} active={} size={}x{} selected={:08X}@{} commands={}",
+        provenance.tv_session_id, provenance.title_present_id, provenance.submitted_frame,
+        provenance.present_origin, provenance.guest_caller, published_mailbox_index,
+        last_acquired_and_ready, last_acquired_and_ready & 3,
+        last_acquired_and_ready >> 2, guest_output_mailbox_writable_, is_active,
+        frontbuffer_width, frontbuffer_height, provenance.selected_texture,
+        provenance.selected_generation, provenance.native_command_count);
   }
 
   // Trigger the presentation on the host.
@@ -1013,6 +1039,26 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
   mailbox_index_or_max_if_inactive_out = properties.IsActive() ? mailbox_index : UINT32_MAX;
   if (properties_out) {
     *properties_out = properties;
+  }
+  static std::atomic<uint64_t> last_tv_mailbox_consume_present_id{0};
+  const bool log_tv_mailbox_consume =
+      properties.provenance.diagnostic_trace &&
+      last_tv_mailbox_consume_present_id.exchange(
+          properties.provenance.title_present_id, std::memory_order_relaxed) !=
+          properties.provenance.title_present_id;
+  if (log_tv_mailbox_consume) {
+    REXLOG_INFO(
+        "gta4-tv-mailbox-consume: session={} present={} frame={} origin={} caller={:08X} "
+        "old-state={:08X} desired-state={:08X} mailbox={} active={} size={}x{} "
+        "selected={:08X}@{} commands={}",
+        properties.provenance.tv_session_id, properties.provenance.title_present_id,
+        properties.provenance.submitted_frame, properties.provenance.present_origin,
+        properties.provenance.guest_caller, old_acquired_and_ready,
+        desired_acquired_and_ready, mailbox_index, properties.IsActive(),
+        properties.frontbuffer_width, properties.frontbuffer_height,
+        properties.provenance.selected_texture,
+        properties.provenance.selected_generation,
+        properties.provenance.native_command_count);
   }
   return std::move(consumer_lock);
 }

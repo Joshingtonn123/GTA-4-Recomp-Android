@@ -614,7 +614,26 @@ void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_recei
   }
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
+        const char* listener_name = listener->input_trace_name();
+        if (rex::input::IsInputTraceEnabled()) {
+          REXLOG_INFO(
+              "input-e2e: seq={} stage=window-listener phase=enter direction=down "
+              "listener={} key={} vk={} handled={}",
+              e.input_trace_sequence(), listener_name,
+              rex::input::InputTraceVirtualKeyName(
+                  static_cast<uint32_t>(e.virtual_key())),
+              static_cast<uint32_t>(e.virtual_key()), e.is_handled());
+        }
         listener->OnKeyDown(e);
+        if (rex::input::IsInputTraceEnabled()) {
+          REXLOG_INFO(
+              "input-e2e: seq={} stage=window-listener phase=exit direction=down "
+              "listener={} key={} vk={} handled={}",
+              e.input_trace_sequence(), listener_name,
+              rex::input::InputTraceVirtualKeyName(
+                  static_cast<uint32_t>(e.virtual_key())),
+              static_cast<uint32_t>(e.virtual_key()), e.is_handled());
+        }
         return e.is_handled();
       },
       destruction_receiver);
@@ -634,7 +653,26 @@ void Window::OnKeyUp(KeyEvent& e, WindowDestructionReceiver& destruction_receive
   }
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
+        const char* listener_name = listener->input_trace_name();
+        if (rex::input::IsInputTraceEnabled()) {
+          REXLOG_INFO(
+              "input-e2e: seq={} stage=window-listener phase=enter direction=up "
+              "listener={} key={} vk={} handled={}",
+              e.input_trace_sequence(), listener_name,
+              rex::input::InputTraceVirtualKeyName(
+                  static_cast<uint32_t>(e.virtual_key())),
+              static_cast<uint32_t>(e.virtual_key()), e.is_handled());
+        }
         listener->OnKeyUp(e);
+        if (rex::input::IsInputTraceEnabled()) {
+          REXLOG_INFO(
+              "input-e2e: seq={} stage=window-listener phase=exit direction=up "
+              "listener={} key={} vk={} handled={}",
+              e.input_trace_sequence(), listener_name,
+              rex::input::InputTraceVirtualKeyName(
+                  static_cast<uint32_t>(e.virtual_key())),
+              static_cast<uint32_t>(e.virtual_key()), e.is_handled());
+        }
         return e.is_handled();
       },
       destruction_receiver);

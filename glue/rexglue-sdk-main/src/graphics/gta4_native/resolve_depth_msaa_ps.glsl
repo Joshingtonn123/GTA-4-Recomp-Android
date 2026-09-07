@@ -13,6 +13,8 @@ layout(push_constant) uniform ResolveConvertConstants {
   uint physical_source_sample_type;
   uint physical_destination_sample_type;
   uint flags;
+  uvec2 source_extent;
+  uvec2 destination_extent;
 } resolve_constants;
 
 ivec2 sample_scale(uint sample_type) {

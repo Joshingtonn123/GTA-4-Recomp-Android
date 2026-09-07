@@ -106,3 +106,31 @@ TEST_CASE("GTA IV depth image layouts map to precise synchronization scopes") {
 
 }  // namespace
 }  // namespace rex::graphics::gta4_native
+
+TEST_CASE("Scene handoff regenerates forward classification rather than importing material stencil") {
+  using namespace rex::graphics::gta4_native;
+  CHECK(ForwardStencilFromPackedSceneDepth(0) == 0x80);
+  CHECK(ForwardStencilFromPackedSceneDepth(1) == 0xFF);
+  CHECK(ForwardStencilFromPackedSceneDepth(0xFFFFFF) == 0xFF);
+  for (uint32_t old_stencil : {0u, 6u, 8u, 128u, 137u, 255u}) {
+    // A previous phone zero and arbitrary G-buffer material bits are irrelevant.
+    (void)old_stencil;
+    CHECK((ForwardStencilFromPackedSceneDepth(1) & 1u) == 1u);
+    CHECK((ForwardStencilFromPackedSceneDepth(0) & 1u) == 0u);
+  }
+  CHECK(IsValidForwardStencilHandoffPolicy(ForwardStencilHandoffPolicy::kPreserve));
+  CHECK(IsValidForwardStencilHandoffPolicy(ForwardStencilHandoffPolicy::kRebuildSceneCoverage));
+  CHECK_FALSE(IsValidForwardStencilHandoffPolicy(static_cast<ForwardStencilHandoffPolicy>(2)));
+}
+
+TEST_CASE("Scene coverage uses late replacement with identical front and back state") {
+  using namespace rex::graphics::gta4_native;
+  const auto state = SceneDepthHandoffStencilState();
+  CHECK(state.compareOp == VK_COMPARE_OP_ALWAYS);
+  CHECK(state.passOp == VK_STENCIL_OP_REPLACE);
+  CHECK(state.failOp == VK_STENCIL_OP_KEEP);
+  CHECK(state.depthFailOp == VK_STENCIL_OP_KEEP);
+  CHECK(state.reference == 0xFF);
+  CHECK(state.writeMask == 0xFF);
+  CHECK(state.compareMask == 0xFF);
+}

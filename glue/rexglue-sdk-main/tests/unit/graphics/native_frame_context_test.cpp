@@ -51,6 +51,15 @@ TEST_CASE("GTA IV native frame contexts permanently own distinct query resources
   CHECK_FALSE(ring.GetSlotResources(2));
 }
 
+TEST_CASE("GTA IV native frame slots do not require diagnostic query resources") {
+  Ring ring;
+  const auto frame = ring.BeginFrame(0);
+  REQUIRE(frame);
+  CHECK_FALSE(ring.ClaimQueryReadback(*frame));
+  REQUIRE(ring.RollbackFrame(*frame));
+  REQUIRE(ring.ResetSlot(*frame));
+}
+
 TEST_CASE("GTA IV native slots require submit wait readback and reset before reuse") {
   Ring ring;
   ConfigureRing(ring);
@@ -88,8 +97,72 @@ TEST_CASE("GTA IV native slots require submit wait readback and reset before reu
   const auto reused = ring.BeginFrame(0);
   REQUIRE(reused);
   REQUIRE_FALSE(ring.ClaimQueryReadback(*frame_zero));
-  REQUIRE(ring.RollbackFrame(*reused));
+  REQUIRE_FALSE(ring.GetCompletedQueryReadback(*frame_zero));
+  REQUIRE_FALSE(ring.AcknowledgeQueryReadback(*frame_zero));
+  REQUIRE(ring.ClaimQueryReadback(*reused) == kSlotZeroQueries);
+  const auto reused_serial = Submit(ring, *reused);
+  Complete(ring, *reused, reused_serial);
+  REQUIRE(ring.GetCompletedQueryReadback(*reused) == kSlotZeroQueries);
+  REQUIRE(ring.AcknowledgeQueryReadback(*reused));
   REQUIRE(ring.ResetSlot(*reused));
+}
+
+TEST_CASE("GTA IV native query ownership cannot be released in flight or by stale identity") {
+  Ring ring;
+  ConfigureRing(ring);
+  const auto frame = ring.BeginFrame(1);
+  REQUIRE(frame);
+  REQUIRE(ring.ClaimQueryReadback(*frame) == kSlotOneQueries);
+  REQUIRE_FALSE(ring.ReleaseSlot(1, kSlotOneQueries));
+  const auto serial = Submit(ring, *frame);
+  Complete(ring, *frame, serial);
+  REQUIRE(ring.AcknowledgeQueryReadback(*frame));
+  REQUIRE(ring.ResetSlot(*frame));
+
+  REQUIRE_FALSE(ring.ReleaseSlot(1, kSlotZeroQueries));
+  REQUIRE(ring.ReleaseSlot(1, kSlotOneQueries));
+  CHECK_FALSE(ring.GetSlotResources(1));
+  REQUIRE(ring.ConfigureSlot(1, kSlotOneQueries));
+  CHECK(ring.GetSlotResources(1) == kSlotOneQueries);
+}
+
+TEST_CASE("GTA IV native frame slots keep two pending query payloads distinct across reuse") {
+  Ring ring;
+  ConfigureRing(ring);
+
+  const auto slot_zero = ring.BeginFrame(0);
+  REQUIRE(slot_zero);
+  REQUIRE(ring.ClaimQueryReadback(*slot_zero) == kSlotZeroQueries);
+  const auto serial_zero = Submit(ring, *slot_zero);
+
+  const auto slot_one = ring.BeginFrame(1);
+  REQUIRE(slot_one);
+  REQUIRE(ring.ClaimQueryReadback(*slot_one) == kSlotOneQueries);
+  const auto serial_one = Submit(ring, *slot_one);
+  CHECK(serial_one > serial_zero);
+  REQUIRE(ring.GetSlotSnapshot(0)->query_readback_claimed);
+  REQUIRE(ring.GetSlotSnapshot(1)->query_readback_claimed);
+
+  Complete(ring, *slot_one, serial_one);
+  REQUIRE(ring.GetCompletedQueryReadback(*slot_one) == kSlotOneQueries);
+  REQUIRE_FALSE(ring.GetCompletedQueryReadback(*slot_zero));
+  REQUIRE(ring.AcknowledgeQueryReadback(*slot_one));
+  REQUIRE(ring.ResetSlot(*slot_one));
+
+  const auto reused_slot_one = ring.BeginFrame(1);
+  REQUIRE(reused_slot_one);
+  REQUIRE_FALSE(ring.ClaimQueryReadback(*slot_one));
+  REQUIRE(ring.ClaimQueryReadback(*reused_slot_one) == kSlotOneQueries);
+  const auto reused_serial_one = Submit(ring, *reused_slot_one);
+
+  Complete(ring, *slot_zero, serial_zero);
+  REQUIRE(ring.GetCompletedQueryReadback(*slot_zero) == kSlotZeroQueries);
+  REQUIRE(ring.AcknowledgeQueryReadback(*slot_zero));
+  REQUIRE(ring.ResetSlot(*slot_zero));
+  Complete(ring, *reused_slot_one, reused_serial_one);
+  REQUIRE(ring.GetCompletedQueryReadback(*reused_slot_one) == kSlotOneQueries);
+  REQUIRE(ring.AcknowledgeQueryReadback(*reused_slot_one));
+  REQUIRE(ring.ResetSlot(*reused_slot_one));
 }
 
 TEST_CASE("GTA IV native shared layout rollback restores the exact queue tail") {

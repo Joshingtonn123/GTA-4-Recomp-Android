@@ -10,6 +10,7 @@
  */
 
 #include <rex/input/input.h>
+#include <rex/input/input_trace.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -18,6 +19,8 @@
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
+
+#include <atomic>
 
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -94,8 +97,8 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetstate(v=vs.85).aspx
 u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> input_state) {
   // Games call this with a NULL state ptr, probably as a query.
-  static int call_count = 0;
-  if (++call_count <= 5) {
+  static std::atomic<uint32_t> call_count{0};
+  if (call_count.fetch_add(1, std::memory_order_relaxed) < 5) {
     REXKRNL_TRACE("[XAM] XamInputGetState called: user={}, flags=0x{:X}", (uint32_t)user_index,
                   (uint32_t)flags);
   }
@@ -112,7 +115,16 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   }
 
   auto* is = input_system();
-  return is->GetState(actual_user_index, input_state);
+  const u32 result = is->GetState(actual_user_index, input_state);
+  const uint64_t causal_sequence = rex::input::InputTraceCausalSequence();
+  if (rex::input::IsInputTraceEnabled() && causal_sequence != 0) {
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=xam-input-get-state user={} flags={:08X} "
+        "output={} result={:08X}",
+        causal_sequence, actual_user_index, static_cast<uint32_t>(flags),
+        input_state ? "state" : "connectivity", static_cast<uint32_t>(result));
+  }
+  return result;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx

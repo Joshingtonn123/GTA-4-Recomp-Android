@@ -63,6 +63,7 @@ class TraceViewer : public rex::ui::WindowedApp {
    public:
     explicit TraceViewerWindowListener(TraceViewer& trace_viewer) : trace_viewer_(trace_viewer) {}
 
+    const char* input_trace_name() const override { return "trace-viewer"; }
     void OnClosing(rex::ui::UIEvent& e) override;
 
     void OnKeyDown(rex::ui::KeyEvent& e) override;

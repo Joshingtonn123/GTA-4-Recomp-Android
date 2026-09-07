@@ -25,6 +25,7 @@ enum class GameSourceStatus {
   kWrongRegion,
   kWrongRevision,
   kWrongSignature,
+  kWrongExecutable,
   kCorruptImage,
   kMissingDefaultXex,
   kAmbiguousDefaultXex,

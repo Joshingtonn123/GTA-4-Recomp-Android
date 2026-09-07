@@ -48,6 +48,10 @@ enum class MemoryPurpose {
   kReadback,
 };
 
+// Exact support for ordinary (pNext-null) image creation tuples and extents.
+bool IsImageCreateInfoSupported(const VulkanDevice* vulkan_device,
+                                const VkImageCreateInfo& create_info);
+
 inline uint32_t ChooseHostMemoryType(const VulkanDevice::MemoryTypes& memory_types,
                                      uint32_t supported_types, const bool is_readback) {
   supported_types &= memory_types.host_visible;

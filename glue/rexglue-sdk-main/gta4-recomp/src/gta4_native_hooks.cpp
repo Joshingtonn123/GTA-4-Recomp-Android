@@ -11,11 +11,13 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -24,7 +26,11 @@
 
 #include <rex/cvar.h>
 #include <rex/diagnostics/policy.h>
+#include <rex/graphics/gta4_native/anti_aliasing_policy.h>
+#include <rex/graphics/gta4_native/supersampling_policy.h>
 #include <rex/graphics/video_mode_util.h>
+#include <rex/graphics/gta4_native/light_trace_context.h>
+#include "rex/graphics/gta4_native/phone_trace.h"
 #include <rex/graphics/gta4_native/shadow_distance_util.h>
 #include <rex/graphics/gta4_native/surface_view.h>
 #include <rex/graphics/gta4_native/title_commands.h>
@@ -34,6 +40,7 @@
 #include <rex/ui/window.h>
 
 #include "gta4_init.h"
+#include "gta4_draw_distance_policy.h"
 #include "gta4_frame_limiter.h"
 
 REXCVAR_DECLARE(uint32_t, gta4_shadow_map_base_size);
@@ -50,11 +57,13 @@ REXCVAR_DECLARE(std::string, gta4_fsr1_quality);
 REXCVAR_DECLARE(std::string, gta4_aspect_ratio);
 REXCVAR_DECLARE(bool, gta4_force_highest_lod);
 REXCVAR_DECLARE(double, gta4_draw_distance_scale);
-REXCVAR_DECLARE(bool, gta4_disable_timecycle_far_clip);
 REXCVAR_DECLARE(uint32_t, gta4_drawable_reference_limit);
-REXCVAR_DECLARE(bool, gta4_disable_model_budget_reduction);
 REXCVAR_DEFINE_BOOL(gta4_native_pixel_snap_fonts, true, "GTA IV/Graphics/Text",
                     "Snap GTA IV font quads to native framebuffer pixels");
+REXCVAR_DEFINE_BOOL(
+    gta4_native_light_clear_x890_filler_flag, false, "GTA IV/Diagnostics",
+    "Diagnostic-only removal of the authored filler-light flag from apartment bulb x890")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
 
@@ -92,6 +101,21 @@ constexpr uint32_t kUpCommandWriteOffset = 13428;
 constexpr uint32_t kUpVertexDataOffset = 13432;
 constexpr uint32_t kUpVertexWordCountOffset = 13440;
 constexpr uint32_t kSubmittedFrameOffset = 16544;
+// Derived from generated retail code and /tmp/calc_tv_trace_addresses.py.
+// sub_82A467D8 copies the incoming 52-byte display descriptor into the device
+// slot; sub_82A4F0E0 later presents that persisted slot from its worker path.
+constexpr uint32_t kPersistedPresentTextureOffset = 14828;
+constexpr uint32_t kPresentDescriptorSize = 52;
+constexpr uint32_t kPresentFlag10941Offset = 10941;
+constexpr uint32_t kPresentFlag10942Offset = 10942;
+constexpr uint32_t kMainPresentCaller = 0x828BF4B0;
+constexpr uint32_t kWorkerPresentCaller = 0x82A4F178;
+constexpr uint32_t kTvMuteGlobal = 0x82CB27E5;
+constexpr uint32_t kTvTracePresentBudget = 480;
+// Four bounded game-side join records per traced Present. The budget was
+// calculated by /tmp/calc_tv_trace_event_budget.py.
+constexpr uint32_t kTvTraceEventBudget = 1920;
+constexpr uint32_t kScriptRtResolveCaller = 0x828DA8E0;
 constexpr uint32_t kDrawParameterVertexRangeOffset = 36;
 constexpr uint32_t kDrawParameterStreamFlagsOffset = 40;
 constexpr uint32_t kDrawParameterTileFlagsOffset = 48;
@@ -132,11 +156,10 @@ constexpr uint32_t kPrimaryVideoWidthGlobal = 0x82B0B454;
 constexpr uint32_t kPrimaryVideoHeightGlobal = 0x82B0B458;
 constexpr uint32_t kSecondaryVideoWidthGlobal = 0x82B0B45C;
 constexpr uint32_t kSecondaryVideoHeightGlobal = 0x82B0B460;
-constexpr uint32_t kForceHighLodGlobal = 0x83016A20;
 constexpr uint32_t kHighestLodDrawableOffset = 0x40;
+constexpr uint32_t kDefaultLodBlendGlobal = 0x82000A34;
 constexpr uint32_t kDistanceScaleOutputGlobal = 0x82A931B4;
 constexpr uint32_t kDistanceScaleInputGlobal = 0x82A931BC;
-constexpr uint32_t kDisableTimecycleFarClipGlobal = 0x82BF3900;
 constexpr uint32_t kGuestTimeStepGlobal = 0x82B06FF8;
 constexpr uint32_t kCurrentViewportGlobal = 0x831C2200;
 constexpr uint32_t kPostFxTimecycleIndexGlobal = 0x82B307A4;
@@ -184,8 +207,6 @@ constexpr uint32_t kPointShadowCacheBaseMultiplier = 8;
 constexpr uint32_t kShadowQualityTable = 0x82C595C0;
 constexpr uint32_t kShadowQualityContextStride = 0x100;
 constexpr uint32_t kShadowQualityRangeOffset = 0x14;
-constexpr uint32_t kReducePedModelBudgetGlobal = 0x82C6C1B1;
-constexpr uint32_t kReduceVehicleModelBudgetGlobal = 0x82C6C1B2;
 // Native rendering consumes the resource descriptors, not their Xbox GPU
 // backing allocation. Keep the guest allocation at the API-valid minimum and
 // patch only the descriptor extents after the trusted D3D constructor returns.
@@ -214,6 +235,16 @@ constexpr std::array<uint32_t, 9> kDeferredFullSizeWrapperGlobals = {
 // the attachment that carries the current depth state.
 constexpr uint32_t kDeferredDepthAaWrapperGlobal = 0x83016B40;
 constexpr uint32_t kDeferredHizRestoreWrapperGlobal = 0x83016B4C;
+// sub_824F4730 constructs these with sub_828D9620 / sub_828D9768.
+// They use the packed-depth alias layout, not the render-target layout above.
+constexpr uint32_t kDeferredGbufferZWrapperGlobal = 0x83016B30;
+constexpr std::array<uint32_t, 2> kDeferredPackedDepthAliasGlobals = {0x83016B50,
+                                                                   0x83016B54};
+constexpr uint32_t kDeferredPackedDepthAliasVtable = 0x8209612C;
+constexpr uint32_t kDeferredPackedDepthAliasTextureOffset = 24;
+constexpr uint32_t kDeferredPackedDepthAliasWidthOffset = 28;
+constexpr uint32_t kDeferredPackedDepthAliasHeightOffset = 30;
+constexpr uint64_t kDeferredPackedDepthAliasTraceSetupLimit = 16;
 constexpr uint32_t kDeferredOriginalRectangleCount = 3;
 constexpr uint32_t kDeferredNativeRectangleCount = 1;
 constexpr uint32_t kDeferredPhaseMarkerLimit = 128;
@@ -254,6 +285,7 @@ struct NativePublishedResolution {
 // original 1280x720 defaults.
 std::mutex g_native_resolution_mutex;
 NativePublishedResolution g_native_resolution;
+std::atomic<uint32_t> g_native_supersampling_effective_factor{1u};
 thread_local uint32_t g_last_title_depth_wrapper = std::numeric_limits<uint32_t>::max();
 thread_local uint32_t g_last_title_depth_surface = std::numeric_limits<uint32_t>::max();
 thread_local uint32_t g_vector_font_id = 0;
@@ -264,6 +296,46 @@ std::atomic<uint64_t> g_indexed_draw_invocation_id{0};
 std::atomic<uint64_t> g_vector_font_owner_trace_count{0};
 std::atomic<uint64_t> g_vector_font_texture_trace_count{0};
 std::atomic<uint64_t> g_vector_font_rectangle_trace_count{0};
+std::atomic<bool> g_tv_watching{false};
+std::atomic<uint64_t> g_tv_session_id{0};
+std::atomic<uint64_t> g_tv_present_id{0};
+std::atomic<uint32_t> g_tv_trace_present_remaining{0};
+std::atomic<uint32_t> g_tv_trace_event_remaining{0};
+std::atomic<uint64_t> g_tv_script_event_sequence{0};
+std::atomic<uint64_t> g_tv_last_movie_sequence{0};
+std::atomic<uint64_t> g_tv_last_rect_sequence{0};
+std::atomic<uint64_t> g_tv_last_bink_sequence{0};
+std::atomic<uint32_t> g_tv_last_bink_result{0};
+thread_local bool g_tv_final_path_active = false;
+thread_local uint32_t g_tv_final_resolve_count = 0;
+thread_local uint64_t g_tv_final_sequence = 0;
+
+bool ConsumeTvPresentTraceBudget() {
+  uint32_t remaining = g_tv_trace_present_remaining.load(std::memory_order_relaxed);
+  while (remaining &&
+         !g_tv_trace_present_remaining.compare_exchange_weak(
+             remaining, remaining - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+  return remaining != 0;
+}
+
+bool ConsumeTvEventTraceBudget() {
+  uint32_t remaining = g_tv_trace_event_remaining.load(std::memory_order_relaxed);
+  while (remaining &&
+         !g_tv_trace_event_remaining.compare_exchange_weak(
+             remaining, remaining - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+  return remaining != 0;
+}
+
+const char* TvPresentOriginName(uint32_t origin) {
+  switch (origin) {
+    case 1:
+      return "main";
+    case 2:
+      return "worker";
+    default:
+      return "other";
+  }
+}
 
 std::mutex g_native_frame_limiter_mutex;
 gta4::frame_limiter::State g_native_frame_limiter_state;
@@ -375,6 +447,7 @@ struct CapturedNativeCommand {
   std::vector<uint8_t> bytes;
   std::vector<uint8_t> payload;
   CapturedDrawSnapshot draw_snapshot;
+  std::shared_ptr<PhoneTraceContext> phone_capture;
   bool draw_diagnostic_valid = false;
   uint32_t capture_frame = 0;
   uint32_t capture_device = 0;
@@ -532,6 +605,1614 @@ uint16_t LoadU16(uint8_t* base, uint32_t address) {
 
 uint32_t LoadU32(uint8_t* base, uint32_t address) {
   return __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(GuestPointer(base, address)));
+}
+
+float LoadF32(uint8_t* base, uint32_t address) {
+  return std::bit_cast<float>(LoadU32(base, address));
+}
+
+struct NativeTitleLightSetupSnapshot {
+  uint32_t technique = 0;
+  uint32_t flags = 0;
+  uint32_t radius_bits = 0;
+  uint32_t intensity_bits = 0;
+  uint32_t auxiliary_bits = 0;
+
+  bool operator==(const NativeTitleLightSetupSnapshot& other) const {
+    return technique == other.technique && flags == other.flags;
+  }
+};
+
+struct NativeTitleLightDrawSnapshot {
+  uint32_t setup = 0;
+  uint32_t technique = 0;
+  std::array<uint32_t, 4> data{};
+
+  bool operator==(const NativeTitleLightDrawSnapshot& other) const {
+    return setup == other.setup && technique == other.technique;
+  }
+};
+
+template <typename Snapshot>
+struct NativeTitleLightTraceState {
+  Snapshot snapshot{};
+  uint64_t observations = 0;
+};
+
+std::mutex g_native_title_light_trace_mutex;
+std::unordered_map<uint32_t, NativeTitleLightTraceState<NativeTitleLightSetupSnapshot>>
+    g_native_title_light_setup_states;
+std::unordered_map<uint32_t, NativeTitleLightTraceState<NativeTitleLightDrawSnapshot>>
+    g_native_title_light_draw_states;
+std::atomic<uint64_t> g_native_title_light_event_sequence{0};
+
+void TraceNativeTitleLightSetup(uint8_t* base, uint32_t object, uint32_t caller, uint32_t device) {
+  if (!IsNativeLightLoopTraceEnabled() || !object) {
+    return;
+  }
+  const uint32_t instance = object;
+  const NativeTitleLightSetupSnapshot snapshot{
+      LoadU32(base, object + 80), LoadU32(base, object + 96), LoadU32(base, object + 84),
+      LoadU32(base, object + 88), LoadU32(base, object + 92)};
+  bool first = false;
+  bool changed = false;
+  uint64_t observations = 0;
+  {
+    std::lock_guard lock(g_native_title_light_trace_mutex);
+    auto [entry, inserted] = g_native_title_light_setup_states.try_emplace(instance);
+    first = inserted;
+    changed = inserted || !(entry->second.snapshot == snapshot);
+    observations = ++entry->second.observations;
+    if (changed) {
+      entry->second.snapshot = snapshot;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+  const uint64_t sequence =
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  REXLOG_INFO(
+      "gta4-native-light-event: layer=title point=setup event={} sequence={} observation={} "
+      "instance={:08X} object={:08X} caller={:08X} device={:08X} technique={:08X} "
+      "flags={:08X} radius-bits={:08X} intensity-bits={:08X} auxiliary-bits={:08X}",
+      first ? "first" : "changed", sequence, observations, instance, object, caller, device,
+      snapshot.technique, snapshot.flags, snapshot.radius_bits, snapshot.intensity_bits,
+      snapshot.auxiliary_bits);
+}
+
+void TraceNativeTitleLightDraw(uint8_t* base, uint32_t object, uint32_t caller, uint32_t device) {
+  if (!IsNativeLightLoopTraceEnabled() || !object) {
+    return;
+  }
+  const uint32_t instance = object;
+  NativeTitleLightDrawSnapshot snapshot{};
+  snapshot.setup = LoadU32(base, object + 24);
+  snapshot.technique = LoadU32(base, object + 28);
+  snapshot.data = {LoadU32(base, object + 8), LoadU32(base, object + 12),
+                   LoadU32(base, object + 16), LoadU32(base, object + 20)};
+  bool first = false;
+  bool changed = false;
+  uint64_t observations = 0;
+  {
+    std::lock_guard lock(g_native_title_light_trace_mutex);
+    auto [entry, inserted] = g_native_title_light_draw_states.try_emplace(instance);
+    first = inserted;
+    changed = inserted || !(entry->second.snapshot == snapshot);
+    observations = ++entry->second.observations;
+    if (changed) {
+      entry->second.snapshot = snapshot;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+  const uint64_t sequence =
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  REXLOG_INFO(
+      "gta4-native-light-event: layer=title point=draw event={} sequence={} observation={} "
+      "instance={:08X} object={:08X} caller={:08X} device={:08X} setup={:08X} "
+      "technique={:08X} data={:08X},{:08X},{:08X},{:08X}",
+      first ? "first" : "changed", sequence, observations, instance, object, caller, device,
+      snapshot.setup, snapshot.technique, snapshot.data[0], snapshot.data[1], snapshot.data[2],
+      snapshot.data[3]);
+}
+
+constexpr std::array<uint32_t, 4> kDeferredLocalLightSelectorCallers = {
+    0x822B13A4,  // Stencil volume, camera inside.
+    0x822B13C0,  // Stencil volume, camera outside.
+    0x822B142C,  // Accumulation, camera inside.
+    0x822B1448,  // Accumulation, camera outside.
+};
+
+bool IsDeferredLocalLightSelectorCaller(uint32_t caller) {
+  return std::find(kDeferredLocalLightSelectorCallers.begin(),
+                   kDeferredLocalLightSelectorCallers.end(),
+                   caller) != kDeferredLocalLightSelectorCallers.end();
+}
+
+const char* DeferredLightTechniqueName(uint32_t technique) {
+  switch (technique) {
+    case 0:
+      return "lightNoDirectional";
+    case 1:
+      return "lightShadowDirectional";
+    case 2:
+      return "default-technique-fallback";
+    case 3:
+      return "stencilVolumePoint";
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+      return "lightVolumePoint";
+    case 8:
+      return "lightVolumeShadowPoint";
+    case 9:
+      return "fillerVolumeShadowPoint";
+    case 10:
+    case 11:
+    case 12:
+      return "fillerVolumePoint";
+    case 13:
+      return "lightShafts";
+    case 14:
+      return "corona";
+    case 15:
+      return "paraboloid_corona";
+    case 16:
+      return "brightlight";
+    case 17:
+      return "smokeBoard";
+    case 18:
+      return "ambientScaleVolume";
+    case 19:
+      return "lightVolumeTexPoint";
+    case 20:
+      return "lightVolumeShadowTexPoint";
+    case 21:
+    case 22:
+      return "gbufferDepthCopy";
+    case 23:
+      return "refMipBlur";
+    case 24:
+      return "waterFx";
+    default:
+      return "out-of-range";
+  }
+}
+
+struct NativeLocalLightSelectionSnapshot {
+  uint32_t technique = 0;
+  uint32_t variant = 0;
+  uint32_t caller = 0;
+  uint32_t type = 0;
+  uint32_t flags = 0;
+  uint32_t radius_bits = 0;
+  uint32_t parameter0_bits = 0;
+  uint32_t parameter1_bits = 0;
+  uint32_t texture0 = 0;
+  uint32_t texture1 = 0;
+
+  bool operator==(const NativeLocalLightSelectionSnapshot&) const = default;
+};
+
+struct NativeLocalLightSelectionState {
+  NativeLocalLightSelectionSnapshot snapshot{};
+  uint64_t observations = 0;
+};
+
+struct ActiveNativeLocalLightSelection {
+  uint32_t light = 0;
+  uint32_t previous_context = 0;
+  uint32_t technique = 0;
+  uint32_t variant = 0;
+  uint32_t caller = 0;
+};
+
+std::mutex g_native_local_light_selection_mutex;
+std::unordered_map<uint32_t, NativeLocalLightSelectionState> g_native_local_light_selection_states;
+thread_local ActiveNativeLocalLightSelection g_active_native_local_light_selection;
+std::atomic<uint64_t> g_native_local_light_selection_sequence{0};
+
+bool BeginNativeLocalLightSelection(PPCContext& ctx, uint8_t* base) {
+  const uint32_t caller = uint32_t(ctx.lr);
+  const uint32_t light = ctx.r30.u32;
+  if (!IsNativeLightLoopTraceEnabled() || !IsDeferredLocalLightSelectorCaller(caller) ||
+      light < 80) {
+    return false;
+  }
+
+  if (g_active_native_local_light_selection.light) {
+    REXLOG_WARN(
+        "gta4-native-local-light: event=replaced light={:08X} technique={} variant={} "
+        "caller={:08X} next-light={:08X}",
+        g_active_native_local_light_selection.light,
+        g_active_native_local_light_selection.technique,
+        g_active_native_local_light_selection.variant, g_active_native_local_light_selection.caller,
+        light);
+    SetNativeLightTraceContext(g_active_native_local_light_selection.previous_context);
+    g_active_native_local_light_selection = {};
+  }
+
+  const uint32_t technique = ctx.r3.u32;
+  const uint32_t variant = ctx.r4.u32;
+  const NativeLocalLightSelectionSnapshot snapshot{
+      technique,
+      variant,
+      caller,
+      LoadU32(base, light - 12),
+      LoadU32(base, light - 8),
+      LoadU32(base, light + 4),
+      LoadU32(base, light + 8),
+      LoadU32(base, light + 12),
+      LoadU32(base, light + 16),
+      LoadU32(base, light + 20),
+  };
+
+  bool first = false;
+  bool changed = false;
+  uint64_t observations = 0;
+  {
+    std::lock_guard lock(g_native_local_light_selection_mutex);
+    auto [entry, inserted] = g_native_local_light_selection_states.try_emplace(light);
+    first = inserted;
+    changed = inserted || !(entry->second.snapshot == snapshot);
+    observations = ++entry->second.observations;
+    if (changed) {
+      entry->second.snapshot = snapshot;
+    }
+  }
+
+  const uint32_t previous_context = GetNativeLightTraceContext();
+  g_active_native_local_light_selection = {light, previous_context, technique, variant, caller};
+  SetNativeLightTraceContext(light);
+
+  if (changed) {
+    const uint64_t sequence =
+        g_native_local_light_selection_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    REXLOG_INFO(
+        "gta4-native-local-light: event={} sequence={} observation={} light={:08X} "
+        "record={:08X} technique={}:{} variant={} caller={:08X} type={} flags={:08X} "
+        "radius-bits={:08X} parameter-bits={:08X},{:08X} textures={:08X},{:08X}",
+        first ? "first" : "changed", sequence, observations, light, light - 80, technique,
+        DeferredLightTechniqueName(technique), variant, caller, snapshot.type, snapshot.flags,
+        snapshot.radius_bits, snapshot.parameter0_bits, snapshot.parameter1_bits, snapshot.texture0,
+        snapshot.texture1);
+  }
+  return true;
+}
+
+void EndNativeLocalLightSelection() {
+  if (!g_active_native_local_light_selection.light) {
+    return;
+  }
+  SetNativeLightTraceContext(g_active_native_local_light_selection.previous_context);
+  g_active_native_local_light_selection = {};
+}
+
+bool IsNativeMode();
+
+constexpr uint32_t kPrimaryDeferredLightListPointerGlobal = 0x82A99784;
+constexpr uint32_t kSecondaryDeferredLightListPointerGlobal = 0x82A9978C;
+constexpr uint32_t kPrimaryDeferredLightCountGlobal = 0x82CF2604;
+constexpr uint32_t kSecondaryDeferredLightCountGlobal = 0x82CF2618;
+constexpr uint32_t kPrimaryDeferredLightStride = 128;
+constexpr uint32_t kSecondaryDeferredLightStride = 80;
+constexpr uint32_t kNativeLocalLightCandidateLimit = 2048;
+
+// Verified by sub_828C6568/sub_828C64C8 in generated/gta4_recomp.65.cpp.
+constexpr uint32_t kActiveDeferredTechniqueGlobal = 0x831C3DE0;
+constexpr uint32_t kDeferredTechniquePassTableOffset = 8;
+constexpr uint32_t kDeferredTechniquePassStride = 32;
+constexpr uint32_t kRetailNullClearColorGlobal = 0x82000A34;
+
+struct NativeLightingExecutionFrame {
+  uint32_t source_function = 0;
+  LocalLightOccurrenceTracker local_occurrences;
+};
+
+thread_local std::vector<NativeLightingExecutionFrame> g_native_lighting_execution_stack;
+
+class ScopedNativeLightingExecution {
+ public:
+  ScopedNativeLightingExecution(uint8_t* base, uint32_t source_function,
+                               RenderExecutionStage stage, LightPassRole role,
+                               LightSourceKind source = LightSourceKind::kUnknown,
+                               uint32_t record_address = 0)
+      : active_(IsNativeMode()) {
+    if (!active_) {
+      return;
+    }
+    LightingContext context{};
+    context.occurrence_id = AcquireNativeLightingOccurrence();
+    context.view_id = AcquireNativeLightingOccurrence();
+    context.stage = stage;
+    context.role = role;
+    context.source = source;
+    context.source_function = source_function;
+    context.record_address = record_address;
+    // sub_828BD648 publishes the viewport consumed by these execution paths.
+    context.view_address = LoadU32(base, kCurrentViewportGlobal);
+    scope_.emplace(context);
+    g_native_lighting_execution_stack.push_back({source_function, {}});
+  }
+
+  ~ScopedNativeLightingExecution() {
+    if (active_) {
+      g_native_lighting_execution_stack.pop_back();
+    }
+  }
+
+  ScopedNativeLightingExecution(const ScopedNativeLightingExecution&) = delete;
+  ScopedNativeLightingExecution& operator=(const ScopedNativeLightingExecution&) = delete;
+
+ private:
+  bool active_ = false;
+  std::optional<ScopedNativeLightingContext> scope_;
+};
+
+LightingContext CaptureNativeLightingSelection(uint8_t* base, PPCContext& ctx) {
+  LightingContext context = GetNativeLightingContext();
+  context.stage = RenderExecutionStage::kDeferredLighting;
+  context.role = DeferredLightPassRole(ctx.r3.u32);
+  context.requested_selector = ctx.r3.u32;
+  context.requested_mode = ctx.r4.u32;
+  context.selector_caller = uint32_t(ctx.lr);
+  context.effective_technique = 0;
+  context.effective_mode = kUnknownLightSelection;
+  context.pass = 0;
+  context.stencil_setup_expected = 0;
+  context.record_address = 0;
+  context.source = LightSourceKind::kUnknown;
+  context.source_function = 0;
+  context.view_address = LoadU32(base, kCurrentViewportGlobal);
+  if (!context.view_id) {
+    context.view_id = AcquireNativeLightingOccurrence();
+  }
+  context.occurrence_id = AcquireNativeLightingOccurrence();
+
+  switch (context.selector_caller) {
+    case 0x821BC5D0:
+      // CDrawDefLight retains its command object in r31 (generated .4).
+      context.source = LightSourceKind::kGlobalCommand;
+      context.source_function = 0x821BC5B0;
+      context.record_address = ctx.r31.u32;
+      break;
+    case 0x822B13A4:
+    case 0x822B13C0:
+      context.role = LightPassRole::kLocalStencilSetup;
+      [[fallthrough]];
+    case 0x822B142C:
+    case 0x822B1448:
+      // sub_822B0F08 adds 80 to the list base, then advances by 128.
+      context.source = LightSourceKind::kPrimaryRecord;
+      context.source_function = 0x822B0F08;
+      context.record_address = ctx.r30.u32 >= 80 ? ctx.r30.u32 - 80 : 0;
+      if (!g_native_lighting_execution_stack.empty() &&
+          g_native_lighting_execution_stack.back().source_function == 0x822B0F08) {
+        auto& occurrences = g_native_lighting_execution_stack.back().local_occurrences;
+        context.stencil_setup_expected =
+            context.role == LightPassRole::kLocalStencilSetup ||
+            (context.role == LightPassRole::kLocalContribution &&
+             occurrences.HasPending(context.record_address, context.view_address));
+        context.occurrence_id = occurrences.Select(context.role, context.record_address,
+                                                    context.view_address, context.occurrence_id);
+      }
+      break;
+    case 0x822B0E50:
+    case 0x822B0ECC:
+    case 0x822B4C58:
+    case 0x822B4C74:
+    case 0x822B4C90:
+    case 0x822B4CAC: {
+      const uint32_t records = LoadU32(base, kPrimaryDeferredLightListPointerGlobal);
+      context.source = LightSourceKind::kPrimaryRecord;
+      context.source_function = context.role == LightPassRole::kAmbientVolume ? 0x822B0B90
+                                                                            : 0x822B4640;
+      context.record_address = records ? records + ctx.r29.u32 : 0;
+      break;
+    }
+    case 0x822B49D0:
+    case 0x822B49E8:
+    case 0x822B4A08:
+    case 0x822B4A20: {
+      const uint32_t records = LoadU32(base, kSecondaryDeferredLightListPointerGlobal);
+      context.source = LightSourceKind::kSecondaryRecord;
+      context.source_function = 0x822B4640;
+      context.record_address = records ? records + ctx.r28.u32 : 0;
+      break;
+    }
+    case 0x82207454:
+      context.source = LightSourceKind::kEffectBatch;
+      context.source_function = 0x822072D0;
+      break;
+    case 0x8234A734:
+      context.source = LightSourceKind::kEffectBatch;
+      context.source_function = 0x8234A600;
+      break;
+    case 0x824F7614:
+      context.source_function = 0x824F7328;
+      context.role = LightPassRole::kGlobalStencil;
+      break;
+  }
+  return context;
+}
+
+// Call-site return addresses are taken from the compiled PPC translation units,
+// not the non-authoritative decompiler pseudocode. They identify the exact
+// per-light loop and pass that selected a deferred technique.
+enum class NativeLocalLightLoopKind : uint8_t {
+  kNone,
+  kCorona,
+  kTypeThree,
+  kPointSpot,
+  kShaft,
+  kWaterFx,
+  kGlobalStencil,
+};
+
+enum class NativeLocalLightSource : uint8_t {
+  kNone,
+  kPrimary,
+  kSecondary,
+  kBucket,
+  kSynthetic,
+};
+
+enum class NativeLocalLightOutcome : uint8_t {
+  kUnknown,
+  kSelected,
+  kTypeFiltered,
+  kDeferredFlagClear,
+  kZeroExtent,
+  kVisibilityRejected,
+  kNoTechniqueSelection,
+};
+
+const char* NativeLocalLightLoopName(NativeLocalLightLoopKind kind) {
+  switch (kind) {
+    case NativeLocalLightLoopKind::kCorona:
+      return "sub_822072D0";
+    case NativeLocalLightLoopKind::kTypeThree:
+      return "sub_822B0B90";
+    case NativeLocalLightLoopKind::kPointSpot:
+      return "sub_822B0F08";
+    case NativeLocalLightLoopKind::kShaft:
+      return "sub_822B4640";
+    case NativeLocalLightLoopKind::kWaterFx:
+      return "sub_8234A600";
+    case NativeLocalLightLoopKind::kGlobalStencil:
+      return "sub_824F7328";
+    case NativeLocalLightLoopKind::kNone:
+      break;
+  }
+  return "none";
+}
+
+const char* NativeLocalLightSourceName(NativeLocalLightSource source) {
+  switch (source) {
+    case NativeLocalLightSource::kPrimary:
+      return "primary";
+    case NativeLocalLightSource::kSecondary:
+      return "secondary";
+    case NativeLocalLightSource::kBucket:
+      return "bucket";
+    case NativeLocalLightSource::kSynthetic:
+      return "synthetic";
+    case NativeLocalLightSource::kNone:
+      break;
+  }
+  return "none";
+}
+
+const char* NativeLocalLightOutcomeName(NativeLocalLightOutcome outcome) {
+  switch (outcome) {
+    case NativeLocalLightOutcome::kSelected:
+      return "selected";
+    case NativeLocalLightOutcome::kTypeFiltered:
+      return "type-filtered";
+    case NativeLocalLightOutcome::kDeferredFlagClear:
+      return "deferred-flag-clear";
+    case NativeLocalLightOutcome::kZeroExtent:
+      return "zero-extent";
+    case NativeLocalLightOutcome::kVisibilityRejected:
+      return "visibility-rejected";
+    case NativeLocalLightOutcome::kNoTechniqueSelection:
+      return "no-technique-selection";
+    case NativeLocalLightOutcome::kUnknown:
+      break;
+  }
+  return "unknown";
+}
+
+struct NativeLocalLightCandidateSnapshot {
+  NativeLocalLightSource source = NativeLocalLightSource::kNone;
+  uint32_t instance = 0;
+  uint32_t ordinal = 0;
+  uint32_t type = 0;
+  uint32_t flags = 0;
+  uint32_t index = 0;
+  uint32_t object = 0;
+  std::array<uint32_t, 3> position_bits{};
+  std::array<uint32_t, 3> extent_bits{};
+  uint32_t auxiliary0 = 0;
+  uint32_t auxiliary1 = 0;
+
+  bool operator==(const NativeLocalLightCandidateSnapshot&) const = default;
+};
+
+struct NativeLocalLightLoopFrame {
+  NativeLocalLightLoopKind kind = NativeLocalLightLoopKind::kNone;
+  uint32_t caller = 0;
+  uint32_t submitted_frame = 0;
+  std::array<uint32_t, 4> arguments{};
+  uint32_t primary_base = 0;
+  uint32_t primary_count = 0;
+  uint32_t secondary_base = 0;
+  uint32_t secondary_count = 0;
+  uint32_t bucket_count = 0;
+  size_t context_depth = 0;
+  uint32_t technique_calls = 0;
+  uint32_t cookie_fallbacks = 0;
+  uint32_t visibility_rejections = 0;
+  uint32_t shadow_unavailable = 0;
+  std::vector<NativeLocalLightCandidateSnapshot> candidates;
+  std::unordered_set<uint32_t> selected_instances;
+  std::unordered_map<uint32_t, NativeLocalLightOutcome> dynamic_outcomes;
+};
+
+struct NativeLocalLightTechniqueContext {
+  uint32_t previous_context = 0;
+  uint32_t previous_technique = 0xFFFFFFFFu;
+  uint32_t previous_mode = 0;
+  uint32_t instance = 0;
+  uint32_t caller = 0;
+};
+
+struct NativeLocalLightCandidateEventState {
+  NativeLocalLightCandidateSnapshot snapshot{};
+  NativeLocalLightOutcome outcome = NativeLocalLightOutcome::kUnknown;
+  uint32_t technique = 0;
+  uint32_t mode = 0;
+};
+
+struct NativeLocalLightLoopEventState {
+  uint32_t primary_base = 0;
+  uint32_t primary_count = 0;
+  uint32_t secondary_base = 0;
+  uint32_t secondary_count = 0;
+  uint32_t bucket_count = 0;
+  uint32_t selected_count = 0;
+  uint32_t technique_calls = 0;
+  uint32_t cookie_fallbacks = 0;
+  uint32_t visibility_rejections = 0;
+  uint32_t shadow_unavailable = 0;
+
+  bool operator==(const NativeLocalLightLoopEventState&) const = default;
+};
+
+thread_local std::vector<NativeLocalLightLoopFrame> g_native_local_light_loop_stack;
+thread_local std::vector<NativeLocalLightTechniqueContext> g_native_local_light_context_stack;
+std::mutex g_native_local_light_event_mutex;
+std::unordered_map<uint64_t, NativeLocalLightCandidateEventState>
+    g_native_local_light_candidate_event_states;
+std::unordered_map<uint32_t, NativeLocalLightLoopEventState> g_native_local_light_loop_event_states;
+std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>>
+    g_native_local_light_technique_event_states;
+
+struct NativeApartmentBulbClassifierSnapshot {
+  uint32_t caller = 0;
+  uint32_t technique = 0;
+  uint32_t mode = 0;
+  uint32_t flags = 0;
+  uint32_t predicate_gate = 0;
+  uint32_t predicate_result = 0;
+  uint32_t selected_technique = 0;
+  uint32_t light_type = 0;
+  std::array<uint32_t, 3> position_bits{};
+
+  bool operator==(const NativeApartmentBulbClassifierSnapshot&) const = default;
+};
+
+struct NativeApartmentBulbSourceSnapshot {
+  uint32_t caller = 0;
+  uint32_t owner = 0;
+  uint32_t owner_vtable = 0;
+  uint32_t owner_flags = 0;
+  uint32_t light_type = 0;
+  uint32_t flags = 0;
+  std::array<uint32_t, 4> vector_pointers{};
+  std::array<uint32_t, 3> position_bits{};
+  std::array<uint32_t, 6> float_argument_bits{};
+
+  bool operator==(const NativeApartmentBulbSourceSnapshot&) const = default;
+};
+
+struct NativeApartmentBulbConstructionSnapshot {
+  uint32_t caller = 0;
+  uint32_t destination = 0;
+  uint32_t light_type = 0;
+  uint32_t flags = 0;
+  uint32_t position_pointer = 0;
+  uint32_t direction_pointer = 0;
+  uint32_t tangent_pointer = 0;
+  uint32_t color_pointer = 0;
+  std::array<uint32_t, 3> position_bits{};
+  std::array<uint32_t, 10> preserved_registers{};
+
+  bool operator==(const NativeApartmentBulbConstructionSnapshot&) const = default;
+};
+
+std::unordered_map<uint64_t, NativeApartmentBulbClassifierSnapshot>
+    g_native_apartment_bulb_classifier_states;
+std::unordered_map<uint64_t, NativeApartmentBulbConstructionSnapshot>
+    g_native_apartment_bulb_construction_states;
+std::unordered_map<uint64_t, NativeApartmentBulbSourceSnapshot>
+    g_native_apartment_bulb_source_states;
+
+uint32_t GetNativeLightSubmittedFrame(uint8_t* base) {
+  const uint32_t device = LoadU32(base, kDeferredDeviceGlobal);
+  return device ? LoadU32(base, device + kSubmittedFrameOffset) : 0;
+}
+
+bool IsNativeLightProvenanceTraceEnabled() {
+  static const bool enabled =
+      ReadNativeLightTraceSetting("REX_GTA4_NATIVE_LIGHT_TRACE_PROVENANCE");
+  return IsNativeMode() && IsNativeLightTraceEnabled() && enabled;
+}
+
+// These scopes only add diagnostic provenance. They neither replace guest
+// selection/admission logic nor extend the lifetime of a guest object/record.
+struct NativeDeferredSelectorTrace {
+  bool resolution_observed = false;
+  bool resolution_succeeded = false;
+  uint32_t explicit_handle = 0;
+  uint32_t resolved_technique = 0;
+  uint32_t return_pass_count = 0;
+};
+
+thread_local NativeDeferredSelectorTrace* g_native_deferred_selector_trace = nullptr;
+
+class ScopedNativeDeferredSelectorTrace {
+ public:
+  ScopedNativeDeferredSelectorTrace()
+      : previous_(g_native_deferred_selector_trace),
+        active_(IsNativeLightProvenanceTraceEnabled()) {
+    if (active_) {
+      g_native_deferred_selector_trace = &trace_;
+    }
+  }
+
+  ~ScopedNativeDeferredSelectorTrace() {
+    if (active_) {
+      g_native_deferred_selector_trace = previous_;
+    }
+  }
+
+  ScopedNativeDeferredSelectorTrace(const ScopedNativeDeferredSelectorTrace&) = delete;
+  ScopedNativeDeferredSelectorTrace& operator=(const ScopedNativeDeferredSelectorTrace&) = delete;
+
+ private:
+  NativeDeferredSelectorTrace trace_{};
+  NativeDeferredSelectorTrace* previous_ = nullptr;
+  bool active_ = false;
+};
+
+void TraceNativeDeferredSelectorResolution(uint8_t* base, const PPCContext& ctx, uint32_t caller,
+                                           uint32_t effect, uint32_t material_index,
+                                           uint32_t explicit_handle, uint32_t active_before) {
+  auto* trace = g_native_deferred_selector_trace;
+  if (!trace || caller != 0x824F6464) {
+    return;
+  }
+
+  // generated .65:44726-44762: the null-handle branch leaves r11 == 0;
+  // success leaves the newly stored technique in r11 and returns its pass
+  // count in r3. __restgprlr_28 (.78:26528) preserves both registers. A
+  // zero pass count alone is therefore not a reliable resolution result.
+  trace->resolution_observed = true;
+  trace->resolution_succeeded = ctx.r11.u32 != 0;
+  trace->explicit_handle = explicit_handle;
+  trace->resolved_technique = ctx.r11.u32;
+  trace->return_pass_count = ctx.r3.u32;
+  const LightingContext& lighting = GetNativeLightingContext();
+  REXLOG_INFO(
+      "gta4-native-light-selector: point=resolution sequence={} frame={} occurrence={} "
+      "record={:08X} source-function={:08X} selector-caller={:08X} caller={:08X} "
+      "requested-selector={} requested-mode={} effect={:08X} material-index={} "
+      "handle-in-r6={:08X} handle-source={} resolution-success={} resolution-result={} "
+      "return-r3={} return-r11={:08X} return-pass-count={} resolved-technique={:08X} "
+      "active-before={:08X} active-after={:08X}",
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      GetNativeLightSubmittedFrame(base), lighting.occurrence_id, lighting.record_address,
+      lighting.source_function, lighting.selector_caller, caller, lighting.requested_selector,
+      lighting.requested_mode, effect, material_index, explicit_handle,
+      explicit_handle ? "explicit" : "fallback", trace->resolution_succeeded,
+      trace->resolution_succeeded
+          ? (trace->return_pass_count ? "resolved-with-passes" : "resolved-zero-passes")
+          : "unresolved",
+      ctx.r3.u32, ctx.r11.u32,
+      trace->return_pass_count, trace->resolved_technique, active_before,
+      LoadU32(base, kActiveDeferredTechniqueGlobal));
+}
+
+void TraceNativeDeferredSelectorPass(uint8_t* base, uint32_t caller) {
+  const auto* trace = g_native_deferred_selector_trace;
+  if (!trace || caller != 0x824F6470) {
+    return;
+  }
+  const LightingContext& lighting = GetNativeLightingContext();
+  REXLOG_INFO(
+      "gta4-native-light-selector: point=pass-apply sequence={} frame={} occurrence={} "
+      "record={:08X} source-function={:08X} selector-caller={:08X} caller={:08X} "
+      "requested-selector={} requested-mode={} effective-mode={} effective-technique={:08X} "
+      "pass={:08X} resolution-observed={} resolution-success={} handle-source={} "
+      "return-pass-count={} mode-in-range={} technique-matches-resolution={}",
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      GetNativeLightSubmittedFrame(base), lighting.occurrence_id, lighting.record_address,
+      lighting.source_function, lighting.selector_caller, caller, lighting.requested_selector,
+      lighting.requested_mode, lighting.effective_mode, lighting.effective_technique, lighting.pass,
+      trace->resolution_observed, trace->resolution_succeeded,
+      trace->resolution_observed ? (trace->explicit_handle ? "explicit" : "fallback") : "unknown",
+      trace->return_pass_count,
+      trace->resolution_observed && trace->resolution_succeeded &&
+          lighting.effective_mode < trace->return_pass_count,
+      trace->resolution_observed && trace->resolution_succeeded &&
+          lighting.effective_technique == trace->resolved_technique);
+}
+
+struct NativeWorldLightProducerTrace {
+  bool known = false;
+  uint32_t caller = 0;
+  uint32_t entity = 0;
+  uint32_t model = 0;
+  uint32_t ordinal = 0;
+  uint32_t wrapper = 0;
+  uint32_t attribute = 0;
+  uint32_t attribute_flags = 0;
+  uint32_t token = 0;
+  uint32_t source_seed = 0;
+  uint32_t room_handle = 0;
+};
+
+thread_local const NativeWorldLightProducerTrace* g_native_world_light_producer_trace = nullptr;
+
+class ScopedNativeWorldLightProducerTrace {
+ public:
+  explicit ScopedNativeWorldLightProducerTrace(const PPCContext& ctx)
+      : previous_(g_native_world_light_producer_trace) {
+    // sub_82208408 keeps entity/model/ordinal in r30/r23/r25. Its call at
+    // 0x822089C0 passes the attribute wrapper in r3 and entity+ordinal in r9.
+    // This retail token is not an allocation generation or a global object ID.
+    trace_.caller = uint32_t(ctx.lr);
+    if (trace_.caller == 0x822089C4) {
+      trace_.known = true;
+      trace_.entity = ctx.r30.u32;
+      trace_.model = ctx.r23.u32;
+      trace_.ordinal = ctx.r25.u32;
+      trace_.wrapper = ctx.r3.u32;
+      trace_.token = ctx.r9.u32;
+      trace_.source_seed = ctx.r8.u32;
+      trace_.room_handle = ctx.r10.u32;
+    }
+    g_native_world_light_producer_trace = &trace_;
+  }
+
+  ~ScopedNativeWorldLightProducerTrace() { g_native_world_light_producer_trace = previous_; }
+
+  ScopedNativeWorldLightProducerTrace(const ScopedNativeWorldLightProducerTrace&) = delete;
+  ScopedNativeWorldLightProducerTrace& operator=(const ScopedNativeWorldLightProducerTrace&) = delete;
+
+ private:
+  NativeWorldLightProducerTrace trace_{};
+  const NativeWorldLightProducerTrace* previous_ = nullptr;
+};
+
+struct NativeLightSubmissionTrace {
+  uint64_t submission = 0;
+  uint32_t caller = 0;
+  uint32_t source_r3 = 0;
+  uint32_t type = 0;
+  uint32_t flags = 0;
+  uint32_t primary_copies = 0;
+  NativeWorldLightProducerTrace world{};
+};
+
+thread_local NativeLightSubmissionTrace* g_native_light_submission_trace = nullptr;
+
+class ScopedNativeLightSubmissionTrace {
+ public:
+  ScopedNativeLightSubmissionTrace(uint8_t* base, const PPCContext& ctx)
+      : previous_(g_native_light_submission_trace),
+        active_(IsNativeLightProvenanceTraceEnabled()) {
+    if (!active_) {
+      return;
+    }
+    trace_.submission =
+        g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    trace_.caller = uint32_t(ctx.lr);
+    trace_.source_r3 = ctx.r3.u32;
+    trace_.type = ctx.r4.u32;
+    trace_.flags = ctx.r5.u32;
+    const auto* world = g_native_world_light_producer_trace;
+    if (world && world->known && world->wrapper == trace_.source_r3 &&
+        (trace_.caller == 0x82208328 || trace_.caller == 0x822083F8 ||
+         trace_.caller == 0x822B32B0)) {
+      trace_.world = *world;
+      // sub_822077D8 receives the actual attribute from wrapper vtable+12
+      // at 0x82207848 and retains it in r31 through these registrar calls.
+      // The intermediate sub_822B3268 does not change r31.
+      trace_.world.attribute = ctx.r31.u32;
+      trace_.world.attribute_flags =
+          trace_.world.attribute ? LoadU32(base, trace_.world.attribute + 76) : 0;
+    }
+    g_native_light_submission_trace = &trace_;
+  }
+
+  ~ScopedNativeLightSubmissionTrace() {
+    if (active_) {
+      g_native_light_submission_trace = previous_;
+    }
+  }
+
+  void TraceNoPrimaryCopy(uint8_t* base) const {
+    if (!active_ || trace_.primary_copies) {
+      return;
+    }
+    REXLOG_INFO(
+        "gta4-native-light-producer: point=submit-no-primary-copy submission={} frame={} "
+        "caller={:08X} source-r3={:08X} type={} flags-in={:08X} world-source-known={} "
+        "entity={:08X} model={:08X} ordinal={} wrapper={:08X} attribute={:08X} "
+        "token={:08X} allocation-generation=unknown",
+        trace_.submission, GetNativeLightSubmittedFrame(base), trace_.caller, trace_.source_r3,
+        trace_.type, trace_.flags, trace_.world.known, trace_.world.entity, trace_.world.model,
+        trace_.world.ordinal, trace_.world.wrapper, trace_.world.attribute, trace_.world.token);
+  }
+
+  ScopedNativeLightSubmissionTrace(const ScopedNativeLightSubmissionTrace&) = delete;
+  ScopedNativeLightSubmissionTrace& operator=(const ScopedNativeLightSubmissionTrace&) = delete;
+
+ private:
+  NativeLightSubmissionTrace trace_{};
+  NativeLightSubmissionTrace* previous_ = nullptr;
+  bool active_ = false;
+};
+
+void TraceNativePrimaryLightAdmission(uint8_t* base, uint32_t caller, uint32_t destination,
+                                      uint32_t candidate) {
+  if (!destination || (caller != 0x822B278C && caller != 0x822B27E8)) {
+    return;
+  }
+  NativeLightSubmissionTrace submission{};
+  if (g_native_light_submission_trace) {
+    ++g_native_light_submission_trace->primary_copies;
+    submission = *g_native_light_submission_trace;
+  }
+  // sub_822B2748 reaches these copies only after append/replacement admission.
+  // sub_822B25A0 rotates the producer arena; a destination address is a reused
+  // slot, not a persistent identity. Log the observed arena, never a fabricated
+  // generation. Publication to the consumer occurs separately in sub_822B3698.
+  const auto& world = submission.world;
+  REXLOG_INFO(
+      "gta4-native-light-producer: point=primary-admit sequence={} submission={} frame={} "
+      "caller={:08X} admission={} record={:08X} candidate={:08X} producer-base={:08X} "
+      "producer-arena={} source-caller={:08X} source-r3={:08X} type={} flags-in={:08X} "
+      "record-type={} record-flags={:08X} record-token={:08X} record-shadow-index={:08X} "
+      "world-source-known={} world-caller={:08X} entity={:08X} model={:08X} ordinal={} "
+      "wrapper={:08X} attribute={:08X} attribute-flags={:08X} token={:08X} "
+      "source-seed={:08X} room-handle={:08X} source-lifetime=live-call "
+      "record-lifetime=arena-slot allocation-generation=unknown",
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      submission.submission, GetNativeLightSubmittedFrame(base), caller,
+      caller == 0x822B278C ? "append" : "replace", destination, candidate,
+      LoadU32(base, 0x82A99780), LoadU32(base, 0x82CF2610), submission.caller,
+      submission.source_r3, submission.type, submission.flags, LoadU32(base, destination + 68),
+      LoadU32(base, destination + 72), LoadU32(base, destination + 96),
+      LoadU32(base, destination + 100), world.known, world.caller, world.entity, world.model,
+      world.ordinal, world.wrapper, world.attribute, world.attribute_flags, world.token,
+      world.source_seed, world.room_handle);
+}
+
+uint64_t MakeNativeLocalLightCandidateKey(NativeLocalLightLoopKind kind,
+                                          NativeLocalLightSource source, uint32_t instance) {
+  return (uint64_t(uint8_t(kind)) << 56) | (uint64_t(uint8_t(source)) << 48) | instance;
+}
+
+NativeLocalLightCandidateSnapshot CapturePrimaryDeferredLight(uint8_t* base, uint32_t instance,
+                                                              uint32_t ordinal) {
+  NativeLocalLightCandidateSnapshot snapshot{};
+  snapshot.source = NativeLocalLightSource::kPrimary;
+  snapshot.instance = instance;
+  snapshot.ordinal = ordinal;
+  snapshot.type = LoadU32(base, instance + 68);
+  snapshot.flags = LoadU32(base, instance + 72);
+  snapshot.index = LoadU32(base, instance + 76);
+  snapshot.object = LoadU32(base, instance + 80);
+  snapshot.position_bits = {LoadU32(base, instance + 32), LoadU32(base, instance + 36),
+                            LoadU32(base, instance + 40)};
+  snapshot.extent_bits = {LoadU32(base, instance + 84), LoadU32(base, instance + 112),
+                          LoadU32(base, instance + 116)};
+  snapshot.auxiliary0 = LoadU32(base, instance + 96);
+  snapshot.auxiliary1 = LoadU32(base, instance + 100);
+  return snapshot;
+}
+
+NativeLocalLightCandidateSnapshot CaptureSecondaryDeferredLight(uint8_t* base, uint32_t instance,
+                                                                uint32_t ordinal) {
+  NativeLocalLightCandidateSnapshot snapshot{};
+  snapshot.source = NativeLocalLightSource::kSecondary;
+  snapshot.instance = instance;
+  snapshot.ordinal = ordinal;
+  snapshot.type = LoadU32(base, instance + 68);
+  snapshot.flags = LoadU32(base, instance + 72);
+  snapshot.index = LoadU32(base, instance + 76);
+  snapshot.object = LoadU32(base, instance + 60);
+  snapshot.position_bits = {LoadU32(base, instance), LoadU32(base, instance + 4),
+                            LoadU32(base, instance + 8)};
+  snapshot.extent_bits = {LoadU32(base, instance + 48), LoadU32(base, instance + 52),
+                          LoadU32(base, instance + 56)};
+  snapshot.auxiliary0 = LoadU32(base, instance + 64);
+  snapshot.auxiliary1 = LoadU32(base, instance + 12);
+  return snapshot;
+}
+
+void CaptureNativeLocalLightList(uint8_t* base, NativeLocalLightSource source, uint32_t list_base,
+                                 uint32_t count, uint32_t stride,
+                                 std::vector<NativeLocalLightCandidateSnapshot>& candidates) {
+  if (!list_base || !count || !stride) {
+    return;
+  }
+  const uint32_t captured_count = std::min(count, kNativeLocalLightCandidateLimit);
+  candidates.reserve(candidates.size() + captured_count);
+  for (uint32_t ordinal = 0; ordinal < captured_count; ++ordinal) {
+    const uint32_t instance = list_base + ordinal * stride;
+    candidates.push_back(source == NativeLocalLightSource::kSecondary
+                             ? CaptureSecondaryDeferredLight(base, instance, ordinal)
+                             : CapturePrimaryDeferredLight(base, instance, ordinal));
+  }
+}
+
+NativeLocalLightLoopFrame BeginNativeLocalLightLoop(NativeLocalLightLoopKind kind, PPCContext& ctx,
+                                                    uint8_t* base) {
+  NativeLocalLightLoopFrame frame{};
+  frame.kind = kind;
+  frame.caller = uint32_t(ctx.lr);
+  frame.submitted_frame = GetNativeLightSubmittedFrame(base);
+  frame.arguments = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32};
+  frame.context_depth = g_native_local_light_context_stack.size();
+
+  if (kind == NativeLocalLightLoopKind::kTypeThree ||
+      kind == NativeLocalLightLoopKind::kPointSpot || kind == NativeLocalLightLoopKind::kShaft) {
+    frame.primary_base = LoadU32(base, kPrimaryDeferredLightListPointerGlobal);
+    frame.primary_count = LoadU32(base, kPrimaryDeferredLightCountGlobal);
+  }
+  if (kind == NativeLocalLightLoopKind::kShaft) {
+    frame.secondary_base = LoadU32(base, kSecondaryDeferredLightListPointerGlobal);
+    frame.secondary_count = LoadU32(base, kSecondaryDeferredLightCountGlobal);
+  }
+  if (kind == NativeLocalLightLoopKind::kTypeThree ||
+      kind == NativeLocalLightLoopKind::kPointSpot || kind == NativeLocalLightLoopKind::kShaft) {
+    CaptureNativeLocalLightList(base, NativeLocalLightSource::kPrimary, frame.primary_base,
+                                frame.primary_count, kPrimaryDeferredLightStride, frame.candidates);
+  }
+  if (kind == NativeLocalLightLoopKind::kShaft) {
+    CaptureNativeLocalLightList(base, NativeLocalLightSource::kSecondary, frame.secondary_base,
+                                frame.secondary_count, kSecondaryDeferredLightStride,
+                                frame.candidates);
+  }
+  if (kind == NativeLocalLightLoopKind::kWaterFx && frame.arguments[2]) {
+    for (uint32_t bucket = 0; bucket < 4; ++bucket) {
+      frame.bucket_count += LoadU32(base, frame.arguments[2] + bucket * 12);
+    }
+  }
+  return frame;
+}
+
+NativeLocalLightOutcome DetermineNativeLocalLightOutcome(
+    const NativeLocalLightLoopFrame& frame, const NativeLocalLightCandidateSnapshot& candidate) {
+  if (frame.selected_instances.contains(candidate.instance)) {
+    return NativeLocalLightOutcome::kSelected;
+  }
+  if (const auto dynamic = frame.dynamic_outcomes.find(candidate.instance);
+      dynamic != frame.dynamic_outcomes.end()) {
+    return dynamic->second;
+  }
+  if (frame.kind == NativeLocalLightLoopKind::kTypeThree && candidate.type != 3) {
+    return NativeLocalLightOutcome::kTypeFiltered;
+  }
+  if (frame.kind == NativeLocalLightLoopKind::kPointSpot && candidate.type != 0 &&
+      candidate.type != 2) {
+    return NativeLocalLightOutcome::kTypeFiltered;
+  }
+  if (frame.kind == NativeLocalLightLoopKind::kShaft &&
+      candidate.source == NativeLocalLightSource::kPrimary) {
+    if (!(candidate.flags & 0x8)) {
+      return NativeLocalLightOutcome::kDeferredFlagClear;
+    }
+    if (candidate.type != 0 && candidate.type != 2) {
+      return NativeLocalLightOutcome::kTypeFiltered;
+    }
+    if (!candidate.extent_bits[1] || !candidate.extent_bits[2]) {
+      return NativeLocalLightOutcome::kZeroExtent;
+    }
+  }
+  return NativeLocalLightOutcome::kNoTechniqueSelection;
+}
+
+void LogNativeLocalLightCandidateTransition(const NativeLocalLightLoopFrame& frame,
+                                            const NativeLocalLightCandidateSnapshot& candidate,
+                                            NativeLocalLightOutcome outcome) {
+  const uint64_t key =
+      MakeNativeLocalLightCandidateKey(frame.kind, candidate.source, candidate.instance);
+  bool first = false;
+  bool changed = false;
+  NativeLocalLightCandidateEventState previous{};
+  {
+    std::lock_guard lock(g_native_local_light_event_mutex);
+    auto [entry, inserted] = g_native_local_light_candidate_event_states.try_emplace(key);
+    first = inserted;
+    previous = entry->second;
+    changed =
+        inserted || !(entry->second.snapshot == candidate) || entry->second.outcome != outcome;
+    if (changed) {
+      entry->second.snapshot = candidate;
+      entry->second.outcome = outcome;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+  REXLOG_INFO(
+      "gta4-native-local-light: point=candidate event={} sequence={} frame={} loop={} "
+      "source={} instance={:08X} ordinal={} outcome={}:previous={} type={} flags={:08X} "
+      "index={:08X} object={:08X} position={:08X},{:08X},{:08X} "
+      "extent={:08X},{:08X},{:08X} auxiliary={:08X},{:08X}",
+      first ? "first" : "changed",
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      frame.submitted_frame, NativeLocalLightLoopName(frame.kind),
+      NativeLocalLightSourceName(candidate.source), candidate.instance, candidate.ordinal,
+      NativeLocalLightOutcomeName(outcome),
+      first ? "none" : NativeLocalLightOutcomeName(previous.outcome), candidate.type,
+      candidate.flags, candidate.index, candidate.object, candidate.position_bits[0],
+      candidate.position_bits[1], candidate.position_bits[2], candidate.extent_bits[0],
+      candidate.extent_bits[1], candidate.extent_bits[2], candidate.auxiliary0,
+      candidate.auxiliary1);
+}
+
+void FinishNativeLocalLightLoop(NativeLocalLightLoopFrame& frame) {
+  while (g_native_local_light_context_stack.size() > frame.context_depth) {
+    const NativeLocalLightTechniqueContext context = g_native_local_light_context_stack.back();
+    g_native_local_light_context_stack.pop_back();
+    SetNativeLightTraceContext(context.previous_context);
+    SetNativeLightTraceTechnique(context.previous_technique);
+    SetNativeLightTraceMode(context.previous_mode);
+    REXLOG_WARN(
+        "gta4-native-local-light: point=context-recovery sequence={} frame={} loop={} "
+        "instance={:08X} begin-caller={:08X}",
+        g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+        frame.submitted_frame, NativeLocalLightLoopName(frame.kind), context.instance,
+        context.caller);
+  }
+
+  for (const NativeLocalLightCandidateSnapshot& candidate : frame.candidates) {
+    LogNativeLocalLightCandidateTransition(frame, candidate,
+                                           DetermineNativeLocalLightOutcome(frame, candidate));
+  }
+
+  const NativeLocalLightLoopEventState current{
+      frame.primary_base,       frame.primary_count,     frame.secondary_base,
+      frame.secondary_count,    frame.bucket_count,      uint32_t(frame.selected_instances.size()),
+      frame.technique_calls,    frame.cookie_fallbacks, frame.visibility_rejections,
+      frame.shadow_unavailable,
+  };
+  bool first = false;
+  bool changed = false;
+  NativeLocalLightLoopEventState previous{};
+  {
+    std::lock_guard lock(g_native_local_light_event_mutex);
+    auto [entry, inserted] =
+        g_native_local_light_loop_event_states.try_emplace(uint32_t(frame.kind));
+    first = inserted;
+    previous = entry->second;
+    changed = inserted || !(entry->second == current);
+    if (changed) {
+      entry->second = current;
+    }
+  }
+  if (changed) {
+    REXLOG_INFO(
+        "gta4-native-local-light: point=loop-summary event={} sequence={} frame={} loop={} "
+        "caller={:08X} args={:08X},{:08X},{:08X},{:08X} "
+        "primary={:08X}:{} secondary={:08X}:{} buckets={} candidates={} selected={} "
+        "technique-calls={} cookie-fallbacks={} visibility-rejected={} shadow-unavailable={} "
+        "previous-primary={} previous-secondary={} previous-selected={} previous-techniques={}",
+        first ? "first" : "changed",
+        g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+        frame.submitted_frame, NativeLocalLightLoopName(frame.kind), frame.caller,
+        frame.arguments[0], frame.arguments[1], frame.arguments[2], frame.arguments[3],
+        frame.primary_base, frame.primary_count, frame.secondary_base, frame.secondary_count,
+        frame.bucket_count, frame.candidates.size(), frame.selected_instances.size(),
+        frame.technique_calls, frame.cookie_fallbacks, frame.visibility_rejections,
+        frame.shadow_unavailable, previous.primary_count, previous.secondary_count,
+        previous.selected_count, previous.technique_calls);
+  }
+}
+
+class ScopedNativeLocalLightLoop {
+ public:
+  ScopedNativeLocalLightLoop(NativeLocalLightLoopKind kind, PPCContext& ctx, uint8_t* base)
+      : active_(IsNativeMode() && IsNativeLightLoopTraceEnabled()) {
+    if (active_) {
+      g_native_local_light_loop_stack.push_back(BeginNativeLocalLightLoop(kind, ctx, base));
+    }
+  }
+
+  ScopedNativeLocalLightLoop(const ScopedNativeLocalLightLoop&) = delete;
+  ScopedNativeLocalLightLoop& operator=(const ScopedNativeLocalLightLoop&) = delete;
+
+  ~ScopedNativeLocalLightLoop() {
+    if (!active_ || g_native_local_light_loop_stack.empty()) {
+      return;
+    }
+    FinishNativeLocalLightLoop(g_native_local_light_loop_stack.back());
+    g_native_local_light_loop_stack.pop_back();
+  }
+
+ private:
+  bool active_ = false;
+};
+
+struct NativeLocalLightTechniqueSite {
+  NativeLocalLightLoopKind kind = NativeLocalLightLoopKind::kNone;
+  NativeLocalLightSource source = NativeLocalLightSource::kNone;
+  uint32_t instance = 0;
+  const char* label = "unknown";
+};
+
+NativeLocalLightTechniqueSite ResolveNativeLocalLightTechniqueSite(uint8_t* base, PPCContext& ctx,
+                                                                   uint32_t caller) {
+  const uint32_t primary_base = LoadU32(base, kPrimaryDeferredLightListPointerGlobal);
+  const uint32_t secondary_base = LoadU32(base, kSecondaryDeferredLightListPointerGlobal);
+  switch (caller) {
+    case 0x82207454:
+      return {NativeLocalLightLoopKind::kCorona, NativeLocalLightSource::kSynthetic,
+              0x822072D0, "corona-batch"};
+    case 0x822B0E50:
+    case 0x822B0ECC:
+      return {NativeLocalLightLoopKind::kTypeThree, NativeLocalLightSource::kPrimary,
+              primary_base ? primary_base + ctx.r29.u32 : 0, "type-three"};
+    case 0x822B13A4:
+    case 0x822B13C0:
+    case 0x822B142C:
+    case 0x822B1448:
+      return {NativeLocalLightLoopKind::kPointSpot, NativeLocalLightSource::kPrimary,
+              ctx.r30.u32 >= 80 ? ctx.r30.u32 - 80 : 0, "point-spot"};
+    case 0x822B49D0:
+    case 0x822B49E8:
+    case 0x822B4A08:
+    case 0x822B4A20:
+      return {NativeLocalLightLoopKind::kShaft, NativeLocalLightSource::kSecondary,
+              secondary_base ? secondary_base + ctx.r28.u32 : 0, "shaft-secondary"};
+    case 0x822B4C58:
+    case 0x822B4C74:
+    case 0x822B4C90:
+    case 0x822B4CAC:
+      return {NativeLocalLightLoopKind::kShaft, NativeLocalLightSource::kPrimary,
+              primary_base ? primary_base + ctx.r29.u32 : 0, "shaft-primary"};
+    case 0x8234A734:
+      return {NativeLocalLightLoopKind::kWaterFx, NativeLocalLightSource::kBucket,
+              ctx.r19.u32 ? LoadU32(base, ctx.r19.u32) : 0, "waterFx-batch"};
+    case 0x824F7614:
+      return {NativeLocalLightLoopKind::kGlobalStencil, NativeLocalLightSource::kSynthetic,
+              0x824F7328, "global-stencil"};
+    default:
+      break;
+  }
+  return {};
+}
+
+NativeLocalLightTechniqueSite ResolveNativeLocalLightBranchSite(uint8_t* base, PPCContext& ctx,
+                                                                uint32_t caller) {
+  const uint32_t primary_base = LoadU32(base, kPrimaryDeferredLightListPointerGlobal);
+  switch (caller) {
+    case 0x822B0C8C:
+    case 0x822B0D5C:
+      return {NativeLocalLightLoopKind::kTypeThree, NativeLocalLightSource::kPrimary,
+              primary_base ? primary_base + ctx.r29.u32 : 0, "type-three"};
+    case 0x822B104C:
+    case 0x822B1120:
+    case 0x822B1144:
+      return {NativeLocalLightLoopKind::kPointSpot, NativeLocalLightSource::kPrimary,
+              ctx.r30.u32 >= 80 ? ctx.r30.u32 - 80 : 0, "point-spot"};
+    case 0x822B4B04:
+    case 0x822B4B30:
+      return {NativeLocalLightLoopKind::kShaft, NativeLocalLightSource::kPrimary,
+              primary_base ? primary_base + ctx.r29.u32 : 0, "shaft-primary"};
+    default:
+      break;
+  }
+  return {};
+}
+
+NativeLocalLightLoopFrame* FindNativeLocalLightLoopFrame(NativeLocalLightLoopKind kind) {
+  for (auto frame = g_native_local_light_loop_stack.rbegin();
+       frame != g_native_local_light_loop_stack.rend(); ++frame) {
+    if (frame->kind == kind) {
+      return &*frame;
+    }
+  }
+  return nullptr;
+}
+
+void TraceNativeApartmentBulbClassifier(uint8_t* base, PPCContext& ctx) {
+  const uint32_t caller = uint32_t(ctx.lr);
+  if (caller != 0x822B13A4 && caller != 0x822B13C0 && caller != 0x822B142C &&
+      caller != 0x822B1448) {
+    return;
+  }
+
+  const NativeLocalLightTechniqueSite site =
+      ResolveNativeLocalLightTechniqueSite(base, ctx, caller);
+  if (!site.instance) {
+    return;
+  }
+  const std::array<uint32_t, 3> position_bits = {LoadU32(base, site.instance + 32),
+                                                 LoadU32(base, site.instance + 36),
+                                                 LoadU32(base, site.instance + 40)};
+  if (position_bits[1] != 0xC3F92482u || position_bits[2] != 0x41A8A5E7u ||
+      (position_bits[0] != 0x445F214Au && position_bits[0] != 0x445EA085u)) {
+    return;
+  }
+
+  const uint32_t flags = LoadU32(base, site.instance + 72);
+  const uint32_t stack = ctx.r1.u32;
+  const std::array<uint32_t, 3> delta_bits = {
+      LoadU32(base, stack + 144), LoadU32(base, stack + 148), LoadU32(base, stack + 152)};
+  const uint32_t classifier_data = LoadU32(base, stack + 96);
+  const uint32_t threshold_radius_bits = classifier_data ? LoadU32(base, classifier_data + 716) : 0;
+  const uint32_t threshold_scale_bits = LoadU32(base, ctx.r16.u32 - 25992);
+  const uint32_t numerator_bits = std::bit_cast<uint32_t>(float(ctx.f31.f64));
+
+  const NativeApartmentBulbClassifierSnapshot snapshot{
+      caller,      ctx.r3.u32,  ctx.r4.u32,  flags,         ctx.r26.u32,
+      ctx.r29.u32, ctx.r28.u32, ctx.r31.u32, position_bits,
+  };
+  const uint64_t key = (uint64_t(position_bits[0]) << 32) | caller;
+  bool first = false;
+  bool changed = false;
+  {
+    std::lock_guard lock(g_native_local_light_event_mutex);
+    auto [entry, inserted] = g_native_apartment_bulb_classifier_states.try_emplace(key);
+    first = inserted;
+    changed = inserted || !(entry->second == snapshot);
+    if (changed) {
+      entry->second = snapshot;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+
+  const std::array<float, 3> delta = {std::bit_cast<float>(delta_bits[0]),
+                                      std::bit_cast<float>(delta_bits[1]),
+                                      std::bit_cast<float>(delta_bits[2])};
+  const double delta_length_squared =
+      std::fma(double(delta[0]), double(delta[0]),
+               std::fma(double(delta[1]), double(delta[1]), double(delta[2]) * double(delta[2])));
+  const double delta_length = delta_length_squared >= 0.0
+                                  ? std::sqrt(delta_length_squared)
+                                  : std::numeric_limits<double>::quiet_NaN();
+  const double numerator = double(std::bit_cast<float>(numerator_bits));
+  const double ratio =
+      delta_length > 0.0 ? numerator / delta_length : std::numeric_limits<double>::infinity();
+  const double threshold = double(std::bit_cast<float>(threshold_radius_bits)) *
+                           double(std::bit_cast<float>(threshold_scale_bits));
+  const bool predicate = ctx.r26.u32 == 1 && (ctx.r29.u32 & 0xFFu) == 1;
+  const bool true_branch = caller == 0x822B13A4 || caller == 0x822B142C;
+  const char* const stage =
+      caller == 0x822B13A4 || caller == 0x822B13C0 ? "stencil" : "accumulation";
+
+  REXLOG_INFO(
+      "gta4-native-light-classifier: event={} sequence={} frame={} bulb={} "
+      "instance={:08X} stage={} branch={} caller={:08X} technique={}:{} mode={} "
+      "flags={:08X} bits=10:{},20:{},40:{},80:{},100:{},200:{},400:{} "
+      "predicate={} consistent={} gate-r26={} result-r29={} selected-r28={} type-r31={} "
+      "position={:.9g},{:.9g},{:.9g} delta={:.9g},{:.9g},{:.9g} "
+      "delta-length={:.9g} numerator={:.9g} ratio={:.9g} threshold={:.9g} "
+      "ratio-ge-threshold={} raw-delta={:08X},{:08X},{:08X} "
+      "raw-radius={:08X} raw-scale={:08X} raw-numerator={:08X}",
+      first ? "first" : "changed",
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      GetNativeLightSubmittedFrame(base),
+      position_bits[0] == 0x445F214Au ? "bulb-x892" : "bulb-x890", position_bits[0], stage,
+      true_branch ? "predicate-true" : "predicate-false", caller, ctx.r3.u32,
+      DeferredLightTechniqueName(ctx.r3.u32), ctx.r4.u32, flags, bool(flags & 0x10u),
+      bool(flags & 0x20u), bool(flags & 0x40u), bool(flags & 0x80u), bool(flags & 0x100u),
+      bool(flags & 0x200u), bool(flags & 0x400u), predicate, predicate == true_branch, ctx.r26.u32,
+      ctx.r29.u32, ctx.r28.u32, ctx.r31.u32, std::bit_cast<float>(position_bits[0]),
+      std::bit_cast<float>(position_bits[1]), std::bit_cast<float>(position_bits[2]), delta[0],
+      delta[1], delta[2], delta_length, numerator, ratio, threshold, ratio >= threshold,
+      delta_bits[0], delta_bits[1], delta_bits[2], threshold_radius_bits, threshold_scale_bits,
+      numerator_bits);
+}
+
+void TraceNativeApartmentBulbSource(uint8_t* base, PPCContext& ctx) {
+  const uint32_t position_pointer = ctx.r8.u32;
+  if (!position_pointer) {
+    return;
+  }
+  const std::array<uint32_t, 3> position_bits = {LoadU32(base, position_pointer),
+                                                 LoadU32(base, position_pointer + 4),
+                                                 LoadU32(base, position_pointer + 8)};
+  if (position_bits[1] != 0xC3F92482u || position_bits[2] != 0x41A8A5E7u ||
+      (position_bits[0] != 0x445F214Au && position_bits[0] != 0x445EA085u)) {
+    return;
+  }
+
+  const uint32_t caller = uint32_t(ctx.lr);
+  const uint32_t owner = ctx.r3.u32;
+  const NativeApartmentBulbSourceSnapshot snapshot{
+      caller,
+      owner,
+      owner ? LoadU32(base, owner) : 0,
+      owner ? LoadU32(base, owner + 76) : 0,
+      ctx.r4.u32,
+      ctx.r5.u32,
+      {ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32},
+      position_bits,
+      {std::bit_cast<uint32_t>(float(ctx.f1.f64)), std::bit_cast<uint32_t>(float(ctx.f2.f64)),
+       std::bit_cast<uint32_t>(float(ctx.f3.f64)), std::bit_cast<uint32_t>(float(ctx.f4.f64)),
+       std::bit_cast<uint32_t>(float(ctx.f5.f64)), std::bit_cast<uint32_t>(float(ctx.f6.f64))},
+  };
+  const uint64_t key = (uint64_t(position_bits[0]) << 32) | caller;
+  bool first = false;
+  bool changed = false;
+  {
+    std::lock_guard lock(g_native_local_light_event_mutex);
+    auto [entry, inserted] = g_native_apartment_bulb_source_states.try_emplace(key);
+    first = inserted;
+    changed = inserted || !(entry->second == snapshot);
+    if (changed) {
+      entry->second = snapshot;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+
+  REXLOG_INFO(
+      "gta4-native-light-source: event={} sequence={} frame={} bulb={} instance={:08X} "
+      "caller={:08X} owner-r3={:08X} owner-vtable={:08X} owner-flags={:08X} "
+      "owner-bit-00100000={} type-r4={} flags-in-r5={:08X} "
+      "bits=10:{},20:{},40:{},80:{},100:{},200:{},400:{} "
+      "vectors-r6-r9={:08X},{:08X},{:08X},{:08X} "
+      "f1-f6={:.9g},{:.9g},{:.9g},{:.9g},{:.9g},{:.9g} "
+      "raw-f1-f6={:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
+      first ? "first" : "changed",
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      GetNativeLightSubmittedFrame(base),
+      position_bits[0] == 0x445F214Au ? "bulb-x892" : "bulb-x890", position_bits[0], caller,
+      snapshot.owner, snapshot.owner_vtable, snapshot.owner_flags,
+      bool(snapshot.owner_flags & 0x00100000u), snapshot.light_type, snapshot.flags,
+      bool(snapshot.flags & 0x10u), bool(snapshot.flags & 0x20u), bool(snapshot.flags & 0x40u),
+      bool(snapshot.flags & 0x80u), bool(snapshot.flags & 0x100u), bool(snapshot.flags & 0x200u),
+      bool(snapshot.flags & 0x400u), snapshot.vector_pointers[0], snapshot.vector_pointers[1],
+      snapshot.vector_pointers[2], snapshot.vector_pointers[3],
+      std::bit_cast<float>(snapshot.float_argument_bits[0]),
+      std::bit_cast<float>(snapshot.float_argument_bits[1]),
+      std::bit_cast<float>(snapshot.float_argument_bits[2]),
+      std::bit_cast<float>(snapshot.float_argument_bits[3]),
+      std::bit_cast<float>(snapshot.float_argument_bits[4]),
+      std::bit_cast<float>(snapshot.float_argument_bits[5]), snapshot.float_argument_bits[0],
+      snapshot.float_argument_bits[1], snapshot.float_argument_bits[2],
+      snapshot.float_argument_bits[3], snapshot.float_argument_bits[4],
+      snapshot.float_argument_bits[5]);
+}
+
+void TraceNativeApartmentBulbConstruction(uint8_t* base, uint32_t caller, uint32_t destination,
+                                          uint32_t light_type, uint32_t flags,
+                                          uint32_t position_pointer, uint32_t direction_pointer,
+                                          uint32_t tangent_pointer, uint32_t color_pointer,
+                                          const std::array<uint32_t, 10>& preserved_registers) {
+  if (!position_pointer) {
+    return;
+  }
+  const std::array<uint32_t, 3> position_bits = {LoadU32(base, position_pointer),
+                                                 LoadU32(base, position_pointer + 4),
+                                                 LoadU32(base, position_pointer + 8)};
+  if (position_bits[1] != 0xC3F92482u || position_bits[2] != 0x41A8A5E7u ||
+      (position_bits[0] != 0x445F214Au && position_bits[0] != 0x445EA085u)) {
+    return;
+  }
+
+  const NativeApartmentBulbConstructionSnapshot snapshot{
+      caller,           destination,         light_type,      flags,
+      position_pointer, direction_pointer,   tangent_pointer, color_pointer,
+      position_bits,    preserved_registers,
+  };
+  const uint64_t key = (uint64_t(position_bits[0]) << 32) | caller;
+  bool first = false;
+  bool changed = false;
+  {
+    std::lock_guard lock(g_native_local_light_event_mutex);
+    auto [entry, inserted] = g_native_apartment_bulb_construction_states.try_emplace(key);
+    first = inserted;
+    changed = inserted || !(entry->second == snapshot);
+    if (changed) {
+      entry->second = snapshot;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+
+  const uint32_t written_type = destination ? LoadU32(base, destination + 68) : 0;
+  const uint32_t written_flags = destination ? LoadU32(base, destination + 72) : 0;
+  // sub_821677B8 walks a source array with r31 as its byte offset and
+  // *(r30) as the current array base. Reconstruct that pointer at the constructor
+  // boundary so the asset/list flag can be compared with the constructed record.
+  const uint32_t source_record =
+      caller == 0x8216798C && preserved_registers[8]
+          ? preserved_registers[9] + LoadU32(base, preserved_registers[8])
+          : 0;
+  const uint32_t source_word0 = source_record ? LoadU32(base, source_record) : 0;
+  const uint32_t source_word1 = source_record ? LoadU32(base, source_record + 4) : 0;
+  REXLOG_INFO(
+      "gta4-native-light-construction: event={} sequence={} frame={} bulb={} "
+      "instance={:08X} caller={:08X} destination={:08X} type={}:written={} "
+      "flags={:08X}:written={:08X} bits=10:{},20:{},40:{},80:{},100:{},200:{},400:{} "
+      "position-pointer={:08X} direction-pointer={:08X} tangent-pointer={:08X} "
+      "color-pointer={:08X} source-record={:08X} source-words={:08X},{:08X} "
+      "registers-r22-r31={:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
+      first ? "first" : "changed",
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      GetNativeLightSubmittedFrame(base),
+      position_bits[0] == 0x445F214Au ? "bulb-x892" : "bulb-x890", position_bits[0], caller,
+      destination, light_type, written_type, flags, written_flags, bool(flags & 0x10u),
+      bool(flags & 0x20u), bool(flags & 0x40u), bool(flags & 0x80u), bool(flags & 0x100u),
+      bool(flags & 0x200u), bool(flags & 0x400u), position_pointer, direction_pointer,
+      tangent_pointer, color_pointer, source_record, source_word0, source_word1,
+      preserved_registers[0], preserved_registers[1], preserved_registers[2],
+      preserved_registers[3], preserved_registers[4], preserved_registers[5],
+      preserved_registers[6], preserved_registers[7], preserved_registers[8],
+      preserved_registers[9]);
+}
+
+void TraceNativeLocalLightTechniqueBegin(uint8_t* base, PPCContext& ctx) {
+  const uint32_t caller = uint32_t(ctx.lr);
+  const uint32_t technique = ctx.r3.u32;
+  const uint32_t mode = ctx.r4.u32;
+  const NativeLocalLightTechniqueSite site =
+      ResolveNativeLocalLightTechniqueSite(base, ctx, caller);
+  if (site.kind == NativeLocalLightLoopKind::kNone || !site.instance) {
+    return;
+  }
+
+  const bool verbose_loop_trace = IsNativeLightLoopTraceEnabled();
+  if (verbose_loop_trace) {
+    NativeLocalLightLoopFrame* frame = FindNativeLocalLightLoopFrame(site.kind);
+    if (frame) {
+      ++frame->technique_calls;
+      frame->selected_instances.insert(site.instance);
+    }
+  }
+
+  // Cached technique command lists are built before a physical light selects
+  // them, so replay-time provenance comes from this thread-local scope. Keep
+  // the scope active for the base light trace even when the high-volume loop
+  // inventory is disabled; otherwise cached VS1/PS5/PS9 draws lose their light
+  // and technique identity and cannot be targeted safely by diagnostics.
+  g_native_local_light_context_stack.push_back({GetNativeLightTraceContext(),
+                                                GetNativeLightTraceTechnique(),
+                                                GetNativeLightTraceMode(), site.instance, caller});
+  SetNativeLightTraceContext(site.instance);
+  SetNativeLightTraceTechnique(technique);
+  SetNativeLightTraceMode(mode);
+
+  if (verbose_loop_trace) {
+    const uint64_t key = (uint64_t(site.instance) << 32) | caller;
+    bool first = false;
+    bool changed = false;
+    std::pair<uint32_t, uint32_t> previous{};
+    {
+      std::lock_guard lock(g_native_local_light_event_mutex);
+      auto [entry, inserted] = g_native_local_light_technique_event_states.try_emplace(key);
+      first = inserted;
+      previous = entry->second;
+      changed = inserted || entry->second.first != technique || entry->second.second != mode;
+      if (changed) {
+        entry->second = {technique, mode};
+      }
+    }
+    if (changed) {
+      REXLOG_INFO(
+          "gta4-native-local-light: point=technique-begin event={} sequence={} frame={} "
+          "loop={} source={} label={} instance={:08X} caller={:08X} "
+          "technique={}:{} mode={} previous-technique={} previous-mode={} context-depth={}",
+          first ? "first" : "changed",
+          g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+          GetNativeLightSubmittedFrame(base), NativeLocalLightLoopName(site.kind),
+          NativeLocalLightSourceName(site.source), site.label, site.instance, caller, technique,
+          DeferredLightTechniqueName(technique), mode, previous.first, previous.second,
+          g_native_local_light_context_stack.size());
+    }
+  }
+}
+
+bool IsNativeLocalLightTechniqueEndCaller(uint32_t caller) {
+  switch (caller) {
+    case 0x822077A0:
+    case 0x822B0EDC:
+    case 0x822B13D0:
+    case 0x822B1458:
+    case 0x822B49DC:
+    case 0x822B4A14:
+    case 0x822B4A2C:
+    case 0x822B4C68:
+    case 0x822B4CA0:
+    case 0x822B4CBC:
+    case 0x8234AA38:
+    case 0x824F767C:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void TraceNativeLocalLightTechniqueEnd(uint8_t* base, uint32_t caller) {
+  if (!IsNativeLocalLightTechniqueEndCaller(caller) || g_native_local_light_context_stack.empty()) {
+    return;
+  }
+  const NativeLocalLightTechniqueContext context = g_native_local_light_context_stack.back();
+  g_native_local_light_context_stack.pop_back();
+  SetNativeLightTraceContext(context.previous_context);
+  SetNativeLightTraceTechnique(context.previous_technique);
+  SetNativeLightTraceMode(context.previous_mode);
+  if (IsNativeLightTraceDetailEnabled()) {
+    REXLOG_INFO(
+        "gta4-native-local-light: point=technique-end sequence={} frame={} instance={:08X} "
+        "begin-caller={:08X} end-caller={:08X} context-depth={}",
+        g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+        GetNativeLightSubmittedFrame(base), context.instance, context.caller, caller,
+        g_native_local_light_context_stack.size());
+  }
+}
+
+void MarkNativeLocalLightBranch(uint8_t* base, PPCContext& ctx, uint32_t caller,
+                                NativeLocalLightOutcome outcome, const char* reason) {
+  const NativeLocalLightTechniqueSite site = ResolveNativeLocalLightBranchSite(base, ctx, caller);
+  if (site.kind == NativeLocalLightLoopKind::kNone || !site.instance) {
+    return;
+  }
+  if (NativeLocalLightLoopFrame* frame = FindNativeLocalLightLoopFrame(site.kind)) {
+    frame->dynamic_outcomes[site.instance] = outcome;
+    if (outcome == NativeLocalLightOutcome::kVisibilityRejected) {
+      ++frame->visibility_rejections;
+    }
+  }
+  REXLOG_INFO(
+      "gta4-native-local-light: point=skip-branch sequence={} frame={} loop={} source={} "
+      "instance={:08X} caller={:08X} reason={}",
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      GetNativeLightSubmittedFrame(base), NativeLocalLightLoopName(site.kind),
+      NativeLocalLightSourceName(site.source), site.instance, caller, reason);
+}
+
+void TraceNativeLocalLightShadowUnavailable(uint8_t* base, PPCContext& ctx, uint32_t caller) {
+  const NativeLocalLightTechniqueSite site = ResolveNativeLocalLightBranchSite(base, ctx, caller);
+  if (site.kind == NativeLocalLightLoopKind::kNone || !site.instance) {
+    return;
+  }
+  if (NativeLocalLightLoopFrame* frame = FindNativeLocalLightLoopFrame(site.kind)) {
+    ++frame->shadow_unavailable;
+  }
+  REXLOG_INFO(
+      "gta4-native-local-light: point=branch sequence={} frame={} loop={} source={} "
+      "instance={:08X} caller={:08X} result=shadow-unavailable-fallback",
+      g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      GetNativeLightSubmittedFrame(base), NativeLocalLightLoopName(site.kind),
+      NativeLocalLightSourceName(site.source), site.instance, caller);
 }
 
 struct CloudGuestStateSnapshot {
@@ -885,6 +2566,35 @@ bool IsNativeMode() {
 }
 
 bool ShouldLogNativeHookCall(uint64_t call_count);
+
+template <typename Command>
+bool SubmitNativeCommand(const Command& command);
+
+void RegisterNativeVirtualResource(uint32_t resource, VirtualResourceKind kind, uint32_t wrapper,
+                                   uint32_t companion, uint32_t backing_width,
+                                   uint32_t backing_height, uint32_t logical_width,
+                                   uint32_t logical_height, uint32_t physical_width,
+                                   uint32_t physical_height,
+                                   VirtualResourceScaleDomain scale_domain,
+                                   uint32_t constructor_caller) {
+  if (!resource) {
+    return;
+  }
+  RegisterVirtualResourceCommand command{};
+  command.resource = resource;
+  command.kind = kind;
+  command.wrapper = wrapper;
+  command.companion = companion;
+  command.guest_backing_width = backing_width;
+  command.guest_backing_height = backing_height;
+  command.logical_width = logical_width;
+  command.logical_height = logical_height;
+  command.physical_width = physical_width;
+  command.physical_height = physical_height;
+  command.scale_domain = scale_domain;
+  command.constructor_caller = constructor_caller;
+  SubmitNativeCommand(command);
+}
 uint64_t NextNativeHookDiagnosticCall(std::atomic<uint64_t>& counter);
 
 bool QueryNativeDeviceCapabilities(DeviceCapabilitiesResult& result) {
@@ -896,12 +2606,23 @@ bool QueryNativeDeviceCapabilities(DeviceCapabilitiesResult& result) {
   return false;
 }
 
-void ApplyModelBudgetOverrides(uint8_t* base) {
-  if (!REXCVAR_GET(gta4_disable_model_budget_reduction)) {
-    return;
+SupersampledExtent GetNativePrimaryPhysicalExtent(uint32_t logical_width, uint32_t logical_height) {
+  const uint32_t pixel_factor =
+      g_native_supersampling_effective_factor.load(std::memory_order_acquire);
+  if (pixel_factor == 1u) {
+    return {logical_width, logical_height};
   }
-  StoreU8(base, kReducePedModelBudgetGlobal, 0);
-  StoreU8(base, kReduceVehicleModelBudgetGlobal, 0);
+
+  const auto physical = CalculateSupersampledExtent(logical_width, logical_height, pixel_factor);
+  if (physical) {
+    return *physical;
+  }
+
+  REXLOG_ERROR(
+      "GTA4SSAA event=reject-resource factor={} logical={}x{} "
+      "reason=physical-extent-overflow",
+      pixel_factor, logical_width, logical_height);
+  return {logical_width, logical_height};
 }
 
 void ApplyShadowDistanceScale(uint8_t* base) {
@@ -950,8 +2671,8 @@ void ApplyShadowDistanceScale(uint8_t* base) {
     REXLOG_INFO(
         "gta4-native-quality: shadow distance #{} multiplier={} context0={} -> {} "
         "context1={} -> {}",
-        override, configured_scale, original_ranges.front(),
-        scaled_ranges.front(), original_ranges.back(), scaled_ranges.back());
+        override, configured_scale, original_ranges.front(), scaled_ranges.front(),
+        original_ranges.back(), scaled_ranges.back());
   }
 }
 
@@ -1036,7 +2757,40 @@ NativeResolutionOverride GetNativeResolutionOverride(uint32_t requested_width,
     result.height = aspect_height;
   }
 
-  const bool fsr1_requested = REXCVAR_GET(gta4_native_upscaler) == "fsr1";
+  const uint32_t requested_ssaa_factor =
+      GetAntiAliasingRoute(GetActiveAntiAliasingMode()).supersampling_pixel_factor;
+  uint32_t effective_ssaa_factor = 1u;
+  if (requested_ssaa_factor > 1u) {
+    DeviceCapabilitiesResult capabilities{};
+    const uint32_t maximum_dimension = QueryNativeDeviceCapabilities(capabilities)
+                                           ? capabilities.max_image_dimension_2d
+                                           : UINT32_MAX;
+    const auto physical = CalculateSupersampledExtent(result.display_width, result.display_height,
+                                                      requested_ssaa_factor, maximum_dimension);
+    if (physical) {
+      effective_ssaa_factor = requested_ssaa_factor;
+      static std::atomic<bool> logged_ssaa_activation{false};
+      if (!logged_ssaa_activation.exchange(true)) {
+        REXLOG_INFO(
+            "GTA4SSAA event=activate factor={} logical={}x{} physical={}x{} "
+            "max-dimension={}",
+            requested_ssaa_factor, result.display_width, result.display_height, physical->width,
+            physical->height, maximum_dimension);
+      }
+    } else {
+      static std::atomic<bool> logged_ssaa_rejection{false};
+      if (!logged_ssaa_rejection.exchange(true)) {
+        REXLOG_ERROR(
+            "GTA4SSAA event=reject-runtime factor={} logical={}x{} max-dimension={} "
+            "reason=physical-extent-unsupported",
+            requested_ssaa_factor, result.display_width, result.display_height, maximum_dimension);
+      }
+    }
+  }
+  g_native_supersampling_effective_factor.store(effective_ssaa_factor, std::memory_order_release);
+
+  const bool ssaa_active = requested_ssaa_factor > 1u;
+  const bool fsr1_requested = REXCVAR_GET(gta4_native_upscaler) == "fsr1" && !ssaa_active;
   const bool hdr_requested = rex::cvar::Query<bool>("vulkan_hdr");
   if (fsr1_requested && !hdr_requested) {
     const std::string& quality = REXCVAR_GET(gta4_fsr1_quality);
@@ -1153,6 +2907,12 @@ void PatchNativeDisplayResourceDimensions(uint8_t* base, uint32_t resource, uint
       texture_layout ? EncodeTextureResourceDimensions(original_dimensions, width, height)
                      : EncodeSurfaceResourceDimensions(original_dimensions, width, height);
   StoreU32(base, dimensions_address, native_dimensions);
+  const SupersampledExtent physical = GetNativePrimaryPhysicalExtent(width, height);
+  RegisterNativeVirtualResource(
+      resource, texture_layout ? VirtualResourceKind::kTexture : VirtualResourceKind::kSurface, 0,
+      0, std::min(width, kNativeBackingWidth), std::min(height, kNativeBackingHeight), width,
+      height, physical.width, physical.height, VirtualResourceScaleDomain::kPrimaryScene,
+      return_address);
 
   static std::atomic<uint64_t> patch_count{0};
   const uint64_t patch = NextNativeHookDiagnosticCall(patch_count);
@@ -1167,7 +2927,7 @@ void PatchNativeDisplayResourceDimensions(uint8_t* base, uint32_t resource, uint
 }
 
 bool PatchDeferredWrapperDimensions(uint8_t* base, uint32_t wrapper, uint32_t width,
-                                    uint32_t height) {
+                                    uint32_t height, uint32_t constructor_caller) {
   if (!wrapper || !width || !height || width > UINT16_MAX || height > UINT16_MAX) {
     return false;
   }
@@ -1191,7 +2951,196 @@ bool PatchDeferredWrapperDimensions(uint8_t* base, uint32_t wrapper, uint32_t wi
              EncodeTextureResourceDimensions(LoadU32(base, dimensions_address), width, height));
   }
 
+  const SupersampledExtent physical = GetNativePrimaryPhysicalExtent(width, height);
+
+  RegisterNativeVirtualResource(surface, VirtualResourceKind::kSurface, wrapper, texture,
+                                kNativeBackingWidth, kNativeBackingHeight, width, height,
+                                physical.width, physical.height,
+                                VirtualResourceScaleDomain::kPrimaryScene, constructor_caller);
+  RegisterNativeVirtualResource(texture, VirtualResourceKind::kTexture, wrapper, surface,
+                                kNativeBackingWidth, kNativeBackingHeight, width, height,
+                                physical.width, physical.height,
+                                VirtualResourceScaleDomain::kPrimaryScene, constructor_caller);
+
   return surface || texture;
+}
+
+bool PatchNativePackedDepthAlias(uint8_t* base, uint32_t alias_global,
+                                 uint32_t source_wrapper, uint32_t constructor_caller) {
+  // Compiled sub_828D9768 uses the alternate wrapper layout (+24/+28/+30).
+  // sub_828D9608 returns the source wrapper's sampled texture at +72.
+  const uint32_t wrapper = LoadU32(base, alias_global);
+  if (!wrapper || !source_wrapper ||
+      LoadU32(base, wrapper) != kDeferredPackedDepthAliasVtable ||
+      LoadU32(base, LoadU32(base, source_wrapper) + 64) != 0x828D9608) {
+    return false;
+  }
+  const uint32_t texture = LoadU32(base, wrapper + kDeferredPackedDepthAliasTextureOffset);
+  const uint32_t source = LoadU32(base, source_wrapper + kDeferredWrapperTextureOffset);
+  const uint32_t width = LoadU16(base, source_wrapper + kDeferredWrapperLogicalWidthOffset);
+  const uint32_t height = LoadU16(base, source_wrapper + kDeferredWrapperLogicalHeightOffset);
+  if (!texture || !source || !width || !height || width > 8192 || height > 8192) {
+    return false;
+  }
+  StoreU16(base, wrapper + kDeferredPackedDepthAliasWidthOffset, uint16_t(width));
+  StoreU16(base, wrapper + kDeferredPackedDepthAliasHeightOffset, uint16_t(height));
+  StoreU32(base, texture + kResourcePackedDimensionsOffset,
+           EncodeTextureResourceDimensions(
+               LoadU32(base, texture + kResourcePackedDimensionsOffset), width, height));
+  const auto physical = GetNativePrimaryPhysicalExtent(width, height);
+  RegisterVirtualResourceCommand registration{};
+  registration.resource = texture;
+  registration.wrapper = wrapper;
+  registration.companion = source;
+  registration.guest_backing_width = kNativeBackingWidth;
+  registration.guest_backing_height = kNativeBackingHeight;
+  registration.logical_width = width;
+  registration.logical_height = height;
+  registration.physical_width = physical.width;
+  registration.physical_height = physical.height;
+  registration.scale_domain = VirtualResourceScaleDomain::kPrimaryScene;
+  registration.constructor_caller = constructor_caller;
+  registration.packed_depth_source = source;
+  return SubmitNativeCommand(registration);
+}
+
+// sub_828D9768 allocates a 52-byte D3D texture header, then binds the source
+// resource's word at +32 masked by 0xFFFFF000 (returns 0x828D97C4 / 0x828D9834).
+// Capture that exact header without reading backing pixels or resolving guest
+// virtual methods. The address is an observation, not an allocation generation.
+struct NativePackedDepthAliasHeaderTrace {
+  bool read = false;
+  std::array<uint32_t, 13> words{};
+};
+
+NativePackedDepthAliasHeaderTrace ReadNativePackedDepthAliasHeader(uint8_t* base,
+                                                                 uint32_t texture) {
+  NativePackedDepthAliasHeaderTrace result;
+  // Last start address that contains the complete header in the guest range.
+  if (!texture || texture > 0xFFFFFFCC) {
+    return result;
+  }
+  constexpr std::array<uint32_t, 13> offsets = {0, 4, 8, 12, 16, 20, 24,
+                                               28, 32, 36, 40, 44, 48};
+  for (size_t word = 0; word < offsets.size(); ++word) {
+    result.words[word] = LoadU32(base, texture + offsets[word]);
+  }
+  result.read = true;
+  return result;
+}
+
+std::string FormatNativePackedDepthAliasHeader(const NativePackedDepthAliasHeaderTrace& header) {
+  std::string result = "[";
+  for (size_t word = 0; word < header.words.size(); ++word) {
+    result += fmt::format("{}{:08X}", word ? "," : "", header.words[word]);
+  }
+  result += "]";
+  return result;
+}
+
+std::string FormatNativePackedDepthAliasFetch(const NativePackedDepthAliasHeaderTrace& header) {
+  // The six fetch words occupy header byte offsets 28, 32, 36, 40, 44, 48.
+  return fmt::format("[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]", header.words[7],
+                     header.words[8], header.words[9], header.words[10], header.words[11],
+                     header.words[12]);
+}
+
+void TraceNativePackedDepthAliasSetup(uint8_t* base, uint64_t setup, const char* phase,
+                                    uint32_t caller, uint32_t mode, uint32_t target_width,
+                                    uint32_t target_height) {
+  if (!setup || setup > kDeferredPackedDepthAliasTraceSetupLimit ||
+      !IsNativeLightProvenanceTraceEnabled()) {
+    return;
+  }
+
+  const uint32_t source_wrapper = LoadU32(base, kDeferredGbufferZWrapperGlobal);
+  const uint32_t source_surface =
+      source_wrapper ? LoadU32(base, source_wrapper + kDeferredWrapperSurfaceOffset) : 0;
+  const uint32_t source_texture =
+      source_wrapper ? LoadU32(base, source_wrapper + kDeferredWrapperTextureOffset) : 0;
+  const auto source_header = ReadNativePackedDepthAliasHeader(base, source_texture);
+  const uint32_t source_surface_word32 = source_surface ? LoadU32(base, source_surface + 32) : 0;
+  const uint32_t source_physical_width =
+      source_wrapper ? LoadU16(base, source_wrapper + kDeferredWrapperPhysicalWidthOffset) : 0;
+  const uint32_t source_physical_height =
+      source_wrapper ? LoadU16(base, source_wrapper + kDeferredWrapperPhysicalHeightOffset) : 0;
+  const uint32_t source_logical_width =
+      source_wrapper ? LoadU16(base, source_wrapper + kDeferredWrapperLogicalWidthOffset) : 0;
+  const uint32_t source_logical_height =
+      source_wrapper ? LoadU16(base, source_wrapper + kDeferredWrapperLogicalHeightOffset) : 0;
+
+  for (uint32_t alias_global : kDeferredPackedDepthAliasGlobals) {
+    const uint32_t wrapper = LoadU32(base, alias_global);
+    const uint32_t vtable = wrapper ? LoadU32(base, wrapper) : 0;
+    const bool layout_matches = vtable == kDeferredPackedDepthAliasVtable;
+    const uint32_t texture =
+        layout_matches ? LoadU32(base, wrapper + kDeferredPackedDepthAliasTextureOffset) : 0;
+    const uint32_t width =
+        layout_matches ? LoadU16(base, wrapper + kDeferredPackedDepthAliasWidthOffset) : 0;
+    const uint32_t height =
+        layout_matches ? LoadU16(base, wrapper + kDeferredPackedDepthAliasHeightOffset) : 0;
+    const auto header = ReadNativePackedDepthAliasHeader(base, texture);
+    // The first alias is built from GBufferZ (return 0x824F497C). The second
+    // uses the factory's slot +40 with r4=0 (return 0x824F49D4); the GBufferZ
+    // fields below are only a comparison for that alias, not a source claim.
+    const bool source_is_gbuffer_z = alias_global == kDeferredPackedDepthAliasGlobals.front();
+    REXLOG_INFO(
+        "gta4-native-light-producer: point=packed-depth-alias phase={} event={} setup={} "
+        "submitted-frame={} source-pc=824F4730 caller={:08X} alias-constructor-return={:08X} "
+        "mode={} target={}x{} alias-global={:08X} wrapper={:08X} vtable={:08X} "
+        "layout-matches={} alias-size={}x{} texture={:08X} header-read={} header-bytes=52 "
+        "header={} fetch={} physical-base-field={:08X} source-is-gbuffer-z={} "
+        "gbuffer-z-global={:08X} gbuffer-z-wrapper={:08X} gbuffer-z-physical={}x{} "
+        "gbuffer-z-logical={}x{} gbuffer-z-surface={:08X} gbuffer-z-surface-word32={:08X} "
+        "gbuffer-z-surface-physical-base-field={:08X} gbuffer-z-texture={:08X} "
+        "gbuffer-z-header-read={} gbuffer-z-header={} gbuffer-z-fetch={} "
+        "gbuffer-z-texture-physical-base-field={:08X}",
+        phase, g_native_title_light_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+        setup, GetNativeLightSubmittedFrame(base), caller,
+        source_is_gbuffer_z ? 0x824F497C : 0x824F49D4, mode, target_width, target_height,
+        alias_global, wrapper, vtable, layout_matches, width, height, texture, header.read,
+        FormatNativePackedDepthAliasHeader(header), FormatNativePackedDepthAliasFetch(header),
+        header.words[8] & 0xFFFFF000, source_is_gbuffer_z, kDeferredGbufferZWrapperGlobal,
+        source_wrapper, source_physical_width, source_physical_height, source_logical_width,
+        source_logical_height, source_surface, source_surface_word32,
+        source_surface_word32 & 0xFFFFF000, source_texture, source_header.read,
+        FormatNativePackedDepthAliasHeader(source_header),
+        FormatNativePackedDepthAliasFetch(source_header), source_header.words[8] & 0xFFFFF000);
+  }
+}
+
+bool RegisterNativeRenderTargetWrapper(uint8_t* base, uint32_t wrapper, uint32_t width,
+                                       uint32_t height, uint32_t constructor_caller) {
+  if (!wrapper || !width || !height) {
+    return false;
+  }
+
+  const uint32_t surface = LoadU32(base, wrapper + kDeferredWrapperSurfaceOffset);
+  const uint32_t texture = LoadU32(base, wrapper + kDeferredWrapperTextureOffset);
+  if (!surface && !texture) {
+    return false;
+  }
+
+  // The surface factory is host-virtualized for every non-trivial render
+  // target. The texture factory intentionally keeps Xbox-envelope targets
+  // concretely backed because some of them are CPU-lockable (PHONE_SCREEN and
+  // PHOTO are examples). Pair both objects under one wrapper lifetime while
+  // retaining their independently correct guest-backing extents.
+  const bool texture_uses_placeholder =
+      width > kOriginalRenderTargetWidth || height > kOriginalRenderTargetHeight;
+  const uint32_t surface_backing_width = std::min(width, kNativeBackingWidth);
+  const uint32_t surface_backing_height = std::min(height, kNativeBackingHeight);
+  const uint32_t texture_backing_width =
+      texture_uses_placeholder ? std::min(width, kNativeBackingWidth) : width;
+  const uint32_t texture_backing_height =
+      texture_uses_placeholder ? std::min(height, kNativeBackingHeight) : height;
+  RegisterNativeVirtualResource(surface, VirtualResourceKind::kSurface, wrapper, texture,
+                                surface_backing_width, surface_backing_height, width, height, width,
+                                height, VirtualResourceScaleDomain::kLogical, constructor_caller);
+  RegisterNativeVirtualResource(texture, VirtualResourceKind::kTexture, wrapper, surface,
+                                texture_backing_width, texture_backing_height, width, height, width,
+                                height, VirtualResourceScaleDomain::kLogical, constructor_caller);
+  return true;
 }
 
 bool IsCachedListCommandType(CommandType type) {
@@ -1215,7 +3164,7 @@ bool IsCachedListCommandType(CommandType type) {
     case CommandType::kDeviceDestroyed:
     case CommandType::kRegisterShader:
     case CommandType::kRegisterVertexDeclaration:
-    case CommandType::kInvalidateTexture:
+    case CommandType::kResourceUnlock:
     case CommandType::kTextureLock:
     case CommandType::kRenderPhaseMarker:
     case CommandType::kPresent:
@@ -1224,10 +3173,13 @@ bool IsCachedListCommandType(CommandType type) {
     case CommandType::kReleaseResource:
     case CommandType::kUpdateEnvironmentalData:
     case CommandType::kDepthSurfaceHandoff:
+    case CommandType::kRegisterVirtualResource:
       return false;
   }
   return false;
 }
+
+#include "gta4_phone_trace.inc"
 
 template <typename Command>
 bool CaptureNativeCommand(const Command& command) {
@@ -1235,7 +3187,7 @@ bool CaptureNativeCommand(const Command& command) {
     return false;
   }
 
-  CapturedNativeCommand captured;
+  CapturedNativeCommand captured{};
   captured.type = command.header.type;
   captured.selector_mask = g_active_native_capture.selector_mask;
   captured.bytes.resize(sizeof(command));
@@ -1309,6 +3261,19 @@ bool CaptureNativeCommand(const Command& command) {
     }
   }
 
+  if (PhoneTraceConfig().enabled) {
+    captured.phone_capture = std::make_shared<PhoneTraceContext>();
+    auto& phone = *captured.phone_capture;
+    phone.event = NextPhoneEvent();
+    phone.capture_object = g_active_native_capture.build_object;
+    phone.capture_ordinal = uint32_t(g_active_native_capture.commands.size());
+    phone.snapshot_valid = captured.draw_snapshot.valid;
+    if constexpr (requires { command.device; }) {
+      phone.device = command.device;
+      phone.guest_frame = command.device ? LoadU32(g_active_native_capture.base, command.device + kSubmittedFrameOffset) : 0;
+      phone.applied = CapturePhoneGuestState(g_active_native_capture.base, command.device);
+    }
+  }
   g_active_native_capture.commands.push_back(std::move(captured));
   return true;
 }
@@ -1319,8 +3284,9 @@ bool SubmitNativeCommand(const Command& command) {
     return true;
   }
   if (auto* graphics = GetNativeGraphicsSystem()) {
-    const bool accepted =
-        graphics->SubmitTitleCommand(kTitleId, kTitleCommandAbi, &command, sizeof(command));
+    uint32_t phone_device = 0;
+    if constexpr (requires { command.device; }) phone_device = command.device;
+    const bool accepted = SubmitPhoneTracedCommand(&command, sizeof(command), phone_device);
     if (!accepted && rex::diagnostics::IsEnabled(rex::diagnostics::Category::kGuestHooks)) {
       static std::atomic<uint64_t> rejection_count{0};
       const uint64_t count = NextNativeHookDiagnosticCall(rejection_count);
@@ -1356,19 +3322,8 @@ EnvironmentalDataV1 CaptureEnvironmentalData(uint8_t* base, uint32_t postfx) {
   data.byte_size = sizeof(data);
   data.source_sequence = source_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
 
-  // FusionShaders' timecycext contract defaults. The Xbox executable has no
-  // timecycext table or proven clock/weather ABI to index one, so expose the
-  // documented neutral row through the typed bridge instead of guessing guest
-  // globals. A future table parser may replace these values without changing
-  // the EnvironmentalDataV1 contract.
-  data.fog_density = 0.004f;
-  data.fog_height_falloff = 0.015f;
-  data.fog_altitude_tweak = 0.7f;
-  data.fog_power = 1.0f;
-  data.valid_fields |= EnvironmentalFieldBit(EnvironmentalField::kFogDensity) |
-                       EnvironmentalFieldBit(EnvironmentalField::kFogHeightFalloff) |
-                       EnvironmentalFieldBit(EnvironmentalField::kFogAltitudeTweak) |
-                       EnvironmentalFieldBit(EnvironmentalField::kFogPower);
+  // No retail clock/weather ABI or timecycext producer has been established.
+  // Leave fog fields invalid; fixed host-effect defaults are not guest data.
 
   if (g_captured_sun_payload.direction_valid) {
     data.sun_direction = g_captured_sun_payload.direction;
@@ -1498,6 +3453,21 @@ class ScopedRenderPhaseMarker {
 template <typename Command, typename Result>
 bool ExecuteNativeCommand(const Command& command, Result& result) {
   if (auto* graphics = GetNativeGraphicsSystem()) {
+    if constexpr (std::is_same_v<Command, TextureLockCommand>) {
+      if (PhoneCaptureActive()) {
+        uint8_t* base = g_phone_guest_base.load(std::memory_order_relaxed);
+        const auto context = NewPhoneContext(base ? LoadU32(base, kDeferredDeviceGlobal) : 0);
+        PhoneTraceLog("guest-sync-submit", fmt::format(
+            "run={} event={} texture={:08X} frame={}", context.run, context.event,
+            command.texture, context.guest_frame));
+        const auto envelope = PackPhoneTraceEnvelope(&command, sizeof(command), kTitleCommandAbi, context);
+        const bool accepted = graphics->ExecuteTitleCommand(kTitleId, kPhoneTraceEnvelopeAbi,
+            envelope.data(), envelope.size(), &result, sizeof(result));
+        PhoneTraceLog("guest-sync-result", fmt::format(
+            "run={} event={} accepted={}", context.run, context.event, accepted));
+        return accepted;
+      }
+    }
     return graphics->ExecuteTitleCommand(kTitleId, kTitleCommandAbi, &command, sizeof(command),
                                          &result, sizeof(result));
   }
@@ -1564,6 +3534,78 @@ uint32_t UpdateResourceLockCount(uint8_t* base, uint32_t resource, int32_t delta
   }
 }
 
+struct NativeResourceLockState {
+  uint32_t nesting = 0;
+  uint32_t flags = 0;
+  uint32_t minimum_offset = UINT32_MAX;
+  uint32_t maximum_end = 0;
+  uint32_t lock_caller = 0;
+  bool guest_write = false;
+};
+
+std::mutex g_native_resource_lock_mutex;
+std::unordered_map<uint32_t, NativeResourceLockState> g_native_resource_locks;
+
+void UpdateGuestDirtyRange(uint8_t* base, uint32_t resource, uint32_t secondary_selector,
+                           uint32_t primary_base, uint32_t secondary_base, uint32_t pointer,
+                           uint32_t size, uint32_t flags) {
+  // The retail lock routine uses bit zero as the no-dirty-update contract.
+  // The DMA/cache-maintenance branches around this range bookkeeping target
+  // the Xbox GPU and intentionally remain stubbed in the native renderer.
+  if (flags & 1u) {
+    return;
+  }
+
+  const bool secondary_range = secondary_selector && secondary_base;
+  const uint32_t range_base = secondary_range ? secondary_base : primary_base;
+  const uint32_t range_field = resource + (secondary_range ? 24u : 20u);
+  const uint32_t offset = pointer - range_base;
+  const uint32_t end = offset + size;
+  const uint32_t first_block = offset >> 7;
+  const uint32_t end_block = (end + 127u) >> 7;
+  const uint32_t previous = LoadU32(base, range_field);
+  const uint32_t previous_first = previous >> 16;
+  const uint32_t previous_end = previous & 0xFFFFu;
+  StoreU32(base, range_field,
+           (std::min(first_block, previous_first) << 16) | std::max(end_block, previous_end));
+}
+
+void RecordNativeResourceLock(uint32_t resource, uint32_t base_pointer, uint32_t pointer,
+                              uint32_t size, uint32_t flags, uint32_t caller) {
+  std::lock_guard lock(g_native_resource_lock_mutex);
+  NativeResourceLockState& state = g_native_resource_locks[resource];
+  ++state.nesting;
+  state.flags |= flags;
+  if (!state.lock_caller) {
+    state.lock_caller = caller;
+  }
+  if (!(flags & 1u)) {
+    const uint32_t offset = pointer - base_pointer;
+    state.minimum_offset = std::min(state.minimum_offset, offset);
+    state.maximum_end = std::max(state.maximum_end, offset + size);
+    state.guest_write = true;
+  }
+}
+
+NativeResourceLockState ConsumeNativeResourceLock(uint32_t resource, bool outermost) {
+  std::lock_guard lock(g_native_resource_lock_mutex);
+  const auto existing = g_native_resource_locks.find(resource);
+  if (existing == g_native_resource_locks.end()) {
+    NativeResourceLockState conservative;
+    conservative.guest_write = true;
+    return conservative;
+  }
+
+  if (existing->second.nesting) {
+    --existing->second.nesting;
+  }
+  NativeResourceLockState state = existing->second;
+  if (outermost || !existing->second.nesting) {
+    g_native_resource_locks.erase(existing);
+  }
+  return state;
+}
+
 void RegisterNativeShader(PPCContext& ctx, uint8_t* base, GuestFunction implementation,
                           ShaderStage stage) {
   const bool native_mode = IsNativeMode();
@@ -1613,7 +3655,7 @@ bool SubmitNativeVertexDeclaration(uint8_t* base, uint32_t device, uint32_t decl
     return false;
   }
 
-  RegisterVertexDeclarationCommand command;
+  RegisterVertexDeclarationCommand command{};
   command.device = device;
   command.declaration = declaration;
   command.element_count = element_count;
@@ -1693,25 +3735,27 @@ void PatchCommandDevice(std::vector<uint8_t>& bytes, uint32_t device) {
   std::memcpy(bytes.data() + sizeof(CommandHeader), &device, sizeof(device));
 }
 
-void MarkCachedDrawStateDirty(std::vector<uint8_t>& bytes, CommandType type) {
-  const auto mark = [&bytes]<typename DrawCommand>() {
+void PatchCachedDrawExecutionState(std::vector<uint8_t>& bytes, CommandType type,
+                                   const LightingContext& lighting) {
+  const auto patch = [&bytes, &lighting]<typename DrawCommand>() {
     if (bytes.size() != sizeof(DrawCommand)) {
       return;
     }
     DrawCommand draw{};
     std::memcpy(&draw, bytes.data(), sizeof(draw));
+    ApplyDrawLightingContext(draw, lighting);
     draw.dirty_state.words.fill(UINT64_MAX);
     std::memcpy(bytes.data(), &draw, sizeof(draw));
   };
   switch (type) {
     case CommandType::kDrawPrimitive:
-      mark.template operator()<DrawPrimitiveCommand>();
+      patch.template operator()<DrawPrimitiveCommand>();
       break;
     case CommandType::kDrawPrimitiveUp:
-      mark.template operator()<DrawPrimitiveUpCommand>();
+      patch.template operator()<DrawPrimitiveUpCommand>();
       break;
     case CommandType::kDrawIndexedPrimitive:
-      mark.template operator()<DrawIndexedPrimitiveCommand>();
+      patch.template operator()<DrawIndexedPrimitiveCommand>();
       break;
     default:
       break;
@@ -1731,8 +3775,10 @@ bool SubmitCapturedNativeCommand(PPCContext& ctx, uint8_t* base, uint32_t device
   PatchCommandDevice(bytes, device);
   // Selector-filtered cached lists do not preserve a trustworthy predecessor
   // dirty-mask chain. The scoped replay snapshot is authoritative, so force a
-  // conservative semantic refresh for every replayed draw.
-  MarkCachedDrawStateDirty(bytes, captured.type);
+  // conservative semantic refresh for every replayed draw. The local-light ID
+  // must also be applied at replay time because command lists are built before
+  // a particular light instance selects them.
+  PatchCachedDrawExecutionState(bytes, captured.type, GetNativeLightingContext());
 
   // A cached command may execute many times. Give each execution unique
   // provenance at submission rather than reusing the ID and LR from the list
@@ -1825,6 +3871,28 @@ bool SubmitCapturedNativeCommand(PPCContext& ctx, uint8_t* base, uint32_t device
                      constants_hash, transform_hash, false);
   }
 
+  const bool trace_phone_replay = PhoneCaptureActive();
+  PhoneTraceContext phone_replay{};
+  if (trace_phone_replay) {
+    phone_replay = NewPhoneContext(device);
+    phone_replay.replay = 1;
+    phone_replay.command_list = command_list;
+    phone_replay.caller = uint32_t(ctx.lr);
+    phone_replay.live = phone_replay.applied;
+    phone_replay.snapshot_valid = captured.draw_snapshot.valid;
+    if (captured.phone_capture) {
+      phone_replay.captured_event = captured.phone_capture->event;
+      phone_replay.capture_object = captured.phone_capture->capture_object;
+      phone_replay.capture_ordinal = captured.phone_capture->capture_ordinal;
+      PhoneTraceLog("cache-captured", fmt::format("run={} event={} captured={} build={:08X} ordinal={} frame={} snapshot={} {}",
+          phone_replay.run, phone_replay.event, phone_replay.captured_event, phone_replay.capture_object,
+          phone_replay.capture_ordinal, captured.phone_capture->guest_frame, phone_replay.snapshot_valid,
+          PhoneGuestStateText(captured.phone_capture->applied)));
+    }
+    PhoneTraceLog("replay-live", fmt::format("run={} event={} list={:08X} ordinal={} mask={:08X} {}",
+        phone_replay.run, phone_replay.event, command_list, replay_command_ordinal, replay_mask,
+        PhoneGuestStateText(phone_replay.live)));
+  }
   bool accepted = false;
   {
     ScopedReplayDrawState replay_state(base, device, captured.draw_snapshot);
@@ -1833,12 +3901,18 @@ bool SubmitCapturedNativeCommand(PPCContext& ctx, uint8_t* base, uint32_t device
       log_replay_state("cached-draw-replay-applied", CaptureLiveVertexTransform(base, device),
                        constants_hash, transform_hash, false);
     }
-    accepted = graphics->SubmitTitleCommand(kTitleId, kTitleCommandAbi, bytes.data(), bytes.size());
+    accepted = SubmitPhoneTracedCommand(bytes.data(), bytes.size(), device,
+                                        trace_phone_replay ? &phone_replay : nullptr);
   }
   if (trace_gbuffer_replay) {
     const auto [constants_hash, transform_hash] = capture_live_hashes();
     log_replay_state("cached-draw-replay-restored", CaptureLiveVertexTransform(base, device),
                      constants_hash, transform_hash, accepted);
+  }
+  if (trace_phone_replay) {
+    const auto restored = CapturePhoneGuestState(base, device);
+    PhoneTraceLog("replay-restored", fmt::format("run={} event={} matches-live={} {}",
+        phone_replay.run, phone_replay.event, restored == phone_replay.live, PhoneGuestStateText(restored)));
   }
   FreeAlignedGuestAllocation(ctx, base, replay_vertex_data);
   return accepted;
@@ -2238,8 +4312,49 @@ void TraceKnownOffscreenTransformTransition(std::string_view point, PPCContext& 
 }
 
 extern "C" void sub_828C6568(PPCContext& ctx, uint8_t* base) {
+  if (PhoneCaptureActive()) {
+    g_phone_context.material = ctx.r3.u32;
+    PhoneTraceLog("material-select", fmt::format("run={} occurrence={} material={:08X} selector={} explicit={} caller={:08X}",
+        g_phone_run.load(), g_phone_context.occurrence, ctx.r3.u32, ctx.r4.u32, ctx.r6.u32, uint32_t(ctx.lr)));
+  }
+  const bool trace = g_native_deferred_selector_trace != nullptr;
+  const uint32_t caller = uint32_t(ctx.lr);
+  const uint32_t effect = ctx.r3.u32;
+  const uint32_t material_index = ctx.r4.u32;
+  const uint32_t explicit_handle = ctx.r6.u32;
+  const uint32_t active_before = trace ? LoadU32(base, kActiveDeferredTechniqueGlobal) : 0;
   TraceKnownOffscreenTransformTransition("offscreen-transition-material-list-select", ctx, base,
                                          __imp__sub_828C6568);
+  if (trace) {
+    TraceNativeDeferredSelectorResolution(base, ctx, caller, effect, material_index, explicit_handle,
+                                           active_before);
+  }
+}
+
+extern "C" void sub_828C64C8(PPCContext& ctx, uint8_t* base) {
+  if (PhoneCaptureActive()) {
+    g_phone_context.material = ctx.r3.u32;
+    g_phone_context.mode = ctx.r4.u32;
+    g_phone_context.technique = LoadU32(base, kActiveDeferredTechniqueGlobal);
+    PhoneTraceLog("material-pass", fmt::format("run={} occurrence={} material={:08X} technique={:08X} mode={} caller={:08X}",
+        g_phone_run.load(), g_phone_context.occurrence, ctx.r3.u32, g_phone_context.technique,
+        ctx.r4.u32, uint32_t(ctx.lr)));
+  }
+  if (IsNativeMode() && RequiresFullLightingConstants(GetNativeLightingContext())) {
+    // The selector has already applied mode overrides and any null-handle
+    // fallback. Record the exact pass BEFORE sub_828C8F38 can replay draws.
+    // generated .65:44567 computes pass = technique->passes + mode * 32.
+    LightingContext& lighting = g_native_lighting_context;
+    lighting.effective_technique = LoadU32(base, kActiveDeferredTechniqueGlobal);
+    lighting.effective_mode = ctx.r4.u32;
+    lighting.pass = lighting.effective_technique
+                        ? LoadU32(base, lighting.effective_technique +
+                                           kDeferredTechniquePassTableOffset) +
+                              lighting.effective_mode * kDeferredTechniquePassStride
+                        : 0;
+    TraceNativeDeferredSelectorPass(base, uint32_t(ctx.lr));
+  }
+  __imp__sub_828C64C8(ctx, base);
 }
 
 extern "C" void sub_828C6620(PPCContext& ctx, uint8_t* base) {
@@ -2552,23 +4667,9 @@ extern "C" void sub_824F3418(PPCContext& ctx, uint8_t* base) {
     return;
   }
 
-  const uint8_t previous_force = LoadU8(base, kForceHighLodGlobal);
   const bool highest_lod_resident = LoadU32(base, ctx.r4.u32 + kHighestLodDrawableOffset) != 0;
-  if (highest_lod_resident) {
-    StoreU8(base, kForceHighLodGlobal, 1);
-  }
-
-  __imp__sub_824F3418(ctx, base);
-  StoreU8(base, kForceHighLodGlobal, previous_force);
-
-  if (highest_lod_resident) {
-    static std::atomic<uint64_t> forced_count{0};
-    const uint64_t forced = NextNativeHookDiagnosticCall(forced_count);
-    if (ShouldLogNativeHookCall(forced)) {
-      REXLOG_INFO("gta4-native-quality: forced highest resident LOD #{} drawable={:08X}", forced,
-                  ctx.r4.u32);
-    }
-  } else {
+  if (!highest_lod_resident) {
+    __imp__sub_824F3418(ctx, base);
     static std::atomic<uint64_t> fallback_count{0};
     const uint64_t fallback = NextNativeHookDiagnosticCall(fallback_count);
     if (ShouldLogNativeHookCall(fallback)) {
@@ -2577,6 +4678,22 @@ extern "C" void sub_824F3418(PPCContext& ctx, uint8_t* base) {
           "preserving the game's resident fallback",
           fallback, ctx.r4.u32);
     }
+    return;
+  }
+
+  // Retail's FORCE_HIGH_LOD branch writes this exact result, but the original
+  // selector checks the middle-LOD pointer before it consults that flag. Write
+  // the forced result directly so a resident LOD0 is selected even when the
+  // middle slot is absent, without mutating the script-owned global.
+  StoreU32(base, ctx.r5.u32, 0);
+  StoreU32(base, ctx.r6.u32, 0);
+  StoreU32(base, ctx.r7.u32, LoadU32(base, kDefaultLodBlendGlobal));
+
+  static std::atomic<uint64_t> forced_count{0};
+  const uint64_t forced = NextNativeHookDiagnosticCall(forced_count);
+  if (ShouldLogNativeHookCall(forced)) {
+    REXLOG_INFO("gta4-native-quality: selected highest resident LOD #{} drawable={:08X}", forced,
+                ctx.r4.u32);
   }
 }
 
@@ -2587,71 +4704,16 @@ extern "C" void sub_821DFFE8(PPCContext& ctx, uint8_t* base) {
     return;
   }
 
-  ApplyModelBudgetOverrides(base);
-  if (configured_scale <= 1.0) {
-    __imp__sub_821DFFE8(ctx, base);
-    return;
-  }
-
-  const uint32_t previous_scale_bits = LoadU32(base, kDistanceScaleInputGlobal);
-  const float previous_scale = std::bit_cast<float>(previous_scale_bits);
-  const float effective_scale = previous_scale * float(configured_scale);
+  const float effective_scale = gta4::draw_distance::ResolveEngineScale(configured_scale);
   StoreU32(base, kDistanceScaleInputGlobal, std::bit_cast<uint32_t>(effective_scale));
   __imp__sub_821DFFE8(ctx, base);
-  StoreU32(base, kDistanceScaleInputGlobal, previous_scale_bits);
 
   static std::atomic<uint64_t> override_count{0};
   const uint64_t override = NextNativeHookDiagnosticCall(override_count);
   if (ShouldLogNativeHookCall(override)) {
-    REXLOG_INFO(
-        "gta4-native-quality: draw distance #{} game={} multiplier={} effective={} "
-        "published={}",
-        override, previous_scale, configured_scale, effective_scale,
-        std::bit_cast<float>(LoadU32(base, kDistanceScaleOutputGlobal)));
-  }
-}
-
-extern "C" void sub_82586E70(PPCContext& ctx, uint8_t* base) {
-  __imp__sub_82586E70(ctx, base);
-  if (!IsNativeMode() || !REXCVAR_GET(gta4_disable_model_budget_reduction)) {
-    return;
-  }
-  StoreU8(base, kReducePedModelBudgetGlobal, 0);
-  static std::atomic<uint64_t> override_count{0};
-  const uint64_t override = NextNativeHookDiagnosticCall(override_count);
-  if (ShouldLogNativeHookCall(override)) {
-    REXLOG_INFO("gta4-native-quality: disabled pedestrian model-budget reduction #{}", override);
-  }
-}
-
-extern "C" void sub_82586E98(PPCContext& ctx, uint8_t* base) {
-  __imp__sub_82586E98(ctx, base);
-  if (!IsNativeMode() || !REXCVAR_GET(gta4_disable_model_budget_reduction)) {
-    return;
-  }
-  StoreU8(base, kReduceVehicleModelBudgetGlobal, 0);
-  static std::atomic<uint64_t> override_count{0};
-  const uint64_t override = NextNativeHookDiagnosticCall(override_count);
-  if (ShouldLogNativeHookCall(override)) {
-    REXLOG_INFO("gta4-native-quality: disabled vehicle model-budget reduction #{}", override);
-  }
-}
-
-extern "C" void sub_8223C288(PPCContext& ctx, uint8_t* base) {
-  if (!IsNativeMode() || !REXCVAR_GET(gta4_disable_timecycle_far_clip)) {
-    __imp__sub_8223C288(ctx, base);
-    return;
-  }
-
-  const uint8_t previous_disable = LoadU8(base, kDisableTimecycleFarClipGlobal);
-  StoreU8(base, kDisableTimecycleFarClipGlobal, 1);
-  __imp__sub_8223C288(ctx, base);
-  StoreU8(base, kDisableTimecycleFarClipGlobal, previous_disable);
-
-  static std::atomic<uint64_t> override_count{0};
-  const uint64_t override = NextNativeHookDiagnosticCall(override_count);
-  if (ShouldLogNativeHookCall(override)) {
-    REXLOG_INFO("gta4-native-quality: suppressed timecycle far clip #{}", override);
+    REXLOG_INFO("gta4-native-quality: draw distance #{} configured={} engine-input={} published={}",
+                override, configured_scale, effective_scale,
+                std::bit_cast<float>(LoadU32(base, kDistanceScaleOutputGlobal)));
   }
 }
 
@@ -2946,7 +5008,7 @@ extern "C" void sub_82A3BF50(PPCContext& ctx, uint8_t* base) {
   const uint32_t index = ctx.r4.u32;
   const uint32_t surface = ctx.r5.u32;
   __imp__sub_82A3BF50(ctx, base);
-  SetRenderTargetCommand command;
+  SetRenderTargetCommand command{};
   command.device = device;
   command.index = index;
   command.surface = CaptureSurfaceDescriptor(base, surface);
@@ -3001,7 +5063,7 @@ extern "C" void sub_82A3C2B8(PPCContext& ctx, uint8_t* base) {
   const uint32_t device = ctx.r3.u32;
   const uint32_t surface = ctx.r4.u32;
   __imp__sub_82A3C2B8(ctx, base);
-  SetDepthStencilCommand command;
+  SetDepthStencilCommand command{};
   command.device = device;
   command.surface = CaptureSurfaceDescriptor(base, surface);
   command.trace_wrapper = surface;
@@ -3046,7 +5108,7 @@ extern "C" void sub_82A3B690(PPCContext& ctx, uint8_t* base) {
     StoreU64(base, device + 16, LoadU64(base, device + 16) | uint64_t(0x00080000));
   }
 
-  SetVertexStreamCommand command;
+  SetVertexStreamCommand command{};
   command.device = device;
   command.stream = stream;
   command.buffer = buffer;
@@ -3070,7 +5132,7 @@ extern "C" void sub_82A3B7B0(PPCContext& ctx, uint8_t* base) {
   RetireNativeBoundResource(base, device, LoadU32(base, slot));
   StoreU32(base, slot, buffer);
 
-  SetIndexBufferCommand command;
+  SetIndexBufferCommand command{};
   command.device = device;
   command.buffer = buffer;
   SubmitNativeCommand(command);
@@ -3117,6 +5179,10 @@ extern "C" void D3DResource_Release(PPCContext& ctx, uint8_t* base) {
   // retained the final shared_ptr forever, which also kept the corresponding
   // MoltenVK image and device memory alive.
   if (native_mode && resource && ctx.r3.u32 == 0) {
+    {
+      std::lock_guard lock(g_native_resource_lock_mutex);
+      g_native_resource_locks.erase(resource);
+    }
     ReleaseResourceCommand command;
     command.resource = resource;
     SubmitNativeCommand(command);
@@ -3134,8 +5200,26 @@ extern "C" void sub_82A4A3C8(PPCContext& ctx, uint8_t* base) {
     ctx.r3.u32 = 0;
     return;
   }
+  const uint32_t secondary_selector = ctx.r5.u32;
+  const uint32_t primary_base = ctx.r6.u32;
+  const uint32_t secondary_base = ctx.r7.u32;
+  const uint32_t pointer = ctx.r8.u32;
+  const uint32_t size = ctx.r9.u32;
+  const uint32_t flags = ctx.r10.u32;
+  const uint32_t range_base = secondary_selector && secondary_base ? secondary_base : primary_base;
+
+  UpdateGuestDirtyRange(base, resource, secondary_selector, primary_base, secondary_base, pointer,
+                        size, flags);
+  RecordNativeResourceLock(resource, range_base, pointer, size, flags, ctx.lr);
   UpdateResourceLockCount(base, resource, 256);
-  ctx.r3.u32 = ctx.r8.u32;
+
+  if (flags & 0x10u) {
+    const uint32_t page = std::rotl(pointer, 12) & 0xFFFu;
+    const uint32_t bank = (page + 512u) & 0x1000u;
+    ctx.r3.u32 = bank + (pointer & 0x1FFFFFFFu) - 0x40000000u;
+  } else {
+    ctx.r3.u32 = pointer;
+  }
 }
 
 extern "C" void sub_82A4A600(PPCContext& ctx, uint8_t* base) {
@@ -3149,7 +5233,9 @@ extern "C" void sub_82A4A600(PPCContext& ctx, uint8_t* base) {
     return;
   }
   const uint32_t previous = UpdateResourceLockCount(base, resource, -256);
-  if ((previous & 0xF00) == 0x100) {
+  const bool outermost = (previous & 0xF00) == 0x100;
+  const NativeResourceLockState lock_state = ConsumeNativeResourceLock(resource, outermost);
+  if (outermost) {
     if (LoadU32(base, resource + 20) != 0xFFFF0000) {
       StoreU32(base, resource + 20, 0xFFFF0000);
     }
@@ -3158,9 +5244,20 @@ extern "C" void sub_82A4A600(PPCContext& ctx, uint8_t* base) {
     }
   }
 
-  InvalidateTextureCommand command;
-  command.texture = resource;
-  SubmitNativeCommand(command);
+  if (outermost) {
+    ResourceUnlockCommand command;
+    command.resource = resource;
+    command.access = lock_state.guest_write ? ResourceUnlockAccess::kGuestWrite
+                                            : ResourceUnlockAccess::kNoDirtyUpdate;
+    command.flags = lock_state.flags;
+    command.range_offset = lock_state.minimum_offset == UINT32_MAX ? 0 : lock_state.minimum_offset;
+    command.range_length = lock_state.maximum_end >= command.range_offset
+                               ? lock_state.maximum_end - command.range_offset
+                               : 0;
+    command.lock_caller = lock_state.lock_caller;
+    command.unlock_caller = ctx.lr;
+    SubmitNativeCommand(command);
+  }
 }
 
 extern "C" void sub_828E0048(PPCContext& ctx, uint8_t* base) {
@@ -3261,7 +5358,7 @@ extern "C" void sub_82A44B78(PPCContext& ctx, uint8_t* base) {
 
   StoreU32(base, slot, texture);
   RetireNativeBoundResource(base, device, previous);
-  SetTextureCommand command;
+  SetTextureCommand command{};
   command.device = device;
   command.stage = stage;
   command.texture = texture;
@@ -3341,7 +5438,7 @@ extern "C" void sub_82A42930(PPCContext& ctx, uint8_t* base) {
 
   SubmitNativeVertexDeclaration(base, device, declaration);
 
-  SetVertexDeclarationCommand command;
+  SetVertexDeclarationCommand command{};
   command.device = device;
   command.declaration = declaration;
   SubmitNativeCommand(command);
@@ -3359,7 +5456,7 @@ extern "C" void sub_82A3A890(PPCContext& ctx, uint8_t* base) {
   StoreU64(base, device + 16, LoadU64(base, device + 16) | uint64_t(0x4000000000));
 
   SubmitNativeVertexDeclaration(base, device, declaration);
-  SetVertexDeclarationCommand command;
+  SetVertexDeclarationCommand command{};
   command.device = device;
   command.declaration = declaration;
   SubmitNativeCommand(command);
@@ -3437,8 +5534,9 @@ extern "C" void sub_82A3DF50(PPCContext& ctx, uint8_t* base) {
     return;
   }
 
-  DrawPrimitiveUpCommand command;
+  DrawPrimitiveUpCommand command{};
   command.device = device;
+  ApplyDrawLightingContext(command, GetNativeLightingContext());
   command.primitive_type = g_pending_draw_primitive_up.primitive_type;
   command.vertex_count = g_pending_draw_primitive_up.vertex_count;
   command.stride = g_pending_draw_primitive_up.stride;
@@ -3470,8 +5568,9 @@ extern "C" void sub_82A3DF60(PPCContext& ctx, uint8_t* base) {
   }
 
   const uint32_t device = ctx.r3.u32;
-  DrawPrimitiveCommand command;
+  DrawPrimitiveCommand command{};
   command.device = device;
+  ApplyDrawLightingContext(command, GetNativeLightingContext());
   command.primitive_type = ctx.r4.u32;
   command.start_vertex = ctx.r5.u32;
   command.vertex_count = ctx.r6.u32;
@@ -3490,7 +5589,7 @@ void SubmitNativeResolve(uint8_t* base, uint32_t device, uint32_t flags,
     return;
   }
 
-  ResolveCommand command;
+  ResolveCommand command{};
   command.device = device;
   command.flags = flags;
   const uint32_t source_index = flags & 7;
@@ -3552,13 +5651,13 @@ void SubmitNativeResolve(uint8_t* base, uint32_t device, uint32_t flags,
       command.clear_color_bits[index] = clear_color_bits[index];
     }
   } else {
-    command.clear_color_bits[0] = std::bit_cast<uint32_t>(1.0f);
-    command.clear_color_bits[1] = std::bit_cast<uint32_t>(1.0f);
-    command.clear_color_bits[2] = std::bit_cast<uint32_t>(1.0f);
-    command.clear_color_bits[3] = std::bit_cast<uint32_t>(1.0f);
+    // sub_82A3CC68 loads the same float into all four lanes at 0x82A3CCF8.
+    std::fill(std::begin(command.clear_color_bits), std::end(command.clear_color_bits),
+              LoadU32(base, kRetailNullClearColorGlobal));
   }
   command.clear_depth_bits = std::bit_cast<uint64_t>(clear_depth);
   command.clear_stencil = clear_stencil;
+  command.parameters_valid = parameters != 0;
   if (parameters) {
     command.color_format = LoadU32(base, parameters);
     command.color_exp_bias = int32_t(LoadU32(base, parameters + 4));
@@ -3681,6 +5780,12 @@ extern "C" void sub_824F4730(PPCContext& ctx, uint8_t* base) {
   }
 
   const uint32_t mode = ctx.r3.u32;
+  const uint32_t setup_caller = ctx.lr;
+  static std::atomic<uint64_t> alias_trace_setup_count{0};
+  const uint64_t alias_trace_setup =
+      IsNativeLightProvenanceTraceEnabled()
+          ? alias_trace_setup_count.fetch_add(1, std::memory_order_relaxed) + 1
+          : 0;
   const uint32_t requested_width = ctx.r4.u32;
   const uint32_t requested_height = ctx.r5.u32;
   const NativeResolutionOverride resolution =
@@ -3703,13 +5808,16 @@ extern "C" void sub_824F4730(PPCContext& ctx, uint8_t* base) {
   g_native_deferred_target_width = previous_target_width;
   g_native_deferred_target_height = previous_target_height;
 
+  TraceNativePackedDepthAliasSetup(base, alias_trace_setup, "before-native-resize", setup_caller,
+                                  mode, resolution.width, resolution.height);
   StoreU32(base, kDeferredWidthGlobal, resolution.width);
   StoreU32(base, kDeferredHeightGlobal, resolution.height);
 
   uint32_t patched_full_size_wrappers = 0;
   for (uint32_t wrapper_global : kDeferredFullSizeWrapperGlobals) {
     const uint32_t wrapper = LoadU32(base, wrapper_global);
-    if (PatchDeferredWrapperDimensions(base, wrapper, resolution.width, resolution.height)) {
+    if (PatchDeferredWrapperDimensions(base, wrapper, resolution.width, resolution.height,
+                                       ctx.lr)) {
       ++patched_full_size_wrappers;
     }
   }
@@ -3717,8 +5825,20 @@ extern "C" void sub_824F4730(PPCContext& ctx, uint8_t* base) {
   const uint32_t hiz_width = (resolution.width + 1) / 2;
   const uint32_t hiz_height = (resolution.height + 1) / 2;
   const uint32_t hiz_wrapper = LoadU32(base, kDeferredHizRestoreWrapperGlobal);
-  const bool patched_hiz = PatchDeferredWrapperDimensions(base, hiz_wrapper, hiz_width, hiz_height);
+  const bool patched_hiz =
+      PatchDeferredWrapperDimensions(base, hiz_wrapper, hiz_width, hiz_height, ctx.lr);
 
+  const bool patched_gbuffer_alias = PatchNativePackedDepthAlias(
+      base, 0x83016B50, LoadU32(base, 0x83016B30), setup_caller);
+  // sub_828D9260(0) returns factory+64: a different RT wrapper from GBufferZ.
+  const uint32_t target_factory = LoadU32(base, 0x831C2DA8);
+  const bool patched_custom_alias = target_factory && PatchNativePackedDepthAlias(
+      base, 0x83016B54, LoadU32(base, target_factory + 64), setup_caller);
+  REXLOG_INFO("gta4-native-resolution: packed-depth-aliases gbuffer={} custom={}",
+              patched_gbuffer_alias, patched_custom_alias);
+
+  TraceNativePackedDepthAliasSetup(base, alias_trace_setup, "after-native-resize", setup_caller,
+                                  mode, resolution.width, resolution.height);
   static std::atomic<uint64_t> override_count{0};
   const uint64_t override_index = NextNativeHookDiagnosticCall(override_count);
   if (ShouldLogNativeHookCall(override_index)) {
@@ -3807,16 +5927,15 @@ extern "C" void sub_828DC7F0(PPCContext& ctx, uint8_t* base) {
     __imp__sub_828DC7F0(ctx, base);
     const uint32_t wrapper = ctx.r3.u32;
     if (wrapper) {
+      const bool registered = RegisterNativeRenderTargetWrapper(base, wrapper, requested_width,
+                                                                requested_height, ctx.lr);
       REXLOG_INFO(
           "gta4-native-architecture: point=title-target-created name={:08X} "
           "wrapper={:08X} surface={:08X} texture={:08X} requested={}x{} "
-          "physical={}x{} logical={}x{}",
+          "physical={}x{} domain=logical registered={}",
           name, wrapper, LoadU32(base, wrapper + kDeferredWrapperSurfaceOffset),
           LoadU32(base, wrapper + kDeferredWrapperTextureOffset), requested_width, requested_height,
-          LoadU16(base, wrapper + kDeferredWrapperPhysicalWidthOffset),
-          LoadU16(base, wrapper + kDeferredWrapperPhysicalHeightOffset),
-          LoadU16(base, wrapper + kDeferredWrapperLogicalWidthOffset),
-          LoadU16(base, wrapper + kDeferredWrapperLogicalHeightOffset));
+          requested_width, requested_height, registered);
     }
     return;
   }
@@ -3909,6 +6028,8 @@ extern "C" void sub_822D1710(PPCContext& ctx, uint8_t* base) {
   const uint32_t caller = ctx.lr;
 
   SubmitEnvironmentalData(base, device, postfx);
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x822D1710, RenderExecutionStage::kCompositePostFx, LightPassRole::kNone);
   ScopedRenderPhaseMarker phase_scope(device, RenderPhase::kCompositePostFx, postfx, caller);
 
   __imp__sub_822D1710(ctx, base);
@@ -3923,6 +6044,8 @@ extern "C" void sub_821BD0A0(PPCContext& ctx, uint8_t* base) {
   const uint32_t radar_map_section = ctx.r3.u32;
   const uint32_t caller = ctx.lr;
   const uint32_t device = LoadU32(base, kDeferredDeviceGlobal);
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x821BD0A0, RenderExecutionStage::kRadarMap, LightPassRole::kNone);
   ScopedRenderPhaseMarker phase_scope(device, RenderPhase::kRadarMap, radar_map_section, caller);
   __imp__sub_821BD0A0(ctx, base);
 }
@@ -3936,6 +6059,8 @@ extern "C" void sub_8267D528(PPCContext& ctx, uint8_t* base) {
   const uint32_t phase_object = ctx.r3.u32;
   const uint32_t caller = ctx.lr;
   const uint32_t device = LoadU32(base, kDeferredDeviceGlobal);
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x8267D528, RenderExecutionStage::kSceneToGBuffer, LightPassRole::kNone);
   ScopedRenderPhaseMarker phase_scope(device, RenderPhase::kSceneToGBuffer, phase_object, caller);
   __imp__sub_8267D528(ctx, base);
 }
@@ -3949,8 +6074,247 @@ extern "C" void sub_8267D750(PPCContext& ctx, uint8_t* base) {
   const uint32_t phase_object = ctx.r3.u32;
   const uint32_t caller = ctx.lr;
   const uint32_t device = LoadU32(base, kDeferredDeviceGlobal);
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x8267D750, RenderExecutionStage::kDeferredLighting, LightPassRole::kNone);
   ScopedRenderPhaseMarker phase_scope(device, RenderPhase::kLightsToScreen, phase_object, caller);
   __imp__sub_8267D750(ctx, base);
+}
+
+extern "C" void sub_822077D8(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeLightProvenanceTraceEnabled()) {
+    __imp__sub_822077D8(ctx, base);
+    return;
+  }
+  ScopedNativeWorldLightProducerTrace producer_scope(ctx);
+  __imp__sub_822077D8(ctx, base);
+}
+
+extern "C" void sub_822AC8D0(PPCContext& ctx, uint8_t* base) {
+  const bool trace = IsNativeLightProvenanceTraceEnabled();
+  const uint32_t caller = uint32_t(ctx.lr);
+  const uint32_t destination = ctx.r3.u32;
+  const uint32_t candidate = ctx.r4.u32;
+  __imp__sub_822AC8D0(ctx, base);
+  if (trace) {
+    TraceNativePrimaryLightAdmission(base, caller, destination, candidate);
+  }
+}
+
+extern "C" void sub_822B2B50(PPCContext& ctx, uint8_t* base) {
+  ScopedNativeLightSubmissionTrace submission_scope(base, ctx);
+  bool apartment_bulb_x890 = false;
+  const uint32_t position_pointer = ctx.r8.u32;
+  if (IsNativeMode() && position_pointer) {
+    const std::array<uint32_t, 3> position_bits = {LoadU32(base, position_pointer),
+                                                   LoadU32(base, position_pointer + 4),
+                                                   LoadU32(base, position_pointer + 8)};
+    apartment_bulb_x890 = position_bits[0] == 0x445EA085u && position_bits[1] == 0xC3F92482u &&
+                          position_bits[2] == 0x41A8A5E7u;
+  }
+  if (IsNativeMode() && IsNativeLightTraceEnabled()) {
+    TraceNativeApartmentBulbSource(base, ctx);
+  }
+  if (apartment_bulb_x890 && REXCVAR_GET(gta4_native_light_clear_x890_filler_flag) &&
+      (ctx.r5.u32 & 0x10u)) {
+    const uint32_t original_flags = ctx.r5.u32;
+    ctx.r5.u32 &= ~0x10u;
+    REXLOG_INFO(
+        "gta4-native-light-source: point=filler-flag-override bulb=bulb-x890 "
+        "instance=445EA085 owner={:08X} original={:08X} effective={:08X}",
+        ctx.r3.u32, original_flags, ctx.r5.u32);
+  }
+  __imp__sub_822B2B50(ctx, base);
+  submission_scope.TraceNoPrimaryCopy(base);
+}
+
+extern "C" void sub_821671F8(PPCContext& ctx, uint8_t* base) {
+  const bool trace = IsNativeMode() && IsNativeLightTraceEnabled();
+  const uint32_t caller = uint32_t(ctx.lr);
+  const uint32_t destination = ctx.r3.u32;
+  const uint32_t light_type = ctx.r4.u32;
+  const uint32_t flags = ctx.r5.u32;
+  // sub_821671F8 copies r6/r7/r8/r9 to record offsets 0/16/32/48.
+  // sub_822AF3D0/sub_824F5D60 consume those slots as direction, tangent,
+  // world position, and RGB respectively; intensity is the separate f1 value.
+  const uint32_t direction_pointer = ctx.r6.u32;
+  const uint32_t tangent_pointer = ctx.r7.u32;
+  const uint32_t position_pointer = ctx.r8.u32;
+  const uint32_t color_pointer = ctx.r9.u32;
+  const std::array<uint32_t, 10> preserved_registers = {
+      ctx.r22.u32, ctx.r23.u32, ctx.r24.u32, ctx.r25.u32, ctx.r26.u32,
+      ctx.r27.u32, ctx.r28.u32, ctx.r29.u32, ctx.r30.u32, ctx.r31.u32,
+  };
+  __imp__sub_821671F8(ctx, base);
+  if (trace) {
+    TraceNativeApartmentBulbConstruction(base, caller, destination, light_type, flags,
+                                         position_pointer, direction_pointer, tangent_pointer,
+                                         color_pointer, preserved_registers);
+  }
+}
+
+extern "C" void sub_822072D0(PPCContext& ctx, uint8_t* base) {
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x822072D0, RenderExecutionStage::kDeferredLighting, LightPassRole::kCorona,
+      LightSourceKind::kEffectBatch);
+  ScopedNativeLocalLightLoop trace(NativeLocalLightLoopKind::kCorona, ctx, base);
+  __imp__sub_822072D0(ctx, base);
+}
+
+extern "C" void sub_822B0B90(PPCContext& ctx, uint8_t* base) {
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x822B0B90, RenderExecutionStage::kDeferredLighting, LightPassRole::kNone);
+  ScopedNativeLocalLightLoop trace(NativeLocalLightLoopKind::kTypeThree, ctx, base);
+  __imp__sub_822B0B90(ctx, base);
+}
+
+extern "C" void sub_822B0F08(PPCContext& ctx, uint8_t* base) {
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x822B0F08, RenderExecutionStage::kDeferredLighting, LightPassRole::kNone);
+  ScopedNativeLocalLightLoop trace(NativeLocalLightLoopKind::kPointSpot, ctx, base);
+  __imp__sub_822B0F08(ctx, base);
+}
+
+extern "C" void sub_822B4640(PPCContext& ctx, uint8_t* base) {
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x822B4640, RenderExecutionStage::kDeferredLighting, LightPassRole::kNone);
+  ScopedNativeLocalLightLoop trace(NativeLocalLightLoopKind::kShaft, ctx, base);
+  __imp__sub_822B4640(ctx, base);
+}
+
+extern "C" void sub_8234A600(PPCContext& ctx, uint8_t* base) {
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x8234A600, RenderExecutionStage::kDeferredLighting, LightPassRole::kWaterFx,
+      LightSourceKind::kEffectBatch);
+  ScopedNativeLocalLightLoop trace(NativeLocalLightLoopKind::kWaterFx, ctx, base);
+  __imp__sub_8234A600(ctx, base);
+}
+
+extern "C" void sub_824F7328(PPCContext& ctx, uint8_t* base) {
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x824F7328, RenderExecutionStage::kDeferredLighting, LightPassRole::kDepthCopy);
+  ScopedNativeLocalLightLoop trace(NativeLocalLightLoopKind::kGlobalStencil, ctx, base);
+  __imp__sub_824F7328(ctx, base);
+}
+
+extern "C" void sub_827A9A20(PPCContext& ctx, uint8_t* base) {
+  const bool trace = IsNativeMode() && IsNativeLightLoopTraceEnabled();
+  const uint32_t caller = uint32_t(ctx.lr);
+  __imp__sub_827A9A20(ctx, base);
+  if (trace && !ctx.r3.u32) {
+    // 0x822B104C stores the optional cookie in r18 and continues at 0x822B1058.
+    // This result does not reject the local-light record.
+    const NativeLocalLightTechniqueSite site = ResolveNativeLocalLightBranchSite(base, ctx, caller);
+    if (site.kind != NativeLocalLightLoopKind::kNone && site.instance) {
+      if (auto* frame = FindNativeLocalLightLoopFrame(site.kind)) {
+        ++frame->cookie_fallbacks;
+      }
+      REXLOG_INFO(
+          "gta4-native-local-light: point=branch frame={} loop={} instance={:08X} "
+          "caller={:08X} result=cookie-unavailable-fallback",
+          GetNativeLightSubmittedFrame(base), NativeLocalLightLoopName(site.kind), site.instance,
+          caller);
+    }
+  }
+}
+
+extern "C" void sub_828BD310(PPCContext& ctx, uint8_t* base) {
+  const bool trace = IsNativeMode() && IsNativeLightLoopTraceEnabled();
+  const uint32_t caller = uint32_t(ctx.lr);
+  __imp__sub_828BD310(ctx, base);
+  if (trace && !ctx.r3.u32) {
+    MarkNativeLocalLightBranch(base, ctx, caller, NativeLocalLightOutcome::kVisibilityRejected,
+                               "visibility-rejected");
+  }
+}
+
+extern "C" void sub_82271FF8(PPCContext& ctx, uint8_t* base) {
+  const bool trace = IsNativeMode() && IsNativeLightLoopTraceEnabled();
+  const uint32_t caller = uint32_t(ctx.lr);
+  __imp__sub_82271FF8(ctx, base);
+  if (trace && ctx.r3.s32 == -1) {
+    TraceNativeLocalLightShadowUnavailable(base, ctx, caller);
+  }
+}
+
+extern "C" void sub_824F6208(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_824F6208(ctx, base);
+    return;
+  }
+  if (IsNativeLightTraceEnabled()) {
+    TraceNativeApartmentBulbClassifier(base, ctx);
+    TraceNativeLocalLightTechniqueBegin(base, ctx);
+  }
+  BeginNativeLightingSelector(CaptureNativeLightingSelection(base, ctx));
+  ScopedNativeDeferredSelectorTrace selector_trace;
+  __imp__sub_824F6208(ctx, base);
+}
+
+extern "C" void sub_824F6478(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_824F6478(ctx, base);
+    return;
+  }
+
+  const uint32_t caller = uint32_t(ctx.lr);
+  __imp__sub_824F6478(ctx, base);
+  EndNativeLightingSelector();
+  if (IsNativeLightTraceEnabled()) {
+    TraceNativeLocalLightTechniqueEnd(base, caller);
+  }
+}
+
+extern "C" void sub_821BC690(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_821BC690(ctx, base);
+    return;
+  }
+
+  const uint32_t light = ctx.r3.u32;
+  const uint32_t instance = light;
+  const uint32_t caller = uint32_t(ctx.lr);
+  const uint32_t device = LoadU32(base, kDeferredDeviceGlobal);
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x821BC690, RenderExecutionStage::kDeferredLighting,
+      LightPassRole::kGlobalParameterUpload, LightSourceKind::kGlobalCommand, light);
+  TraceNativeTitleLightSetup(base, light, caller, device);
+  if (const uint64_t record = AcquireNativeLightTraceRecord(); record) {
+    REXLOG_INFO(
+        "gta4-native-light-trace: record={} point=title-setup instance={:08X} object={:08X} "
+        "caller={:08X} device={:08X} technique={:08X} flags={:08X} radius-bits={:08X} "
+        "intensity-bits={:08X} data0={:08X} data1={:08X} data2={:08X} data3={:08X}",
+        record, instance, light, caller, device, LoadU32(base, light + 80),
+        LoadU32(base, light + 96), LoadU32(base, light + 84), LoadU32(base, light + 88),
+        LoadU32(base, light + 16), LoadU32(base, light + 32), LoadU32(base, light + 48),
+        LoadU32(base, light + 64));
+  }
+  __imp__sub_821BC690(ctx, base);
+}
+
+extern "C" void sub_821BC5B0(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_821BC5B0(ctx, base);
+    return;
+  }
+
+  const uint32_t light = ctx.r3.u32;
+  const uint32_t instance = light;
+  const uint32_t caller = uint32_t(ctx.lr);
+  const uint32_t device = LoadU32(base, kDeferredDeviceGlobal);
+  ScopedNativeLightingExecution lighting_scope(
+      base, 0x821BC5B0, RenderExecutionStage::kDeferredLighting,
+      LightPassRole::kGlobalContribution, LightSourceKind::kGlobalCommand, light);
+  TraceNativeTitleLightDraw(base, light, caller, device);
+  if (const uint64_t record = AcquireNativeLightTraceRecord(); record) {
+    REXLOG_INFO(
+        "gta4-native-light-trace: record={} point=title-draw instance={:08X} object={:08X} "
+        "caller={:08X} device={:08X} setup={:08X} technique={:08X} data0={:08X} "
+        "data1={:08X} data2={:08X} data3={:08X}",
+        record, instance, light, caller, device, LoadU32(base, light + 24),
+        LoadU32(base, light + 28), LoadU32(base, light + 8), LoadU32(base, light + 12),
+        LoadU32(base, light + 16), LoadU32(base, light + 20));
+  }
+  __imp__sub_821BC5B0(ctx, base);
 }
 
 extern "C" void sub_82A3E910(PPCContext& ctx, uint8_t* base) {
@@ -4109,7 +6473,7 @@ extern "C" void sub_824F6AF0(PPCContext& ctx, uint8_t* base) {
   SubmitNativeResolve(base, device, 274, &full_rectangle, third_output, &origin, 0, 0,
                       clear_color_bits, 0.0, 0, 0, 3, uint32_t(ctx.lr), outputs[2]);
 
-  DepthSurfaceHandoffCommand depth_handoff;
+  DepthSurfaceHandoffCommand depth_handoff{};
   depth_handoff.device = device;
   depth_handoff.source = CaptureSurfaceDescriptor(base, deferred_depth_surface);
   depth_handoff.destination = CaptureSurfaceDescriptor(base, primary_depth_surface);
@@ -4117,6 +6481,9 @@ extern "C" void sub_824F6AF0(PPCContext& ctx, uint8_t* base) {
   depth_handoff.destination_wrapper = primary_depth_surface;
   depth_handoff.source_texture = depth_output;
   depth_handoff.trace_caller = uint32_t(ctx.lr);
+  // Replace the scene depth-copy alias contract explicitly: PS_depthCopy0
+  // generates forward coverage from packed depth, never last frame's UI mask.
+  depth_handoff.stencil_policy = ForwardStencilHandoffPolicy::kRebuildSceneCoverage;
   if (!SubmitNativeCommand(depth_handoff)) {
     REXLOG_ERROR(
         "gta4-native-cause: point=explicit-depth-handoff-submit result=rejected "
@@ -4155,6 +6522,23 @@ extern "C" void sub_82A3CC68(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode()) {
     __imp__sub_82A3CC68(ctx, base);
     return;
+  }
+
+  if (g_tv_final_path_active) {
+    ++g_tv_final_resolve_count;
+  }
+  if (g_tv_watching.load(std::memory_order_relaxed) && ctx.lr == kScriptRtResolveCaller &&
+      ConsumeTvEventTraceBudget()) {
+    REXLOG_INFO(
+        "gta4-tv-script-rt-resolve: session={} final={} movie={} rect={} bink={}:{} "
+        "caller={:08X} device={:08X} flags={:08X} source-rect={:08X} "
+        "destination={:08X} point={:08X} level={} slice={}",
+        g_tv_session_id.load(std::memory_order_relaxed), g_tv_final_sequence,
+        g_tv_last_movie_sequence.load(std::memory_order_relaxed),
+        g_tv_last_rect_sequence.load(std::memory_order_relaxed),
+        g_tv_last_bink_sequence.load(std::memory_order_relaxed),
+        g_tv_last_bink_result.load(std::memory_order_relaxed), uint32_t(ctx.lr), ctx.r3.u32,
+        ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32);
   }
 
   static std::atomic<uint64_t> call_count{0};
@@ -4333,8 +6717,9 @@ extern "C" void sub_82A3E348(PPCContext& ctx, uint8_t* base) {
   }
 
   const uint32_t device = ctx.r3.u32;
-  DrawIndexedPrimitiveCommand command;
+  DrawIndexedPrimitiveCommand command{};
   command.device = device;
+  ApplyDrawLightingContext(command, GetNativeLightingContext());
   command.primitive_type = ctx.r4.u32;
   command.base_vertex = ctx.r5.s32;
   command.start_index = ctx.r6.u32;
@@ -4456,7 +6841,7 @@ extern "C" void sub_82A457B0(PPCContext& ctx, uint8_t* base) {
     return;
   }
 
-  ClearCommand command;
+  ClearCommand command{};
   command.device = device;
   command.flags = flags;
   command.left = left;
@@ -4467,6 +6852,10 @@ extern "C" void sub_82A457B0(PPCContext& ctx, uint8_t* base) {
     for (uint32_t index = 0; index < 4; ++index) {
       command.color_bits[index] = LoadU32(base, color + index * sizeof(uint32_t));
     }
+  } else {
+    // generated .81:16055 loads 0x82000A34 into every lane; retail is +0.0.
+    std::fill(std::begin(command.color_bits), std::end(command.color_bits),
+              LoadU32(base, kRetailNullClearColorGlobal));
   }
   command.depth_bits = std::bit_cast<uint64_t>(ctx.f1.f64);
   command.stencil = ctx.r8.u32;
@@ -4493,6 +6882,200 @@ extern "C" void sub_82A46DA0(PPCContext& ctx, uint8_t* base) {
   StoreU32(base, device + 22280, behavior);
 }
 
+extern "C" void sub_8247BD88(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_8247BD88(ctx, base);
+    return;
+  }
+
+  const bool watching = g_tv_watching.load(std::memory_order_relaxed);
+  const uint32_t script_context = ctx.r3.u32;
+  const uint32_t arguments = script_context ? LoadU32(base, script_context + 8) : 0;
+  std::array<uint32_t, 8> raw{};
+  if (arguments) {
+    for (uint32_t index = 0; index < raw.size(); ++index) {
+      raw[index] = LoadU32(base, arguments + index * sizeof(uint32_t));
+    }
+  }
+  const uint64_t sequence =
+      watching ? g_tv_script_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+  if (watching) {
+    g_tv_last_rect_sequence.store(sequence, std::memory_order_relaxed);
+  }
+
+  __imp__sub_8247BD88(ctx, base);
+
+  if (watching && ConsumeTvEventTraceBudget()) {
+    REXLOG_INFO(
+        "gta4-tv-script-background: session={} sequence={} caller={:08X} "
+        "context={:08X} arguments={:08X} rect-bits={:08X},{:08X},{:08X},{:08X} "
+        "rgba={:08X},{:08X},{:08X},{:08X}",
+        g_tv_session_id.load(std::memory_order_relaxed), sequence, uint32_t(ctx.lr), script_context,
+        arguments, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+  }
+}
+
+extern "C" void sub_8247BED8(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_8247BED8(ctx, base);
+    return;
+  }
+
+  const bool watching = g_tv_watching.load(std::memory_order_relaxed);
+  const uint32_t script_context = ctx.r3.u32;
+  const uint32_t arguments = script_context ? LoadU32(base, script_context + 8) : 0;
+  std::array<uint32_t, 9> raw{};
+  if (arguments) {
+    for (uint32_t index = 0; index < raw.size(); ++index) {
+      raw[index] = LoadU32(base, arguments + index * sizeof(uint32_t));
+    }
+  }
+  const uint64_t sequence =
+      watching ? g_tv_script_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+  if (watching) {
+    g_tv_last_movie_sequence.store(sequence, std::memory_order_relaxed);
+  }
+
+  __imp__sub_8247BED8(ctx, base);
+
+  if (watching && ConsumeTvEventTraceBudget()) {
+    REXLOG_INFO(
+        "gta4-tv-script-draw: session={} sequence={} caller={:08X} context={:08X} "
+        "arguments={:08X} rect-rotation-bits={:08X},{:08X},{:08X},{:08X},{:08X} "
+        "rgba={:08X},{:08X},{:08X},{:08X}",
+        g_tv_session_id.load(std::memory_order_relaxed), sequence, uint32_t(ctx.lr), script_context,
+        arguments, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8]);
+  }
+}
+
+extern "C" void sub_827BB138(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_827BB138(ctx, base);
+    return;
+  }
+
+  const bool watching = g_tv_watching.load(std::memory_order_relaxed);
+  const uint32_t player = ctx.r3.u32;
+  const uint32_t decoder = player ? LoadU32(base, player) : 0;
+  const uint32_t frame_table = player ? LoadU32(base, player + 8) : 0;
+  const uint32_t draw_parameters = player ? LoadU32(base, player + 104) : 0;
+  const uint32_t plane_y = player ? LoadU32(base, player + 108) : 0;
+  const uint32_t plane_cr = player ? LoadU32(base, player + 112) : 0;
+  const uint32_t plane_cb = player ? LoadU32(base, player + 116) : 0;
+  const uint32_t plane_a = player ? LoadU32(base, player + 120) : 0;
+  const uint32_t state_96 = player ? LoadU8(base, player + 96) : 0;
+  const uint32_t state_97 = player ? LoadU8(base, player + 97) : 0;
+  const uint32_t state_98 = player ? LoadU8(base, player + 98) : 0;
+  const uint32_t state_99 = player ? LoadU8(base, player + 99) : 0;
+  const uint32_t state_100 = player ? LoadU8(base, player + 100) : 0;
+  const uint64_t sequence =
+      watching ? g_tv_script_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+
+  __imp__sub_827BB138(ctx, base);
+
+  const uint32_t result = ctx.r3.u32;
+  if (watching) {
+    g_tv_last_bink_sequence.store(sequence, std::memory_order_relaxed);
+    g_tv_last_bink_result.store(result, std::memory_order_relaxed);
+  }
+  if (watching && ConsumeTvEventTraceBudget()) {
+    const char* reason = result       ? "submitted"
+                         : !player    ? "no-player"
+                         : !decoder   ? "no-decoder"
+                         : !state_100 ? "not-ready"
+                                      : "resource-unavailable";
+    REXLOG_INFO(
+        "gta4-tv-bink-draw-result: session={} sequence={} movie={} caller={:08X} "
+        "player={:08X} decoder={:08X} frame-table={:08X} parameters={:08X} "
+        "state={},{},{},{},{} planes={:08X},{:08X},{:08X},{:08X} "
+        "result={} reason={}",
+        g_tv_session_id.load(std::memory_order_relaxed), sequence,
+        g_tv_last_movie_sequence.load(std::memory_order_relaxed), uint32_t(ctx.lr), player, decoder,
+        frame_table, draw_parameters, state_96, state_97, state_98, state_99, state_100, plane_y,
+        plane_cr, plane_cb, plane_a, result, reason);
+  }
+}
+
+extern "C" void sub_828C15C8(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_828C15C8(ctx, base);
+    return;
+  }
+
+  const bool watching = g_tv_watching.load(std::memory_order_relaxed);
+  const uint32_t fade = ctx.r3.u32;
+  const uint32_t fade_amount_bits = fade ? LoadU32(base, fade) : 0;
+  const uint32_t fade_color = fade ? LoadU32(base, fade + 8) : 0;
+  const uint32_t fade_flags = fade ? LoadU32(base, fade + 12) : 0;
+  const bool previous_active = g_tv_final_path_active;
+  const uint32_t previous_resolve_count = g_tv_final_resolve_count;
+  const uint64_t previous_sequence = g_tv_final_sequence;
+  const uint64_t sequence =
+      watching ? g_tv_script_event_sequence.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+  g_tv_final_path_active = watching;
+  g_tv_final_resolve_count = 0;
+  g_tv_final_sequence = sequence;
+
+  __imp__sub_828C15C8(ctx, base);
+
+  const uint32_t resolve_count = g_tv_final_resolve_count;
+  if (watching && ConsumeTvEventTraceBudget()) {
+    const char* path = !resolve_count ? "direct-present"
+                       : fade         ? "fade-resolve"
+                                      : "ordinary-resolve";
+    REXLOG_INFO(
+        "gta4-tv-final-path: session={} sequence={} movie={} rect={} bink={}:{} "
+        "caller={:08X} fade={:08X} fade-amount-bits={:08X} "
+        "fade-color={:08X} fade-flags={:08X} resolves={} path={}",
+        g_tv_session_id.load(std::memory_order_relaxed), sequence,
+        g_tv_last_movie_sequence.load(std::memory_order_relaxed),
+        g_tv_last_rect_sequence.load(std::memory_order_relaxed),
+        g_tv_last_bink_sequence.load(std::memory_order_relaxed),
+        g_tv_last_bink_result.load(std::memory_order_relaxed), uint32_t(ctx.lr), fade,
+        fade_amount_bits, fade_color, fade_flags, resolve_count, path);
+  }
+
+  g_tv_final_path_active = previous_active;
+  g_tv_final_resolve_count = previous_resolve_count;
+  g_tv_final_sequence = previous_sequence;
+}
+
+extern "C" void sub_826273A0(PPCContext& ctx, uint8_t* base) {
+  if (!IsNativeMode()) {
+    __imp__sub_826273A0(ctx, base);
+    return;
+  }
+
+  // Complete retail behavior: this function is exactly the one-byte commit
+  // used by MUTE_GAMEWORLD_AND_POSITIONED_RADIO_FOR_TV.
+  const bool watching = ctx.r4.u8 != 0;
+  StoreU8(base, kTvMuteGlobal, ctx.r4.u8);
+
+  const bool was_watching = g_tv_watching.exchange(watching, std::memory_order_relaxed);
+  if (watching == was_watching) {
+    return;
+  }
+  if (watching) {
+    const uint64_t session = g_tv_session_id.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_tv_trace_present_remaining.store(kTvTracePresentBudget, std::memory_order_relaxed);
+    g_tv_trace_event_remaining.store(kTvTraceEventBudget, std::memory_order_relaxed);
+    g_tv_last_movie_sequence.store(0, std::memory_order_relaxed);
+    g_tv_last_rect_sequence.store(0, std::memory_order_relaxed);
+    g_tv_last_bink_sequence.store(0, std::memory_order_relaxed);
+    g_tv_last_bink_result.store(0, std::memory_order_relaxed);
+    REXLOG_INFO(
+        "gta4-tv-session: event=begin session={} guest-global={:08X} "
+        "present-budget={} event-budget={}",
+        session, kTvMuteGlobal, kTvTracePresentBudget, kTvTraceEventBudget);
+  } else {
+    const uint64_t session = g_tv_session_id.load(std::memory_order_relaxed);
+    g_tv_trace_present_remaining.store(0, std::memory_order_relaxed);
+    g_tv_trace_event_remaining.store(0, std::memory_order_relaxed);
+    REXLOG_INFO("gta4-tv-session: event=end session={} guest-global={:08X}", session,
+                kTvMuteGlobal);
+  }
+}
+
 extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode()) {
     __imp__sub_82A467D8(ctx, base);
@@ -4514,6 +7097,38 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
           LoadU32(base, command.frontbuffer_texture + 28 + index * sizeof(uint32_t));
     }
   }
+  command.diagnostic_present_id = g_tv_present_id.fetch_add(1, std::memory_order_relaxed) + 1;
+  command.diagnostic_tv_session_id = g_tv_session_id.load(std::memory_order_relaxed);
+  command.diagnostic_tv_final_sequence = g_tv_final_sequence;
+  command.diagnostic_tv_movie_sequence = g_tv_last_movie_sequence.load(std::memory_order_relaxed);
+  command.diagnostic_tv_rect_sequence = g_tv_last_rect_sequence.load(std::memory_order_relaxed);
+  command.diagnostic_tv_bink_sequence = g_tv_last_bink_sequence.load(std::memory_order_relaxed);
+  command.diagnostic_tv_bink_result = g_tv_last_bink_result.load(std::memory_order_relaxed);
+  command.diagnostic_guest_caller = ctx.lr;
+  command.diagnostic_origin = ctx.lr == kMainPresentCaller     ? 1
+                              : ctx.lr == kWorkerPresentCaller ? 2
+                                                               : 0;
+  command.diagnostic_persisted_texture = device + kPersistedPresentTextureOffset;
+  for (uint32_t index = 0; index < std::size(command.diagnostic_persisted_fetch); ++index) {
+    command.diagnostic_persisted_fetch[index] =
+        LoadU32(base, command.diagnostic_persisted_texture + 28 + index * sizeof(uint32_t));
+  }
+  if (command.frontbuffer_texture) {
+    command.diagnostic_requested_descriptor_hash =
+        XXH3_64bits(GuestPointer(base, command.frontbuffer_texture), kPresentDescriptorSize);
+  }
+  command.diagnostic_persisted_descriptor_hash =
+      XXH3_64bits(GuestPointer(base, command.diagnostic_persisted_texture), kPresentDescriptorSize);
+  command.diagnostic_descriptor_equal =
+      command.frontbuffer_texture != 0 &&
+      std::memcmp(GuestPointer(base, command.frontbuffer_texture),
+                  GuestPointer(base, command.diagnostic_persisted_texture),
+                  kPresentDescriptorSize) == 0;
+  command.diagnostic_device_flag_10941 = LoadU8(base, device + kPresentFlag10941Offset);
+  command.diagnostic_device_flag_10942 = LoadU8(base, device + kPresentFlag10942Offset);
+  command.diagnostic_trace =
+      g_tv_watching.load(std::memory_order_relaxed) && ConsumeTvPresentTraceBudget();
+  command.diagnostic_force_content_probe = command.diagnostic_trace;
   {
     std::lock_guard lock(g_native_resolution_mutex);
     command.width = g_native_resolution.render_width;
@@ -4522,9 +7137,42 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
     command.display_height = g_native_resolution.display_height;
   }
   command.submitted_frame = submitted_frame;
+  if (const uint64_t dropped = GetNativeLightTraceDroppedRecords(); dropped) {
+    static std::atomic<uint64_t> last_reported_drops{0};
+    if (last_reported_drops.exchange(dropped, std::memory_order_relaxed) != dropped) {
+      REXLOG_WARN(
+          "gta4-native-light-trace: point=frame-completion frame={} dropped={} "
+          "capture-complete=0",
+          submitted_frame, dropped);
+    }
+  }
+  if (command.diagnostic_trace) {
+    const uint64_t requested_fetch_hash =
+        XXH3_64bits(command.frontbuffer_fetch, sizeof(command.frontbuffer_fetch));
+    const uint64_t persisted_fetch_hash =
+        XXH3_64bits(command.diagnostic_persisted_fetch, sizeof(command.diagnostic_persisted_fetch));
+    REXLOG_INFO(
+        "gta4-tv-present-title: session={} present={} frame={} final={} movie={} "
+        "rect={} bink={}:{} origin={} caller={:08X} "
+        "device={:08X} requested={:08X} persisted={:08X} descriptor-equal={} "
+        "descriptor-hash={:016X}/{:016X} fetch-hash={:016X}/{:016X} "
+        "flags={:02X}/{:02X} force-probe={}",
+        command.diagnostic_tv_session_id, command.diagnostic_present_id, command.submitted_frame,
+        command.diagnostic_tv_final_sequence, command.diagnostic_tv_movie_sequence,
+        command.diagnostic_tv_rect_sequence, command.diagnostic_tv_bink_sequence,
+        command.diagnostic_tv_bink_result, TvPresentOriginName(command.diagnostic_origin),
+        command.diagnostic_guest_caller, command.device, command.frontbuffer_texture,
+        command.diagnostic_persisted_texture, command.diagnostic_descriptor_equal,
+        command.diagnostic_requested_descriptor_hash, command.diagnostic_persisted_descriptor_hash,
+        requested_fetch_hash, persisted_fetch_hash, command.diagnostic_device_flag_10941,
+        command.diagnostic_device_flag_10942, command.diagnostic_force_content_probe);
+  }
   g_last_present_frontbuffer.store(command.frontbuffer_texture, std::memory_order_relaxed);
   if (SubmitNativeCommand(command)) {
     PaceNativePresent(submitted_frame);
   }
   ctx.r3.u32 = device;
 }
+
+#include "gta4_fade_trace_hooks.inc"
+#include "gta4_phone_trace_hooks.inc"

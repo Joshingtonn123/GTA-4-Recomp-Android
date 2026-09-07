@@ -54,6 +54,12 @@ PixelShaderOutput shaderMain(Interpolators input) {
       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 0x1A0);
   const uint hdr_sampler_index =
       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 0x1A4);
+  // Preserve explicit LOD sampling while applying the guest sampler bias,
+  // already clamped by the host. Depth uses guest slot zero; HDR uses slot one.
+  const float depth_sampler_lod_bias =
+      vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 752);
+  const float hdr_sampler_lod_bias =
+      vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 756);
   const float4 dofProj =
       vk::RawBufferLoad<float4>(g_PushConstants.PixelShaderConstants + 0xD00, 0x10);
   const float4 gDepthFxParams =
@@ -78,9 +84,9 @@ PixelShaderOutput shaderMain(Interpolators input) {
   float4 r5 = 0.0;
   float4 r6 = 0.0;
 
-  r3.xyz = hdr_texture.SampleLevel(hdr_sampler, r0.xy, 0.0).xyz;
+  r3.xyz = hdr_texture.SampleLevel(hdr_sampler, r0.xy, 0.0 + hdr_sampler_lod_bias).xyz;
   r3.w = 1.0;
-  r0.w = depth_texture.SampleLevel(depth_sampler, r0.xy, 0.0).x;
+  r0.w = depth_texture.SampleLevel(depth_sampler, r0.xy, 0.0 + depth_sampler_lod_bias).x;
   r6.x = 1.0 - globalFogParams.w;
   r4.xy = gDepthFxParams.xy - 1.0;
   r0.z = dofProj.y * dofProj.x;

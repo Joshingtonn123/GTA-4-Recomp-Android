@@ -15,6 +15,10 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 project("LibertyRecomp-ALL")
 
+# Reproduce the source fixes carried for pinned upstream dependencies.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DependencyPatches.cmake")
+liberty_apply_dependency_patches("${CMAKE_CURRENT_SOURCE_DIR}")
+
 set(LIBERTY_RECOMP_GRAINE_MAC OFF)
 if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND
    (NOT DEFINED LIBERTY_RECOMP_TARGET_PLATFORM OR

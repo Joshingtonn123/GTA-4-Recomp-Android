@@ -4,6 +4,7 @@
 add_library(rexinput OBJECT
     absolute_pointer.cpp
     input_system.cpp
+    mnk/controller_compatibility.cpp
     mnk/mnk_input_driver.cpp
     mnk/pointer_motion.cpp
     nop/nop_input_driver.cpp

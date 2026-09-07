@@ -76,6 +76,10 @@ struct DirtyBitSpan {
   uint8_t first_dirty_bit = 0;
   uint8_t bit_count = 0;
   uint32_t first_element = 0;
+  // Xenos float-constant masks number 64-byte register groups from the most
+  // significant bit. Other native state masks use the usual least-significant
+  // bit ordering, so keep the direction explicit in the title-owned layout.
+  bool reverse_bits = false;
 };
 
 struct DirtyComponentLayout {
@@ -262,7 +266,8 @@ void ForEachDirtyElement(const NativeDirtyWords& dirty_words, const DirtyCompone
         (dirty_words[span.dirty_word] >> span.first_dirty_bit) & LowBitMask(span.bit_count);
     while (bits) {
       const uint32_t bit = static_cast<uint32_t>(std::countr_zero(bits));
-      callback(span.first_element + bit);
+      const uint32_t element_bit = span.reverse_bits ? uint32_t(span.bit_count - 1) - bit : bit;
+      callback(span.first_element + element_bit);
       bits &= bits - 1;
     }
   }

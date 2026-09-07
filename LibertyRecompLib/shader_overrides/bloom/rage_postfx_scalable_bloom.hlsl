@@ -61,7 +61,8 @@ static const float kCenterWeights[5] = {
 
 float3 SampleBloom(Texture2D<float4> texture, SamplerState bloom_sampler,
                    float2 uv) {
-  return texture.Sample(bloom_sampler, uv).rgb;
+  const float lod_bias = vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 752);
+  return texture.SampleBias(bloom_sampler, uv, lod_bias).rgb;
 }
 
 #ifndef XENOS_RECOMP_LATE_FRAGMENT_TESTS

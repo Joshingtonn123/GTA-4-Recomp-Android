@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <type_traits>
 
 namespace rex::graphics::gta4_native::performance {
@@ -72,6 +73,17 @@ enum class CpuRange : uint8_t {
   kPresenterPresent,
   kPresenterTotal,
   kOutsideRenderer,
+  kSlotCleanup,
+  kProfileReadback,
+  kPipelineCompileJobs,
+  kPipelineWait,
+  // Nested components of kHousekeeping, excluding kProfileReadback. These
+  // explain the parent range and must not be added to it as separate costs.
+  kHousekeepingSurfaceRelease,
+  kHousekeepingTextureReclamation,
+  kHousekeepingTextureRetirement,
+  kHousekeepingBufferReclamation,
+  kHousekeepingPersistentBufferReclamation,
   kCount,
 };
 
@@ -116,6 +128,8 @@ enum class Counter : uint8_t {
   kPipelinesLive,
   kUnavailableGpuRanges,
   kDroppedGpuRanges,
+  kCoarseGpuTiming,
+  kPipelineRequestReuses,
   kCount,
 };
 
@@ -129,6 +143,7 @@ constexpr size_t kMaximumGpuQueriesPerFrame = 256;
 constexpr size_t kQueriesPerGpuSpan = 2;
 constexpr size_t kMaximumGpuSpansPerFrame = kMaximumGpuQueriesPerFrame / kQueriesPerGpuSpan;
 constexpr size_t kFrameSampleCapacity = 600;
+constexpr size_t kFrameSampleCompletionSlotCount = 2;
 
 struct GpuSpan {
   GpuRange range = GpuRange::kFrame;
@@ -210,6 +225,30 @@ class FrameSampleRing {
  private:
   std::array<FrameSample, kFrameSampleCapacity> samples_{};
   size_t head_ = 0;
+  size_t size_ = 0;
+};
+
+// Holds immutable samples after their exact frame-slot fence completes. A
+// sequence may become ready in either CPU-observed slot order, but PopNext only
+// publishes the requested capture sequence. This keeps export rows ordered and
+// prevents a reused slot from overwriting a not-yet-published sample.
+class FrameSampleCompletionQueue {
+ public:
+  void Clear();
+  bool Complete(size_t slot, uint64_t sequence, bool publish, const FrameSample& sample);
+  bool PopNext(uint64_t sequence, bool* publish, FrameSample* sample);
+
+  bool occupied(size_t slot) const;
+  size_t size() const { return size_; }
+
+ private:
+  struct CompletedSample {
+    uint64_t sequence = 0;
+    bool publish = false;
+    FrameSample sample{};
+  };
+
+  std::array<std::optional<CompletedSample>, kFrameSampleCompletionSlotCount> slots_{};
   size_t size_ = 0;
 };
 

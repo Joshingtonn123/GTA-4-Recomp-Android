@@ -1,0 +1,3 @@
+# Dependency patches retain their exact upstream context and portable LF bytes.
+# Leading context markers before tabs and empty lines are patch syntax.
+cmake/dependency-patches/*.patch text eol=lf -whitespace

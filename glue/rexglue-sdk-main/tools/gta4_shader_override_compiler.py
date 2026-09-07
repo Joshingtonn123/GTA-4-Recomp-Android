@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,14 +20,29 @@ SPIRV_MAGIC = 0x07230203
 SPIRV_HEADER_WORDS = 5
 SPIRV_OP_ENTRY_POINT = 15
 SPIRV_OP_EXECUTION_MODE = 16
+SPIRV_OP_VARIABLE = 59
+SPIRV_OP_DECORATE = 71
 SPIRV_EXECUTION_MODE_EARLY_FRAGMENT_TESTS = 9
+SPIRV_DECORATION_SPEC_ID = 1
+SPIRV_DECORATION_BUILT_IN = 11
+SPIRV_DECORATION_LOCATION = 30
+SPIRV_DECORATION_BINDING = 33
+SPIRV_DECORATION_DESCRIPTOR_SET = 34
+SPIRV_BUILT_IN_SAMPLE_MASK = 20
+SPIRV_STORAGE_CLASS_INPUT = 1
+SPIRV_STORAGE_CLASS_OUTPUT = 3
 SPIRV_EXECUTION_MODELS = {"vertex": 0, "pixel": 4}
 SHADER_OVERRIDE_STAGES = {"pixel": 0, "vertex": 1}
+SHADER_OVERRIDE_ACTIVATIONS = {"stage": 0, "pipeline_pair": 1}
+SUPPORTED_BUILT_INS = {"SampleMask": SPIRV_BUILT_IN_SAMPLE_MASK}
 SPEC_CONSTANT_ALPHA_TEST = 0x00000002
+USE_STOCK_TEXTURE_MASK = 0xFFFFFFFF
 HASH_PATTERN = re.compile(r"0x[0-9A-Fa-f]{16}\Z")
 MASK_PATTERN = re.compile(r"0x[0-9A-Fa-f]{8}\Z")
 ENTRY_POINT_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 DEFINE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:=[A-Za-z0-9_+.,-]+)?\Z")
+DESCRIPTOR_BINDING_PATTERN = re.compile(r"([0-9]+):([0-9]+)\Z")
+SUPPORTED_SAMPLE_COUNTS = frozenset((1, 2, 4, 8, 16, 32, 64))
 TOP_LEVEL_KEYS = {"version", "overrides"}
 ENTRY_KEYS = {
     "stage",
@@ -35,11 +52,77 @@ ENTRY_KEYS = {
     "entry_point",
     "specialization_constants_mask",
     "defines",
+    "activation",
+    "pipeline_pair_id",
+    "counterpart_hashes",
+    "used_texture_mask",
+    "support_radius_bits",
+    "required_builtins",
+    "require_early_fragment_tests",
+    "supported_sample_counts",
+    "expected_input_locations",
+    "expected_output_locations",
+    "expected_descriptor_bindings",
+    "expected_spec_ids",
 }
 
 
 class ManifestError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class SpirvInterface:
+    input_locations: tuple[int, ...]
+    output_locations: tuple[int, ...]
+    descriptor_bindings: tuple[tuple[int, int], ...]
+    spec_ids: tuple[int, ...]
+    builtins: tuple[int, ...]
+
+
+def _parse_uint_list(
+    raw_value: Any, context: str, *, allowed: frozenset[int] | None = None
+) -> tuple[int, ...]:
+    if not isinstance(raw_value, list) or any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > 0xFFFFFFFF
+        for value in raw_value
+    ):
+        raise ManifestError(f"{context} must be an array of uint32 values")
+    if len(set(raw_value)) != len(raw_value):
+        raise ManifestError(f"{context} contains a duplicate")
+    if allowed is not None and any(value not in allowed for value in raw_value):
+        rendered = ", ".join(str(value) for value in sorted(allowed))
+        raise ManifestError(f"{context} may contain only: {rendered}")
+    return tuple(sorted(raw_value))
+
+
+def _parse_optional_uint_list(
+    raw_entry: dict[str, Any], key: str, context: str
+) -> tuple[int, ...] | None:
+    if key not in raw_entry:
+        return None
+    return _parse_uint_list(raw_entry[key], f"{context}.{key}")
+
+
+def _parse_optional_descriptor_bindings(
+    raw_entry: dict[str, Any], key: str, context: str
+) -> tuple[tuple[int, int], ...] | None:
+    if key not in raw_entry:
+        return None
+    raw_value = raw_entry[key]
+    if not isinstance(raw_value, list):
+        raise ManifestError(f"{context}.{key} must be an array of SET:BINDING strings")
+    result: list[tuple[int, int]] = []
+    for index, value in enumerate(raw_value):
+        if not isinstance(value, str):
+            raise ManifestError(f"{context}.{key}[{index}] must be a SET:BINDING string")
+        match = DESCRIPTOR_BINDING_PATTERN.fullmatch(value)
+        if not match:
+            raise ManifestError(f"{context}.{key}[{index}] must be a SET:BINDING string")
+        result.append((int(match.group(1)), int(match.group(2))))
+    if len(set(result)) != len(result):
+        raise ManifestError(f"{context}.{key} contains a duplicate")
+    return tuple(sorted(result))
 
 
 def _require_exact_keys(value: dict[str, Any], allowed: set[str], context: str) -> None:
@@ -125,6 +208,97 @@ def load_manifest(manifest_path: Path, source_root: Path) -> list[dict[str, Any]
         if len(set(raw_defines)) != len(raw_defines):
             raise ManifestError(f"{context}.defines contains a duplicate")
 
+        activation_name = raw_entry.get("activation", "stage")
+        if activation_name not in SHADER_OVERRIDE_ACTIVATIONS:
+            raise ManifestError(f"{context}.activation must be 'stage' or 'pipeline_pair'")
+        activation = SHADER_OVERRIDE_ACTIVATIONS[activation_name]
+
+        raw_pair_id = raw_entry.get("pipeline_pair_id", 0)
+        if not isinstance(raw_pair_id, int) or isinstance(raw_pair_id, bool):
+            raise ManifestError(f"{context}.pipeline_pair_id must be an integer")
+        if raw_pair_id < 0 or raw_pair_id > 0xFFFFFFFF:
+            raise ManifestError(f"{context}.pipeline_pair_id is outside uint32 range")
+
+        raw_counterparts = raw_entry.get("counterpart_hashes", [])
+        if not isinstance(raw_counterparts, list):
+            raise ManifestError(f"{context}.counterpart_hashes must be an array")
+        counterpart_hashes = [
+            _parse_hex(value, HASH_PATTERN, f"{context}.counterpart_hashes[{item_index}]")
+            for item_index, value in enumerate(raw_counterparts)
+        ]
+        if len(set(counterpart_hashes)) != len(counterpart_hashes):
+            raise ManifestError(f"{context}.counterpart_hashes contains a duplicate")
+
+        if activation_name == "pipeline_pair":
+            if raw_pair_id == 0:
+                raise ManifestError(f"{context}.pipeline_pair_id must be nonzero for pipeline_pair")
+            if not counterpart_hashes:
+                raise ManifestError(f"{context}.counterpart_hashes must not be empty for pipeline_pair")
+        elif raw_pair_id or counterpart_hashes:
+            raise ManifestError(
+                f"{context} may only declare pipeline_pair_id/counterpart_hashes for pipeline_pair"
+            )
+
+        used_texture_mask = USE_STOCK_TEXTURE_MASK
+        if "used_texture_mask" in raw_entry:
+            used_texture_mask = _parse_hex(
+                raw_entry["used_texture_mask"], MASK_PATTERN, f"{context}.used_texture_mask"
+            )
+
+        support_radius_bits = 0
+        if "support_radius_bits" in raw_entry:
+            support_radius_bits = _parse_hex(
+                raw_entry["support_radius_bits"], MASK_PATTERN, f"{context}.support_radius_bits"
+            )
+            support_radius = struct.unpack("<f", struct.pack("<I", support_radius_bits))[0]
+            if not math.isfinite(support_radius) or support_radius <= 0.0:
+                raise ManifestError(f"{context}.support_radius_bits must encode a finite positive float")
+
+        raw_required_builtins = raw_entry.get("required_builtins", [])
+        if not isinstance(raw_required_builtins, list) or any(
+            not isinstance(name, str) or name not in SUPPORTED_BUILT_INS
+            for name in raw_required_builtins
+        ):
+            raise ManifestError(
+                f"{context}.required_builtins must contain only: {', '.join(SUPPORTED_BUILT_INS)}"
+            )
+        if len(set(raw_required_builtins)) != len(raw_required_builtins):
+            raise ManifestError(f"{context}.required_builtins contains a duplicate")
+        if raw_required_builtins and stage_name != "pixel":
+            raise ManifestError(f"{context}.required_builtins is only valid for pixel shaders")
+
+        require_early_fragment_tests = raw_entry.get("require_early_fragment_tests", False)
+        if not isinstance(require_early_fragment_tests, bool):
+            raise ManifestError(f"{context}.require_early_fragment_tests must be a boolean")
+        if require_early_fragment_tests and stage_name != "pixel":
+            raise ManifestError(
+                f"{context}.require_early_fragment_tests is only valid for pixel shaders"
+            )
+
+        supported_sample_counts = _parse_uint_list(
+            raw_entry.get("supported_sample_counts", []),
+            f"{context}.supported_sample_counts",
+            allowed=SUPPORTED_SAMPLE_COUNTS,
+        )
+        supported_sample_count_mask = 0
+        for sample_count in supported_sample_counts:
+            supported_sample_count_mask |= sample_count
+        if activation_name == "pipeline_pair" and not supported_sample_count_mask:
+            raise ManifestError(
+                f"{context}.supported_sample_counts must not be empty for pipeline_pair"
+            )
+
+        expected_input_locations = _parse_optional_uint_list(
+            raw_entry, "expected_input_locations", context
+        )
+        expected_output_locations = _parse_optional_uint_list(
+            raw_entry, "expected_output_locations", context
+        )
+        expected_descriptor_bindings = _parse_optional_descriptor_bindings(
+            raw_entry, "expected_descriptor_bindings", context
+        )
+        expected_spec_ids = _parse_optional_uint_list(raw_entry, "expected_spec_ids", context)
+
         identity = (SHADER_OVERRIDE_STAGES[stage_name], shader_hash)
         if identity in identities:
             raise ManifestError(
@@ -143,8 +317,53 @@ def load_manifest(manifest_path: Path, source_root: Path) -> list[dict[str, Any]
                 "entry_point": entry_point,
                 "specialization_constants_mask": mask,
                 "defines": sorted(raw_defines),
+                "activation_name": activation_name,
+                "activation": activation,
+                "pipeline_pair_id": raw_pair_id,
+                "counterpart_hashes": sorted(counterpart_hashes),
+                "used_texture_mask": used_texture_mask,
+                "support_radius_bits": support_radius_bits,
+                "required_builtins": tuple(sorted(raw_required_builtins)),
+                "require_early_fragment_tests": require_early_fragment_tests,
+                "supported_sample_counts": supported_sample_counts,
+                "supported_sample_count_mask": supported_sample_count_mask,
+                "expected_input_locations": expected_input_locations,
+                "expected_output_locations": expected_output_locations,
+                "expected_descriptor_bindings": expected_descriptor_bindings,
+                "expected_spec_ids": expected_spec_ids,
             }
         )
+
+    entries_by_pair: dict[int, list[dict[str, Any]]] = {}
+    for entry in entries:
+        if entry["activation_name"] == "pipeline_pair":
+            entries_by_pair.setdefault(entry["pipeline_pair_id"], []).append(entry)
+
+    for pair_id, pair_entries in sorted(entries_by_pair.items()):
+        context = f"pipeline_pair_id {pair_id}"
+        if len(pair_entries) != 2:
+            raise ManifestError(f"{context} must contain exactly one vertex and one pixel override")
+        by_stage = {entry["stage_name"]: entry for entry in pair_entries}
+        if set(by_stage) != {"vertex", "pixel"}:
+            raise ManifestError(f"{context} must contain exactly one vertex and one pixel override")
+        vertex = by_stage["vertex"]
+        pixel = by_stage["pixel"]
+        if pixel["hash"] not in vertex["counterpart_hashes"]:
+            raise ManifestError(f"{context} vertex override does not permit its pixel counterpart")
+        if vertex["hash"] not in pixel["counterpart_hashes"]:
+            raise ManifestError(f"{context} pixel override does not permit its vertex counterpart")
+        if not vertex["support_radius_bits"] or not pixel["support_radius_bits"]:
+            raise ManifestError(f"{context} must declare support_radius_bits on both overrides")
+        vertex_radius = struct.unpack("<f", struct.pack("<I", vertex["support_radius_bits"]))[0]
+        pixel_radius = struct.unpack("<f", struct.pack("<I", pixel["support_radius_bits"]))[0]
+        if vertex_radius < pixel_radius:
+            raise ManifestError(
+                f"{context} vertex support radius must contain the pixel nonzero support radius"
+            )
+        if vertex["supported_sample_count_mask"] != pixel["supported_sample_count_mask"]:
+            raise ManifestError(f"{context} shader stages must support the same sample counts")
+        if not vertex["supported_sample_count_mask"]:
+            raise ManifestError(f"{context} must support at least one sample count")
 
     return sorted(entries, key=lambda entry: (entry["stage"], entry["hash"]))
 
@@ -254,15 +473,17 @@ def compile_shader(
     _run_tool(command)
 
 
-def _decode_spirv_string(words: Sequence[int]) -> str:
+def _decode_spirv_string(words: Sequence[int]) -> tuple[str, int]:
     encoded = b"".join(struct.pack("<I", word) for word in words)
     terminator = encoded.find(b"\0")
     if terminator < 0:
         raise ManifestError("SPIR-V OpEntryPoint name is not null-terminated")
     try:
-        return encoded[:terminator].decode("utf-8")
+        value = encoded[:terminator].decode("utf-8")
     except UnicodeDecodeError as error:
         raise ManifestError("SPIR-V OpEntryPoint name is not UTF-8") from error
+    consumed_words = (terminator + 1 + struct.calcsize("<I") - 1) // struct.calcsize("<I")
+    return value, consumed_words
 
 
 def validate_spirv(
@@ -270,7 +491,13 @@ def validate_spirv(
     expected_execution_model: int,
     expected_entry_point: str,
     forbid_early_fragment_tests: bool = False,
-) -> tuple[int, ...]:
+    required_builtins: Sequence[str] = (),
+    require_early_fragment_tests: bool = False,
+    expected_input_locations: tuple[int, ...] | None = None,
+    expected_output_locations: tuple[int, ...] | None = None,
+    expected_descriptor_bindings: tuple[tuple[int, int], ...] | None = None,
+    expected_spec_ids: tuple[int, ...] | None = None,
+) -> tuple[tuple[int, ...], SpirvInterface]:
     if len(blob) < SPIRV_HEADER_WORDS * struct.calcsize("<I"):
         raise ManifestError("SPIR-V module is shorter than its header")
     if len(blob) % struct.calcsize("<I"):
@@ -280,7 +507,15 @@ def validate_spirv(
     if words[0] != SPIRV_MAGIC:
         raise ManifestError("SPIR-V module has an invalid magic number")
 
-    matching_entry_point = False
+    matching_entry_points: set[int] = set()
+    matching_interfaces: set[int] = set()
+    early_fragment_test_entries: set[int] = set()
+    storage_class_by_id: dict[int, int] = {}
+    builtin_by_id: dict[int, int] = {}
+    location_by_id: dict[int, int] = {}
+    binding_by_id: dict[int, int] = {}
+    descriptor_set_by_id: dict[int, int] = {}
+    spec_id_by_id: dict[int, int] = {}
     index = SPIRV_HEADER_WORDS
     while index < len(words):
         instruction = words[index]
@@ -295,23 +530,98 @@ def validate_spirv(
             if instruction_word_count < 4:
                 raise ManifestError("SPIR-V OpEntryPoint is truncated")
             execution_model = words[index + 1]
-            entry_point = _decode_spirv_string(words[index + 3 : instruction_end])
-            matching_entry_point |= (
-                execution_model == expected_execution_model and entry_point == expected_entry_point
+            entry_point_id = words[index + 2]
+            entry_point, name_word_count = _decode_spirv_string(
+                words[index + 3 : instruction_end]
             )
-        elif (
-            forbid_early_fragment_tests
-            and opcode == SPIRV_OP_EXECUTION_MODE
-            and instruction_word_count >= 3
-            and words[index + 2] == SPIRV_EXECUTION_MODE_EARLY_FRAGMENT_TESTS
-        ):
-            raise ManifestError("late SPIR-V unexpectedly enables EarlyFragmentTests")
+            if execution_model == expected_execution_model and entry_point == expected_entry_point:
+                matching_entry_points.add(entry_point_id)
+                interface_start = index + 3 + name_word_count
+                matching_interfaces.update(words[interface_start:instruction_end])
+        elif opcode == SPIRV_OP_EXECUTION_MODE and instruction_word_count >= 3:
+            if words[index + 2] == SPIRV_EXECUTION_MODE_EARLY_FRAGMENT_TESTS:
+                early_fragment_test_entries.add(words[index + 1])
+        elif opcode == SPIRV_OP_VARIABLE and instruction_word_count >= 4:
+            storage_class_by_id[words[index + 2]] = words[index + 3]
+        elif opcode == SPIRV_OP_DECORATE and instruction_word_count >= 3:
+            target_id = words[index + 1]
+            decoration = words[index + 2]
+            if instruction_word_count >= 4:
+                value = words[index + 3]
+                if decoration == SPIRV_DECORATION_SPEC_ID:
+                    spec_id_by_id[target_id] = value
+                elif decoration == SPIRV_DECORATION_BUILT_IN:
+                    builtin_by_id[target_id] = value
+                elif decoration == SPIRV_DECORATION_LOCATION:
+                    location_by_id[target_id] = value
+                elif decoration == SPIRV_DECORATION_BINDING:
+                    binding_by_id[target_id] = value
+                elif decoration == SPIRV_DECORATION_DESCRIPTOR_SET:
+                    descriptor_set_by_id[target_id] = value
         index = instruction_end
-    if not matching_entry_point:
+
+    if not matching_entry_points:
         raise ManifestError(
             f"SPIR-V does not contain the requested stage/entry point {expected_entry_point!r}"
         )
-    return words
+    has_early_fragment_tests = bool(matching_entry_points & early_fragment_test_entries)
+    if forbid_early_fragment_tests and has_early_fragment_tests:
+        raise ManifestError("late SPIR-V unexpectedly enables EarlyFragmentTests")
+    if require_early_fragment_tests and not has_early_fragment_tests:
+        raise ManifestError("SPIR-V entry point is missing required EarlyFragmentTests")
+
+    interface_builtins = {
+        builtin_by_id[interface_id]
+        for interface_id in matching_interfaces
+        if interface_id in builtin_by_id
+    }
+    for builtin_name in required_builtins:
+        builtin = SUPPORTED_BUILT_INS[builtin_name]
+        if builtin not in interface_builtins:
+            raise ManifestError(
+                f"SPIR-V entry point is missing required BuiltIn {builtin_name}"
+            )
+
+    interface = SpirvInterface(
+        input_locations=tuple(
+            sorted(
+                location_by_id[interface_id]
+                for interface_id in matching_interfaces
+                if storage_class_by_id.get(interface_id) == SPIRV_STORAGE_CLASS_INPUT
+                and interface_id in location_by_id
+            )
+        ),
+        output_locations=tuple(
+            sorted(
+                location_by_id[interface_id]
+                for interface_id in matching_interfaces
+                if storage_class_by_id.get(interface_id) == SPIRV_STORAGE_CLASS_OUTPUT
+                and interface_id in location_by_id
+            )
+        ),
+        descriptor_bindings=tuple(
+            sorted(
+                (descriptor_set_by_id[target_id], binding_by_id[target_id])
+                for target_id in storage_class_by_id
+                if target_id in descriptor_set_by_id and target_id in binding_by_id
+            )
+        ),
+        spec_ids=tuple(sorted(spec_id_by_id.values())),
+        builtins=tuple(sorted(interface_builtins)),
+    )
+
+    expected_fields = (
+        ("input locations", expected_input_locations, interface.input_locations),
+        ("output locations", expected_output_locations, interface.output_locations),
+        ("descriptor bindings", expected_descriptor_bindings, interface.descriptor_bindings),
+        ("specialization IDs", expected_spec_ids, interface.spec_ids),
+    )
+    for field_name, expected, actual in expected_fields:
+        if expected is not None and expected != actual:
+            raise ManifestError(
+                f"SPIR-V {field_name} mismatch: expected {expected}, found {actual}"
+            )
+    return words, interface
 
 
 def _format_words(words: Iterable[int]) -> str:
@@ -325,6 +635,18 @@ def generate_cpp(compiled_entries: Sequence[dict[str, Any]]) -> str:
         "namespace {",
     ]
     for index, entry in enumerate(compiled_entries):
+        if entry["counterpart_hashes"]:
+            output.extend(
+                (
+                    f"constexpr uint64_t kShaderOverrideCounterparts{index}[] = {{",
+                    "\n".join(
+                        f"    0x{counterpart_hash:016X}ull,"
+                        for counterpart_hash in entry["counterpart_hashes"]
+                    ),
+                    "};",
+                    "",
+                )
+            )
         output.extend(
             (
                 f"constexpr uint32_t kShaderOverrideSpirv{index}[] = {{",
@@ -359,10 +681,29 @@ def generate_cpp(compiled_entries: Sequence[dict[str, Any]]) -> str:
             else:
                 late_spirv = f"kShaderOverrideLateSpirv{index}"
                 late_spirv_size = f"sizeof(kShaderOverrideLateSpirv{index})"
+            activation_constant = (
+                "kShaderOverrideActivationPipelinePair"
+                if entry["activation_name"] == "pipeline_pair"
+                else "kShaderOverrideActivationStage"
+            )
+            if entry["counterpart_hashes"]:
+                counterparts = f"kShaderOverrideCounterparts{index}"
+                counterpart_count = (
+                    f"sizeof(kShaderOverrideCounterparts{index}) / "
+                    f"sizeof(kShaderOverrideCounterparts{index}[0])"
+                )
+            else:
+                counterparts = "nullptr"
+                counterpart_count = "0"
             output.append(
                 "    {"
                 f"0x{entry['hash']:016X}ull, {stage_constant}, "
                 f"0x{entry['specialization_constants_mask']:08X}u, "
+                f"{activation_constant}, {entry['pipeline_pair_id']}u, "
+                f"0x{entry['used_texture_mask']:08X}u, "
+                f"0x{entry['support_radius_bits']:08X}u, "
+                f"0x{entry['supported_sample_count_mask']:08X}u, "
+                f"{counterparts}, {counterpart_count}, "
                 f"kShaderOverrideSpirv{index}, sizeof(kShaderOverrideSpirv{index}), "
                 f"{late_spirv}, {late_spirv_size}, {filename}"
                 "},"
@@ -449,10 +790,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     )
                 )
                 compiled_entry = dict(entry)
-                compiled_entry["words"] = validate_spirv(
+                compiled_entry["words"], early_interface = validate_spirv(
                     spirv_path.read_bytes(),
                     entry["execution_model"],
                     entry["entry_point"],
+                    required_builtins=entry["required_builtins"],
+                    require_early_fragment_tests=entry["require_early_fragment_tests"],
+                    expected_input_locations=entry["expected_input_locations"],
+                    expected_output_locations=entry["expected_output_locations"],
+                    expected_descriptor_bindings=entry["expected_descriptor_bindings"],
+                    expected_spec_ids=entry["expected_spec_ids"],
                 )
                 compiled_entry["late_words"] = None
                 if requires_late_fragment_tests(entry):
@@ -474,12 +821,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             str(late_spirv_path),
                         )
                     )
-                    compiled_entry["late_words"] = validate_spirv(
+                    compiled_entry["late_words"], late_interface = validate_spirv(
                         late_spirv_path.read_bytes(),
                         entry["execution_model"],
                         entry["entry_point"],
                         forbid_early_fragment_tests=True,
+                        required_builtins=entry["required_builtins"],
+                        expected_input_locations=entry["expected_input_locations"],
+                        expected_output_locations=entry["expected_output_locations"],
+                        expected_descriptor_bindings=entry["expected_descriptor_bindings"],
+                        expected_spec_ids=entry["expected_spec_ids"],
                     )
+                    if early_interface != late_interface:
+                        raise ManifestError(
+                            f"{entry['source_name']} early/late SPIR-V interfaces differ: "
+                            f"early={early_interface}, late={late_interface}"
+                        )
                 compiled_entries.append(compiled_entry)
 
         _write_if_changed(options.output, generate_cpp(compiled_entries))

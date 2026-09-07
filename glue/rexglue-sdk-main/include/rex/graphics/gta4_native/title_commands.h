@@ -5,11 +5,13 @@
 #include <type_traits>
 
 #include <rex/graphics/gta4_native/environmental_data.h>
+#include <rex/graphics/gta4_native/lighting_semantics.h>
+#include <rex/graphics/gta4_native/forward_stencil.h>
 
 namespace rex::graphics::gta4_native {
 
 inline constexpr uint32_t kTitleId = 0x545407F2;
-inline constexpr uint32_t kTitleCommandAbi = 24;
+inline constexpr uint32_t kTitleCommandAbi = 31;
 inline constexpr uint32_t kGuestDeviceSize = 0x5780;
 inline constexpr uint32_t kTextureStageCount = 26;
 inline constexpr uint32_t kRenderTargetCount = 4;
@@ -26,7 +28,7 @@ enum class CommandType : uint32_t {
   kSetVertexShader,
   kSetVertexDeclaration,
   kSetTexture,
-  kInvalidateTexture,
+  kResourceUnlock,
   kSetDepthStencil,
   kSetRenderTarget,
   kSetVertexStream,
@@ -44,6 +46,7 @@ enum class CommandType : uint32_t {
   kReleaseResource,
   kUpdateEnvironmentalData,
   kDepthSurfaceHandoff,
+  kRegisterVirtualResource,
 };
 
 enum class ReflectionFamily : uint32_t {
@@ -78,8 +81,8 @@ enum class ShaderStage : uint32_t {
 };
 
 struct CommandHeader {
-  uint32_t size;
-  CommandType type;
+  uint32_t size{};
+  CommandType type{};
 };
 
 struct UpdateEnvironmentalDataCommand {
@@ -91,76 +94,117 @@ struct UpdateEnvironmentalDataCommand {
 };
 
 struct DeviceCommand {
-  CommandHeader header;
-  uint32_t device;
-  uint32_t mode;
+  CommandHeader header{};
+  uint32_t device{};
+  uint32_t mode{};
 };
 
 struct RegisterShaderCommand {
   CommandHeader header{sizeof(RegisterShaderCommand), CommandType::kRegisterShader};
-  uint32_t shader;
-  ShaderStage stage;
-  uint64_t hash;
+  uint32_t shader{};
+  ShaderStage stage{};
+  uint64_t hash{};
 };
 
 struct VertexElement {
-  uint16_t stream;
-  uint16_t offset;
-  uint32_t type;
-  uint8_t method;
-  uint8_t usage;
-  uint8_t usage_index;
-  uint8_t padding;
+  uint16_t stream{};
+  uint16_t offset{};
+  uint32_t type{};
+  uint8_t method{};
+  uint8_t usage{};
+  uint8_t usage_index{};
+  uint8_t padding{};
 };
 
 struct RegisterVertexDeclarationCommand {
   CommandHeader header{sizeof(RegisterVertexDeclarationCommand),
                        CommandType::kRegisterVertexDeclaration};
-  uint32_t device;
-  uint32_t declaration;
-  uint32_t element_count;
-  uint32_t maximum_stream;
-  VertexElement elements[kMaximumVertexElementCount];
+  uint32_t device{};
+  uint32_t declaration{};
+  uint32_t element_count{};
+  uint32_t maximum_stream{};
+  VertexElement elements[kMaximumVertexElementCount]{};
 };
 
 struct SetRenderStateCommand {
   CommandHeader header{sizeof(SetRenderStateCommand), CommandType::kSetRenderState};
-  uint32_t device;
-  uint32_t state;
-  uint32_t value;
+  uint32_t device{};
+  uint32_t state{};
+  uint32_t value{};
 };
 
 struct SetShaderCommand {
-  CommandHeader header;
-  uint32_t device;
-  uint32_t shader;
+  CommandHeader header{};
+  uint32_t device{};
+  uint32_t shader{};
 };
 
 struct SetVertexDeclarationCommand {
   CommandHeader header{sizeof(SetVertexDeclarationCommand), CommandType::kSetVertexDeclaration};
-  uint32_t device;
-  uint32_t declaration;
+  uint32_t device{};
+  uint32_t declaration{};
 };
 
 struct SetTextureCommand {
   CommandHeader header{sizeof(SetTextureCommand), CommandType::kSetTexture};
-  uint32_t device;
-  uint32_t stage;
-  uint32_t texture;
+  uint32_t device{};
+  uint32_t stage{};
+  uint32_t texture{};
   // Logical GTA IV font identity carried from the grcTexture resource owner
   // through the title's virtual texture accessor. Zero denotes a non-font
   // texture; values 1, 2, and 3 map to font1, font2, and font3 respectively.
   uint32_t vector_font_id = 0;
 };
 
-struct InvalidateTextureCommand {
-  CommandHeader header{sizeof(InvalidateTextureCommand), CommandType::kInvalidateTexture};
-  uint32_t texture;
+enum class ResourceUnlockAccess : uint32_t {
+  kNoDirtyUpdate,
+  kGuestWrite,
+};
+
+struct ResourceUnlockCommand {
+  CommandHeader header{sizeof(ResourceUnlockCommand), CommandType::kResourceUnlock};
+  uint32_t resource = 0;
+  ResourceUnlockAccess access = ResourceUnlockAccess::kGuestWrite;
+  uint32_t flags = 0;
+  uint32_t range_offset = 0;
+  uint32_t range_length = 0;
+  uint32_t lock_caller = 0;
+  uint32_t unlock_caller = 0;
+};
+
+enum class VirtualResourceKind : uint32_t {
+  kTexture,
+  kSurface,
+};
+
+enum class VirtualResourceScaleDomain : uint32_t {
+  kLogical,
+  kPrimaryScene,
+};
+
+struct RegisterVirtualResourceCommand {
+  CommandHeader header{sizeof(RegisterVirtualResourceCommand),
+                       CommandType::kRegisterVirtualResource};
+  uint32_t resource = 0;
+  VirtualResourceKind kind = VirtualResourceKind::kTexture;
+  uint32_t wrapper = 0;
+  uint32_t companion = 0;
+  uint32_t guest_backing_width = 0;
+  uint32_t guest_backing_height = 0;
+  uint32_t logical_width = 0;
+  uint32_t logical_height = 0;
+  uint32_t physical_width = 0;
+  uint32_t physical_height = 0;
+  VirtualResourceScaleDomain scale_domain = VirtualResourceScaleDomain::kLogical;
+  uint32_t constructor_caller = 0;
+  // Explicit sampled-texture alias produced by sub_828D9768. The source is
+  // the resolved texture, not its live depth/stencil surface companion.
+  uint32_t packed_depth_source = 0;
 };
 
 struct ReleaseResourceCommand {
   CommandHeader header{sizeof(ReleaseResourceCommand), CommandType::kReleaseResource};
-  uint32_t resource;
+  uint32_t resource{};
 };
 
 struct RegisterReflectionTargetCommand {
@@ -194,49 +238,50 @@ struct SurfaceDescriptor {
 
 struct SetDepthStencilCommand {
   CommandHeader header{sizeof(SetDepthStencilCommand), CommandType::kSetDepthStencil};
-  uint32_t device;
-  SurfaceDescriptor surface;
-  uint32_t trace_wrapper;
-  uint32_t trace_caller;
+  uint32_t device{};
+  SurfaceDescriptor surface{};
+  uint32_t trace_wrapper{};
+  uint32_t trace_caller{};
 };
 
 // GTA IV owns two distinct native depth objects across the deferred-to-forward
 // phase boundary. The title names that relationship explicitly so the native
 // renderer never has to infer resource identity from Xenos placement fields.
-// Only depth is transferred; the destination object's stencil contents remain
-// owned by the forward path.
+// Depth-only callers preserve destination stencil. The scene-to-forward
+// caller explicitly rebuilds forward coverage from resolved scene depth.
 struct DepthSurfaceHandoffCommand {
   CommandHeader header{sizeof(DepthSurfaceHandoffCommand), CommandType::kDepthSurfaceHandoff};
   uint32_t device = 0;
-  SurfaceDescriptor source;
-  SurfaceDescriptor destination;
+  SurfaceDescriptor source{};
+  SurfaceDescriptor destination{};
   uint32_t source_wrapper = 0;
   uint32_t destination_wrapper = 0;
   uint32_t source_texture = 0;
   uint32_t trace_caller = 0;
+  ForwardStencilHandoffPolicy stencil_policy = ForwardStencilHandoffPolicy::kPreserve;
 };
 
 struct SetRenderTargetCommand {
   CommandHeader header{sizeof(SetRenderTargetCommand), CommandType::kSetRenderTarget};
-  uint32_t device;
-  uint32_t index;
-  SurfaceDescriptor surface;
+  uint32_t device{};
+  uint32_t index{};
+  SurfaceDescriptor surface{};
 };
 
 struct SetVertexStreamCommand {
   CommandHeader header{sizeof(SetVertexStreamCommand), CommandType::kSetVertexStream};
-  uint32_t device;
-  uint32_t stream;
-  uint32_t buffer;
-  uint32_t offset;
-  uint32_t stride;
-  uint32_t stride_words;
+  uint32_t device{};
+  uint32_t stream{};
+  uint32_t buffer{};
+  uint32_t offset{};
+  uint32_t stride{};
+  uint32_t stride_words{};
 };
 
 struct SetIndexBufferCommand {
   CommandHeader header{sizeof(SetIndexBufferCommand), CommandType::kSetIndexBuffer};
-  uint32_t device;
-  uint32_t buffer;
+  uint32_t device{};
+  uint32_t buffer{};
 };
 
 struct NativeDirtyState {
@@ -254,42 +299,65 @@ struct NativeDirtyState {
 
 struct DrawPrimitiveCommand {
   CommandHeader header{sizeof(DrawPrimitiveCommand), CommandType::kDrawPrimitive};
-  uint32_t device;
-  uint32_t flags;
-  uint32_t primitive_type;
-  uint32_t start_vertex;
-  uint32_t vertex_count;
-  uint32_t instance_flags;
-  uint64_t depth_bias_bits;
+  uint32_t device{};
+  uint32_t light_trace_id = 0;
+  uint32_t light_trace_technique = 0xFFFFFFFFu;
+  uint32_t light_trace_mode = 0;
+  uint32_t flags{};
+  uint32_t primitive_type{};
+  uint32_t start_vertex{};
+  uint32_t vertex_count{};
+  uint32_t instance_flags{};
+  uint64_t depth_bias_bits{};
   NativeDirtyState dirty_state{};
+  LightingContext lighting{};
 };
 
 struct DrawPrimitiveUpCommand {
   CommandHeader header{sizeof(DrawPrimitiveUpCommand), CommandType::kDrawPrimitiveUp};
-  uint32_t device;
-  uint32_t primitive_type;
-  uint32_t vertex_count;
-  uint32_t stride;
-  uint32_t vertex_data;
-  uint32_t vertex_data_size;
+  uint32_t device{};
+  uint32_t light_trace_id = 0;
+  uint32_t light_trace_technique = 0xFFFFFFFFu;
+  uint32_t light_trace_mode = 0;
+  uint32_t primitive_type{};
+  uint32_t vertex_count{};
+  uint32_t stride{};
+  uint32_t vertex_data{};
+  uint32_t vertex_data_size{};
   NativeDirtyState dirty_state{};
+  LightingContext lighting{};
 };
 
 struct DrawIndexedPrimitiveCommand {
   CommandHeader header{sizeof(DrawIndexedPrimitiveCommand), CommandType::kDrawIndexedPrimitive};
-  uint32_t device;
-  uint32_t primitive_type;
-  int32_t base_vertex;
-  uint32_t start_index;
-  uint32_t index_count;
-  uint32_t primitive_restart_enabled;
-  uint32_t primitive_restart_index;
-  uint32_t caller;
-  uint32_t origin_flags;
-  uint32_t command_list;
-  uint64_t draw_id;
+  uint32_t device{};
+  uint32_t light_trace_id = 0;
+  uint32_t light_trace_technique = 0xFFFFFFFFu;
+  uint32_t light_trace_mode = 0;
+  uint32_t primitive_type{};
+  int32_t base_vertex{};
+  uint32_t start_index{};
+  uint32_t index_count{};
+  uint32_t primitive_restart_enabled{};
+  uint32_t primitive_restart_index{};
+  uint32_t caller{};
+  uint32_t origin_flags{};
+  uint32_t command_list{};
+  uint64_t draw_id{};
   NativeDirtyState dirty_state{};
+  LightingContext lighting{};
 };
+
+template <typename DrawCommand>
+void ApplyDrawLightingContext(DrawCommand& command, const LightingContext& context) {
+  command.lighting = context;
+  // Legacy diagnostics remain readable, but decisions use `lighting`.
+  command.light_trace_id = context.record_address;
+  command.light_trace_technique = context.requested_selector;
+  command.light_trace_mode = context.effective_mode != kUnknownLightSelection
+                                 ? context.effective_mode
+                                 : context.requested_mode;
+}
 
 enum DrawCommandOriginFlags : uint32_t {
   kDrawCommandOriginDirect = 0,
@@ -297,40 +365,43 @@ enum DrawCommandOriginFlags : uint32_t {
 };
 
 struct ResolveRectangle {
-  int32_t left;
-  int32_t top;
-  int32_t right;
-  int32_t bottom;
+  int32_t left{};
+  int32_t top{};
+  int32_t right{};
+  int32_t bottom{};
 };
 
 struct ResolvePoint {
-  int32_t x;
-  int32_t y;
+  int32_t x{};
+  int32_t y{};
 };
 
 struct ResolveCommand {
   CommandHeader header{sizeof(ResolveCommand), CommandType::kResolve};
-  uint32_t device;
-  uint32_t flags;
-  SurfaceDescriptor source;
-  uint32_t source_rectangle_valid;
-  ResolveRectangle source_rectangle;
-  uint32_t destination_texture;
-  uint32_t destination_fetch[6];
-  uint32_t destination_point_valid;
-  ResolvePoint destination_point;
-  uint32_t destination_level;
-  uint32_t destination_slice_or_face;
-  uint32_t clear_color_bits[4];
-  uint64_t clear_depth_bits;
-  uint32_t clear_stencil;
-  uint32_t color_format;
-  int32_t color_exp_bias;
-  uint32_t depth_format;
-  uint32_t trace_origin;
-  uint32_t trace_caller;
-  uint32_t trace_owner;
-  uint32_t trace_source_wrapper;
+  uint32_t device{};
+  uint32_t flags{};
+  SurfaceDescriptor source{};
+  uint32_t source_rectangle_valid{};
+  ResolveRectangle source_rectangle{};
+  uint32_t destination_texture{};
+  uint32_t destination_fetch[6]{};
+  uint32_t destination_point_valid{};
+  ResolvePoint destination_point{};
+  uint32_t destination_level{};
+  uint32_t destination_slice_or_face{};
+  uint32_t clear_color_bits[4]{};
+  uint64_t clear_depth_bits{};
+  uint32_t clear_stencil{};
+  // Optional source-clear packing overrides from sub_82A3CC68's last
+  // argument. These do not override the destination texture's format.
+  uint32_t parameters_valid = 0;
+  uint32_t color_format{};
+  int32_t color_exp_bias{};
+  uint32_t depth_format{};
+  uint32_t trace_origin{};
+  uint32_t trace_caller{};
+  uint32_t trace_owner{};
+  uint32_t trace_source_wrapper{};
 };
 
 enum class TextureLockDimension : uint32_t {
@@ -340,17 +411,17 @@ enum class TextureLockDimension : uint32_t {
 
 struct TextureLockCommand {
   CommandHeader header{sizeof(TextureLockCommand), CommandType::kTextureLock};
-  uint32_t texture;
-  uint32_t array_index;
-  uint32_t level;
-  uint32_t flags;
-  TextureLockDimension dimension;
+  uint32_t texture{};
+  uint32_t array_index{};
+  uint32_t level{};
+  uint32_t flags{};
+  TextureLockDimension dimension{};
 };
 
 struct TextureLockResult {
-  uint64_t generation;
-  uint32_t copied_to_guest;
-  uint32_t reserved;
+  uint64_t generation{};
+  uint32_t copied_to_guest{};
+  uint32_t reserved{};
 };
 
 struct QueryDeviceCapabilitiesCommand {
@@ -359,43 +430,63 @@ struct QueryDeviceCapabilitiesCommand {
 };
 
 struct DeviceCapabilitiesResult {
-  uint32_t max_image_dimension_2d;
-  uint32_t reserved;
+  uint32_t max_image_dimension_2d{};
+  uint32_t reserved{};
 };
 
 struct ClearCommand {
   CommandHeader header{sizeof(ClearCommand), CommandType::kClear};
-  uint32_t device;
-  uint32_t flags;
-  int32_t left;
-  int32_t top;
-  int32_t right;
-  int32_t bottom;
-  uint32_t color_bits[4];
-  uint64_t depth_bits;
-  uint32_t stencil;
+  uint32_t device{};
+  uint32_t flags{};
+  int32_t left{};
+  int32_t top{};
+  int32_t right{};
+  int32_t bottom{};
+  uint32_t color_bits[4]{};
+  uint64_t depth_bits{};
+  uint32_t stencil{};
   NativeDirtyState dirty_state{};
 };
 
 struct RenderPhaseMarkerCommand {
   CommandHeader header{sizeof(RenderPhaseMarkerCommand), CommandType::kRenderPhaseMarker};
-  uint32_t device;
-  RenderPhase phase;
-  RenderPhaseEvent event;
-  uint32_t object;
-  uint32_t caller;
+  uint32_t device{};
+  RenderPhase phase{};
+  RenderPhaseEvent event{};
+  uint32_t object{};
+  uint32_t caller{};
 };
 
 struct PresentCommand {
   CommandHeader header{sizeof(PresentCommand), CommandType::kPresent};
-  uint32_t device;
-  uint32_t frontbuffer_texture;
-  uint32_t frontbuffer_fetch[6];
-  uint32_t width;
-  uint32_t height;
-  uint32_t display_width;
-  uint32_t display_height;
-  uint32_t submitted_frame;
+  uint32_t device{};
+  uint32_t frontbuffer_texture{};
+  uint32_t frontbuffer_fetch[6]{};
+  uint32_t width{};
+  uint32_t height{};
+  uint32_t display_width{};
+  uint32_t display_height{};
+  uint32_t submitted_frame{};
+  // Bounded TV flicker provenance. These fields are diagnostic-only title
+  // command metadata; they don't alter the guest ABI or resource identity.
+  uint64_t diagnostic_present_id{};
+  uint64_t diagnostic_tv_session_id{};
+  uint64_t diagnostic_tv_final_sequence{};
+  uint64_t diagnostic_tv_movie_sequence{};
+  uint64_t diagnostic_tv_rect_sequence{};
+  uint64_t diagnostic_tv_bink_sequence{};
+  uint64_t diagnostic_requested_descriptor_hash{};
+  uint64_t diagnostic_persisted_descriptor_hash{};
+  uint32_t diagnostic_guest_caller{};
+  uint32_t diagnostic_origin{};
+  uint32_t diagnostic_persisted_texture{};
+  uint32_t diagnostic_persisted_fetch[6]{};
+  uint32_t diagnostic_descriptor_equal{};
+  uint32_t diagnostic_device_flag_10941{};
+  uint32_t diagnostic_device_flag_10942{};
+  uint32_t diagnostic_tv_bink_result{};
+  uint32_t diagnostic_trace{};
+  uint32_t diagnostic_force_content_probe{};
 };
 
 static_assert(std::is_trivially_copyable<CommandHeader>::value);
@@ -410,13 +501,14 @@ static_assert(std::is_trivially_copyable<SetRenderStateCommand>::value);
 static_assert(std::is_trivially_copyable<SetShaderCommand>::value);
 static_assert(std::is_trivially_copyable<SetVertexDeclarationCommand>::value);
 static_assert(std::is_trivially_copyable<SetTextureCommand>::value);
-static_assert(std::is_trivially_copyable<InvalidateTextureCommand>::value);
+static_assert(std::is_trivially_copyable<ResourceUnlockCommand>::value);
+static_assert(std::is_trivially_copyable<RegisterVirtualResourceCommand>::value);
 static_assert(std::is_trivially_copyable<ReleaseResourceCommand>::value);
 static_assert(std::is_trivially_copyable<RegisterReflectionTargetCommand>::value);
 static_assert(std::is_trivially_copyable<SurfaceDescriptor>::value);
 static_assert(std::is_trivially_copyable<SetDepthStencilCommand>::value);
 static_assert(std::is_trivially_copyable<DepthSurfaceHandoffCommand>::value);
-static_assert(sizeof(DepthSurfaceHandoffCommand) == 100);
+static_assert(sizeof(DepthSurfaceHandoffCommand) == 104);
 static_assert(std::is_trivially_copyable<SetRenderTargetCommand>::value);
 static_assert(std::is_trivially_copyable<SetVertexStreamCommand>::value);
 static_assert(std::is_trivially_copyable<SetIndexBufferCommand>::value);

@@ -17,7 +17,8 @@ NativeDescriptorStatus EvaluateIndexedBackend(const NativeDescriptorPolicyInputs
   }
   if (inputs.use_update_after_bind_layout &&
       (!features.descriptor_binding_sampled_image_update_after_bind ||
-       !features.descriptor_binding_sampler_update_after_bind)) {
+       !features.descriptor_binding_sampler_update_after_bind ||
+       !features.descriptor_binding_update_unused_while_pending)) {
     return NativeDescriptorStatus::kMissingUpdateAfterBindFeatures;
   }
 
@@ -46,6 +47,26 @@ bool WritesMatch(const NativeDescriptorWrite& left, const NativeDescriptorWrite&
   return left.slot == right.slot && left.generation == right.generation &&
          left.epoch == right.epoch && left.payload == right.payload &&
          left.tombstone == right.tombstone;
+}
+
+uint32_t SearchLargestSupportedLayout(NativeDescriptorKind kind, uint32_t upper_bound,
+                                      const NativeDescriptorFixedLayoutProbe& probe,
+                                      uint32_t* probe_count) {
+  uint32_t supported = 0;
+  uint32_t unsupported = upper_bound;
+  while (supported < unsupported) {
+    const uint32_t remaining = unsupported - supported;
+    const uint32_t candidate = supported + remaining / 2 + remaining % 2;
+    if (probe_count) {
+      ++*probe_count;
+    }
+    if (probe(kind, candidate)) {
+      supported = candidate;
+    } else {
+      unsupported = candidate - 1;
+    }
+  }
+  return supported;
 }
 
 }  // namespace
@@ -122,6 +143,117 @@ NativeDescriptorCapacity ChooseNativeDescriptorCapacity(
   result.pool_samplers = uint32_t(pool_samplers);
   result.pool_storage_buffers = uint32_t(pool_storage_buffers);
   result.pool_descriptors = uint32_t(pool_descriptors);
+  return result;
+}
+
+NativeDescriptorPageCapacity NegotiateNativeDescriptorPageCapacity(
+    const NativeDescriptorPageCapacityInputs& inputs,
+    const NativeDescriptorFixedLayoutProbe& probe) {
+  NativeDescriptorPageCapacity result{};
+  if (!inputs.desired_sampled_images_per_set || !inputs.desired_samplers ||
+      !inputs.minimum_sampled_images_per_set || !inputs.minimum_samplers ||
+      inputs.minimum_sampled_images_per_set > inputs.desired_sampled_images_per_set ||
+      inputs.minimum_samplers > inputs.desired_samplers || !inputs.sampled_image_set_count ||
+      !inputs.frame_copy_count || !inputs.storage_descriptors_per_copy) {
+    return result;
+  }
+  if (!probe) {
+    result.status = NativeDescriptorStatus::kLayoutSupportNotQueried;
+    return result;
+  }
+
+  const uint64_t image_set_count = inputs.sampled_image_set_count;
+  const uint64_t frame_copy_count = inputs.frame_copy_count;
+  const uint64_t storage_count = inputs.storage_descriptors_per_copy;
+  const NativeDescriptorLimits& limits = inputs.limits;
+  if (inputs.pool_storage_descriptors >= limits.max_descriptors_in_all_pools) {
+    result.status = NativeDescriptorStatus::kInsufficientDeviceLimits;
+    return result;
+  }
+  const uint64_t available_pool_descriptors =
+      uint64_t(limits.max_descriptors_in_all_pools) -
+      inputs.pool_storage_descriptors;
+  const uint64_t pool_budget_per_copy =
+      available_pool_descriptors / frame_copy_count;
+  const uint64_t per_stage_budget = limits.max_per_stage_resources;
+  const uint64_t minimum_per_stage_fixed_budget =
+      storage_count + inputs.minimum_samplers;
+  if (per_stage_budget < minimum_per_stage_fixed_budget ||
+      pool_budget_per_copy < inputs.minimum_samplers) {
+    result.status = NativeDescriptorStatus::kInsufficientDeviceLimits;
+    return result;
+  }
+
+  uint64_t image_upper = std::min<uint64_t>(
+      {inputs.desired_sampled_images_per_set,
+       uint64_t(limits.max_per_stage_sampled_images) / image_set_count,
+       uint64_t(limits.max_descriptor_set_sampled_images) / image_set_count,
+       (per_stage_budget - minimum_per_stage_fixed_budget) / image_set_count,
+       (pool_budget_per_copy - inputs.minimum_samplers) / image_set_count});
+  if (image_upper < inputs.minimum_sampled_images_per_set) {
+    result.status = NativeDescriptorStatus::kInsufficientDeviceLimits;
+    return result;
+  }
+  const uint32_t image_capacity = SearchLargestSupportedLayout(
+      NativeDescriptorKind::kSampledImage, uint32_t(image_upper), probe,
+      &result.sampled_image_probe_count);
+  if (image_capacity < inputs.minimum_sampled_images_per_set) {
+    result.status = NativeDescriptorStatus::kLayoutUnsupported;
+    return result;
+  }
+
+  const uint64_t sampled_images_per_stage = uint64_t(image_capacity) * image_set_count;
+  const uint64_t per_stage_sampler_budget =
+      per_stage_budget - storage_count - sampled_images_per_stage;
+  const uint64_t pool_sampler_budget =
+      pool_budget_per_copy - sampled_images_per_stage;
+  const uint64_t sampler_upper =
+      std::min<uint64_t>({inputs.desired_samplers, limits.max_per_stage_samplers,
+                          limits.max_descriptor_set_samplers,
+                          per_stage_sampler_budget, pool_sampler_budget});
+  if (sampler_upper < inputs.minimum_samplers) {
+    result.status = NativeDescriptorStatus::kInsufficientDeviceLimits;
+    return result;
+  }
+  const uint32_t sampler_capacity = SearchLargestSupportedLayout(
+      NativeDescriptorKind::kSampler, uint32_t(sampler_upper), probe,
+      &result.sampler_probe_count);
+  if (sampler_capacity < inputs.minimum_samplers) {
+    result.status = NativeDescriptorStatus::kLayoutUnsupported;
+    return result;
+  }
+
+  const uint64_t resources_per_stage =
+      sampled_images_per_stage + sampler_capacity + storage_count;
+  const uint64_t descriptors_per_copy = sampled_images_per_stage + sampler_capacity;
+  const uint64_t descriptors_per_page = descriptors_per_copy * frame_copy_count;
+  if (!descriptors_per_page ||
+      descriptors_per_page > available_pool_descriptors) {
+    result.status = NativeDescriptorStatus::kInsufficientDeviceLimits;
+    return result;
+  }
+  const uint64_t maximum_page_count =
+      available_pool_descriptors / descriptors_per_page;
+  const uint64_t required_pool_descriptors =
+      descriptors_per_page + inputs.pool_storage_descriptors;
+  const uint64_t uint32_max = std::numeric_limits<uint32_t>::max();
+  if (sampled_images_per_stage > uint32_max || resources_per_stage > uint32_max ||
+      descriptors_per_copy > uint32_max || descriptors_per_page > uint32_max ||
+      required_pool_descriptors > uint32_max ||
+      maximum_page_count > uint32_max) {
+    result.status = NativeDescriptorStatus::kInvalidConfiguration;
+    return result;
+  }
+
+  result.status = NativeDescriptorStatus::kSuccess;
+  result.sampled_images_per_set = image_capacity;
+  result.samplers = sampler_capacity;
+  result.sampled_images_per_stage = uint32_t(sampled_images_per_stage);
+  result.resources_per_stage = uint32_t(resources_per_stage);
+  result.descriptors_per_copy = uint32_t(descriptors_per_copy);
+  result.descriptors_per_page = uint32_t(descriptors_per_page);
+  result.required_pool_descriptors = uint32_t(required_pool_descriptors);
+  result.maximum_page_count = uint32_t(maximum_page_count);
   return result;
 }
 
@@ -526,4 +658,169 @@ bool NativeDescriptorEpochTable::IsRetirementComplete(NativeDescriptorSlotHandle
   return slot.state == SlotState::kFree;
 }
 
+NativeStableDescriptorSlotTable::NativeStableDescriptorSlotTable(
+    const NativeStableDescriptorSlotConfig& config)
+    : page_(config.page), slots_(config.slot_capacity) {
+  if (!config.slot_capacity) {
+    return;
+  }
+  for (uint32_t slot = 0; slot < config.slot_capacity; ++slot) {
+    free_slots_.push_back(slot);
+  }
+  initialization_status_ = NativeDescriptorStatus::kSuccess;
+}
+
+NativeDescriptorStatus NativeStableDescriptorSlotTable::ValidateHandle(
+    NativeDescriptorSlotHandle handle) const {
+  if (!valid()) {
+    return NativeDescriptorStatus::kInvalidConfiguration;
+  }
+  if (handle.page != page_ || handle.index >= slots_.size() || !handle.generation) {
+    return NativeDescriptorStatus::kInvalidSlot;
+  }
+  if (slots_[handle.index].generation != handle.generation) {
+    return NativeDescriptorStatus::kStaleSlot;
+  }
+  return NativeDescriptorStatus::kSuccess;
+}
+
+bool NativeStableDescriptorSlotTable::AdvanceSemanticEpoch() {
+  if (semantic_epoch_ == std::numeric_limits<uint64_t>::max()) {
+    return false;
+  }
+  ++semantic_epoch_;
+  return true;
+}
+
+NativeDescriptorAllocation NativeStableDescriptorSlotTable::Allocate() {
+  NativeDescriptorAllocation result{};
+  ++counters_.allocation_calls;
+  if (!valid()) {
+    return result;
+  }
+  if (free_slots_.empty()) {
+    result.status = NativeDescriptorStatus::kCapacityExhausted;
+    return result;
+  }
+
+  const uint32_t slot_index = free_slots_.front();
+  Slot& slot = slots_[slot_index];
+  if (slot.generation == std::numeric_limits<uint64_t>::max() ||
+      !AdvanceSemanticEpoch()) {
+    result.status = NativeDescriptorStatus::kCounterExhausted;
+    return result;
+  }
+
+  free_slots_.pop_front();
+  ++slot.generation;
+  slot.state = SlotState::kLive;
+  slot.retire_after_gpu_serial = 0;
+  ++live_count_;
+  ++counters_.publish_requirements;
+
+  result.status = NativeDescriptorStatus::kSuccess;
+  result.handle = {slot_index, slot.generation, page_};
+  return result;
+}
+
+NativeDescriptorStatus NativeStableDescriptorSlotTable::AbortUnsubmitted(
+    NativeDescriptorSlotHandle handle) {
+  ++counters_.abort_calls;
+  const NativeDescriptorStatus handle_status = ValidateHandle(handle);
+  if (handle_status != NativeDescriptorStatus::kSuccess) {
+    return handle_status;
+  }
+  Slot& slot = slots_[handle.index];
+  if (slot.state != SlotState::kLive) {
+    return NativeDescriptorStatus::kSlotNotLive;
+  }
+  if (!AdvanceSemanticEpoch()) {
+    return NativeDescriptorStatus::kCounterExhausted;
+  }
+
+  slot.state = SlotState::kFree;
+  slot.retire_after_gpu_serial = 0;
+  free_slots_.push_back(handle.index);
+  --live_count_;
+  ++counters_.aborted_unsubmitted_slots;
+  return NativeDescriptorStatus::kSuccess;
+}
+
+NativeDescriptorStatus NativeStableDescriptorSlotTable::Retire(
+    NativeDescriptorSlotHandle handle, uint64_t last_use_gpu_serial) {
+  ++counters_.retirement_calls;
+  const NativeDescriptorStatus handle_status = ValidateHandle(handle);
+  if (handle_status != NativeDescriptorStatus::kSuccess) {
+    return handle_status;
+  }
+  Slot& slot = slots_[handle.index];
+  if (slot.state != SlotState::kLive) {
+    return NativeDescriptorStatus::kSlotNotLive;
+  }
+
+  slot.state = SlotState::kRetiring;
+  slot.retire_after_gpu_serial = last_use_gpu_serial;
+  --live_count_;
+  ++retiring_count_;
+  return NativeDescriptorStatus::kSuccess;
+}
+
+NativeDescriptorStatus NativeStableDescriptorSlotTable::Reclaim(
+    NativeDescriptorSlotHandle handle, uint64_t completed_gpu_serial,
+    const ClearCallback& clear_callback) {
+  ++counters_.reclaim_calls;
+  const NativeDescriptorStatus handle_status = ValidateHandle(handle);
+  if (handle_status != NativeDescriptorStatus::kSuccess) {
+    return handle_status;
+  }
+  Slot& slot = slots_[handle.index];
+  if (slot.state != SlotState::kRetiring) {
+    return NativeDescriptorStatus::kSlotNotLive;
+  }
+  if (completed_gpu_serial < slot.retire_after_gpu_serial) {
+    return NativeDescriptorStatus::kGpuSubmissionPending;
+  }
+  if (!clear_callback ||
+      semantic_epoch_ == std::numeric_limits<uint64_t>::max()) {
+    return !clear_callback ? NativeDescriptorStatus::kDescriptorClearFailed
+                           : NativeDescriptorStatus::kCounterExhausted;
+  }
+
+  ++counters_.clear_callbacks;
+  if (!clear_callback(handle)) {
+    return NativeDescriptorStatus::kDescriptorClearFailed;
+  }
+  if (!AdvanceSemanticEpoch()) {
+    return NativeDescriptorStatus::kCounterExhausted;
+  }
+
+  slot.state = SlotState::kFree;
+  slot.retire_after_gpu_serial = 0;
+  free_slots_.push_back(handle.index);
+  --retiring_count_;
+  ++counters_.reclaimed_slots;
+  return NativeDescriptorStatus::kSuccess;
+}
+
+bool NativeStableDescriptorSlotTable::IsLive(
+    NativeDescriptorSlotHandle handle) const {
+  return ValidateHandle(handle) == NativeDescriptorStatus::kSuccess &&
+         slots_[handle.index].state == SlotState::kLive;
+}
+
+bool NativeStableDescriptorSlotTable::IsRetiring(
+    NativeDescriptorSlotHandle handle) const {
+  return ValidateHandle(handle) == NativeDescriptorStatus::kSuccess &&
+         slots_[handle.index].state == SlotState::kRetiring;
+}
+
+bool NativeStableDescriptorSlotTable::IsRetirementComplete(
+    NativeDescriptorSlotHandle handle) const {
+  if (!valid() || handle.page != page_ || handle.index >= slots_.size() ||
+      !handle.generation) {
+    return false;
+  }
+  const Slot& slot = slots_[handle.index];
+  return slot.generation != handle.generation || slot.state == SlotState::kFree;
+}
 }  // namespace rex::graphics::gta4_native

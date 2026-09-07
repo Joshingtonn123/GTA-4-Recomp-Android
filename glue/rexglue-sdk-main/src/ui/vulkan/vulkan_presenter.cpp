@@ -29,6 +29,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/diagnostics/policy.h>
+#include <rex/diagnostics/gpu_flight_recorder.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
@@ -73,6 +74,15 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
 
+REXCVAR_DEFINE_BOOL(vulkan_prefer_present_mode_fifo,
+#if REX_PLATFORM_MAC
+                    true,
+#else
+                    false,
+#endif
+                    "UI/Vulkan",
+                    "Prefer strict display-paced FIFO presentation over mailbox and immediate");
+
 REXCVAR_DEFINE_UINT32(vulkan_present_acquire_timeout_ms, 50, "UI/Vulkan",
                       "Maximum wait for a swapchain image before dropping a paint attempt")
     .range(1, 1000);
@@ -80,11 +90,16 @@ REXCVAR_DEFINE_UINT32(vulkan_present_acquire_timeout_ms, 50, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_presenter_probe_guest_output_pixels, false, "UI/Vulkan",
                     "Periodically read back guest output for pixel diagnostics");
 
+REXCVAR_DEFINE_BOOL(
+    vulkan_presenter_probe_swapchain_pixels, false, "UI/Vulkan",
+    "Asynchronously sample swapchain pixels immediately before presentation");
+
 static constexpr bool kVulkanHDRDefault = false;
 REXCVAR_DEFINE_BOOL(vulkan_hdr, kVulkanHDRDefault, "UI/Vulkan",
                     "Use an FP16 extended-linear HDR swapchain when supported");
 
 namespace rex {
+namespace gpu_flight = rex::diagnostics::gpu_flight;
 namespace ui {
 namespace vulkan {
 
@@ -104,6 +119,20 @@ float IEEEHalfToFloat(uint16_t value) {
     magnitude = std::ldexp(1.0f + float(fraction) / 1024.0f, int(exponent) - 15);
   }
   return sign ? -magnitude : magnitude;
+}
+
+VkDeviceSize GetDiagnosticSwapchainProbePixelStride(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+      return 8;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+      return 4;
+    default:
+      return 0;
+  }
 }
 
 float LinearToSRGB(float value) {
@@ -177,6 +206,19 @@ VulkanPresenter::PaintContext::Submission::~Submission() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
+  if (diagnostic_swapchain_probe_.mapping) {
+    dfn.vkUnmapMemory(device, diagnostic_swapchain_probe_.memory);
+    diagnostic_swapchain_probe_.mapping = nullptr;
+  }
+  if (diagnostic_swapchain_probe_.buffer != VK_NULL_HANDLE) {
+    dfn.vkDestroyBuffer(device, diagnostic_swapchain_probe_.buffer, nullptr);
+    diagnostic_swapchain_probe_.buffer = VK_NULL_HANDLE;
+  }
+  if (diagnostic_swapchain_probe_.memory != VK_NULL_HANDLE) {
+    dfn.vkFreeMemory(device, diagnostic_swapchain_probe_.memory, nullptr);
+    diagnostic_swapchain_probe_.memory = VK_NULL_HANDLE;
+  }
+
   if (draw_command_pool_ != VK_NULL_HANDLE) {
     dfn.vkDestroyCommandPool(device, draw_command_pool_, nullptr);
   }
@@ -227,6 +269,36 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
     return false;
   }
 
+  return true;
+}
+
+bool VulkanPresenter::PaintContext::Submission::InitializeDiagnosticSwapchainProbe() {
+  DiagnosticSwapchainProbe& probe = diagnostic_swapchain_probe_;
+  if (probe.mapping) {
+    return true;
+  }
+
+  if (!util::CreateDedicatedAllocationBuffer(
+          vulkan_device_, kDiagnosticSwapchainProbeBufferSize,
+          VK_BUFFER_USAGE_TRANSFER_DST_BIT, util::MemoryPurpose::kReadback,
+          probe.buffer, probe.memory, &probe.memory_type, &probe.memory_size)) {
+    return false;
+  }
+
+  void* mapping = nullptr;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  if (dfn.vkMapMemory(device, probe.memory, 0, VK_WHOLE_SIZE, 0, &mapping) !=
+      VK_SUCCESS) {
+    dfn.vkDestroyBuffer(device, probe.buffer, nullptr);
+    dfn.vkFreeMemory(device, probe.memory, nullptr);
+    probe.buffer = VK_NULL_HANDLE;
+    probe.memory = VK_NULL_HANDLE;
+    probe.memory_type = UINT32_MAX;
+    probe.memory_size = 0;
+    return false;
+  }
+  probe.mapping = static_cast<uint8_t*>(mapping);
   return true;
 }
 
@@ -817,6 +889,23 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   VkColorSpaceKHR new_swapchain_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
   bool new_swapchain_is_hdr = false;
   const bool new_swapchain_hdr_requested = REXCVAR_GET(vulkan_hdr);
+  const bool new_swapchain_probe_requested =
+      REXCVAR_GET(vulkan_presenter_probe_swapchain_pixels);
+  bool new_swapchain_probe_resources_ready = true;
+  if (new_swapchain_probe_requested) {
+    for (const auto& submission : paint_context_.submissions) {
+      if (!submission->InitializeDiagnosticSwapchainProbe()) {
+        new_swapchain_probe_resources_ready = false;
+        break;
+      }
+    }
+    if (!new_swapchain_probe_resources_ready) {
+      REXLOG_WARN(
+          "VulkanPresenter: Swapchain pixel probe readback allocation failed; "
+          "continuing without the probe");
+    }
+  }
+  bool new_swapchain_probe_enabled = false;
 
   // ConnectOrReconnectToSurfaceFromUIThread may be called only for the
   // ui::Surface of the current swapchain or when the old swapchain and
@@ -831,10 +920,12 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     bool surface_unusable;
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
-        old_swapchain, new_swapchain_hdr_requested, paint_context_.present_queue_family,
-        new_swapchain_format,
+        old_swapchain, new_swapchain_hdr_requested,
+        new_swapchain_probe_requested && new_swapchain_probe_resources_ready,
+        paint_context_.present_queue_family, new_swapchain_format,
         new_swapchain_color_space, paint_context_.swapchain_extent,
-        paint_context_.swapchain_is_fifo, new_swapchain_is_hdr, surface_unusable);
+        paint_context_.swapchain_is_fifo, new_swapchain_is_hdr,
+        new_swapchain_probe_enabled, surface_unusable);
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -926,9 +1017,12 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     bool surface_unusable;
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
-        VK_NULL_HANDLE, new_swapchain_hdr_requested, paint_context_.present_queue_family,
-        new_swapchain_format, new_swapchain_color_space, paint_context_.swapchain_extent,
-        paint_context_.swapchain_is_fifo, new_swapchain_is_hdr, surface_unusable);
+        VK_NULL_HANDLE, new_swapchain_hdr_requested,
+        new_swapchain_probe_requested && new_swapchain_probe_resources_ready,
+        paint_context_.present_queue_family, new_swapchain_format,
+        new_swapchain_color_space, paint_context_.swapchain_extent,
+        paint_context_.swapchain_is_fifo, new_swapchain_is_hdr,
+        new_swapchain_probe_enabled, surface_unusable);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -944,12 +1038,30 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // paint_context_.DestroySwapchainAndVulkanSurface must be called before
   // returning.
 
+  ++diagnostic_swapchain_epoch_;
+
+  if (new_swapchain_probe_enabled &&
+      !GetDiagnosticSwapchainProbePixelStride(new_swapchain_format)) {
+    REXLOG_WARN(
+        "VulkanPresenter: Swapchain format {} is unsupported by the pixel "
+        "probe; continuing without the probe",
+        uint32_t(new_swapchain_format));
+    new_swapchain_probe_enabled = false;
+  }
+
   paint_context_.swapchain_color_space = new_swapchain_color_space;
   paint_context_.swapchain_is_hdr = new_swapchain_is_hdr;
   paint_context_.swapchain_hdr_requested = new_swapchain_hdr_requested;
+  paint_context_.swapchain_probe_requested = new_swapchain_probe_requested;
+  paint_context_.swapchain_probe_enabled = new_swapchain_probe_enabled;
 
-  // Update the render pass to the new format.
-  if (paint_context_.swapchain_render_pass_format != new_swapchain_format) {
+  // Update the render pass if its attachment format or final-layout contract
+  // changed. The opt-in probe ends the pass in transfer-source layout so it
+  // can sample the completed UI composition before returning the image to the
+  // presentation layout.
+  if (paint_context_.swapchain_render_pass_format != new_swapchain_format ||
+      paint_context_.swapchain_render_pass_transfer_source !=
+          new_swapchain_probe_enabled) {
     util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
                                paint_context_.swapchain_render_pass);
     paint_context_.swapchain_render_pass_format = new_swapchain_format;
@@ -966,7 +1078,9 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     render_pass_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     render_pass_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     render_pass_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    render_pass_attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    render_pass_attachment.finalLayout = new_swapchain_probe_enabled
+                                             ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                             : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     VkAttachmentReference render_pass_color_attachment;
     render_pass_color_attachment.attachment = 0;
     render_pass_color_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -989,11 +1103,14 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     render_pass_dependencies[1].srcSubpass = 0;
     render_pass_dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
     render_pass_dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    // Semaphores are signaled at VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT.
-    render_pass_dependencies[1].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    render_pass_dependencies[1].dstStageMask =
+        new_swapchain_probe_enabled ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                                    : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     render_pass_dependencies[1].srcAccessMask =
         VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    render_pass_dependencies[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    render_pass_dependencies[1].dstAccessMask =
+        new_swapchain_probe_enabled ? VK_ACCESS_TRANSFER_READ_BIT
+                                    : VK_ACCESS_MEMORY_READ_BIT;
     render_pass_dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
     VkRenderPassCreateInfo render_pass_create_info;
     render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -1018,6 +1135,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain_render_pass_format = new_swapchain_format;
     paint_context_.swapchain_render_pass_clear_load_op =
         render_pass_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+    paint_context_.swapchain_render_pass_transfer_source =
+        new_swapchain_probe_enabled;
   }
 
   // Swapchain paint pipelines are render-pass-format-specific. Keep their
@@ -1225,12 +1344,14 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
 
 VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
-    VkSwapchainKHR old_swapchain, bool hdr_requested, uint32_t& present_queue_family_out,
-    VkFormat& image_format_out, VkColorSpaceKHR& image_color_space_out,
-    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& is_hdr_out,
+    VkSwapchainKHR old_swapchain, bool hdr_requested, bool swapchain_probe_requested,
+    uint32_t& present_queue_family_out, VkFormat& image_format_out,
+    VkColorSpaceKHR& image_color_space_out, VkExtent2D& image_extent_out,
+    bool& is_fifo_out, bool& is_hdr_out, bool& swapchain_probe_enabled_out,
     bool& ui_surface_unusable_out) {
   ui_surface_unusable_out = false;
   is_hdr_out = false;
+  swapchain_probe_enabled_out = false;
 
   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
   const VkPhysicalDevice physical_device = vulkan_device->physical_device();
@@ -1476,6 +1597,17 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.imageExtent = image_extent;
   swapchain_create_info.imageArrayLayers = 1;
   swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  if (swapchain_probe_requested) {
+    if (surface_capabilities.supportedUsageFlags &
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+      swapchain_create_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      swapchain_probe_enabled_out = true;
+    } else {
+      REXLOG_WARN(
+          "VulkanPresenter: Surface does not support transfer-source "
+          "swapchain images; swapchain pixel probe disabled");
+    }
+  }
   uint32_t swapchain_queue_family_indices[2];
   if (queue_family_index_graphics_compute != queue_family_index_present) {
     // Using concurrent sharing mode to avoid an explicit ownership transfer
@@ -1519,11 +1651,15 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     swapchain_create_info.compositeAlpha =
         VkCompositeAlphaFlagBitsKHR(uint32_t(1) << composite_alpha_shift);
   }
-  // Prefer mailbox where available. It keeps multiple drawable images in
-  // circulation without the sustained above-refresh immediate-present
-  // behavior that can turn MoltenVK drawable acquisition into periodic CPU
-  // stalls. Immediate remains an explicit opt-in.
-  if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
+  // Strict FIFO is the macOS default for display-clock backpressure. Other
+  // platforms retain the lower-latency mailbox preference, with immediate
+  // presentation remaining an explicit platform policy.
+  if (REXCVAR_GET(vulkan_prefer_present_mode_fifo)) {
+    // FIFO is required by Vulkan and supplies display-clock backpressure rather
+    // than letting the guest-output producer continuously replace mailbox
+    // entries. On macOS this also keeps presentation on the AppKit/UI path.
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
           present_modes.cend()) {
     swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
@@ -1585,6 +1721,8 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
   swapchain_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
   swapchain_is_hdr = false;
   swapchain_hdr_requested = false;
+  swapchain_probe_requested = false;
+  swapchain_probe_enabled = false;
   // The old swapchain must be destroyed externally.
   VkSwapchainKHR old_swapchain = swapchain;
   swapchain = nullptr;
@@ -1677,6 +1815,12 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
   const uint64_t paint_timing_begin = rex::chrono::Clock::QueryHostTickCount();
+  const uint64_t tv_paint_attempt = ++diagnostic_tv_paint_sequence_;
+  const bool tv_trace_carried = diagnostic_tv_paint_carry_remaining_ != 0;
+  GuestOutputProvenance tv_trace_provenance = diagnostic_tv_provenance_;
+  if (tv_trace_carried) {
+    --diagnostic_tv_paint_carry_remaining_;
+  }
   uint64_t paint_acquire_ticks = 0;
   uint64_t paint_submit_ticks = 0;
   uint64_t paint_present_ticks = 0;
@@ -1688,6 +1832,17 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 REXCVAR_GET(vulkan_hdr));
     return PaintResult::kNotPresentedConnectionOutdated;
   }
+  if (paint_context_.swapchain_probe_requested !=
+      REXCVAR_GET(vulkan_presenter_probe_swapchain_pixels)) {
+    REXLOG_INFO(
+        "VulkanPresenter: Swapchain pixel probe setting changed to {}; "
+        "recreating swapchain",
+        REXCVAR_GET(vulkan_presenter_probe_swapchain_pixels));
+    return PaintResult::kNotPresentedConnectionOutdated;
+  }
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
 
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
@@ -1702,14 +1857,157 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       // this submission on its asynchronous queue. Never wait for that work on
       // the AppKit thread: yielding to the event loop is what lets Core
       // Animation recycle drawables and break drawable-starvation cycles.
+      if (tv_trace_carried) {
+        REXLOG_INFO(
+            "gta4-tv-paint-attempt: session={} present={} frame={} attempt={} "
+            "ui={} provenance=carry result=retry reason=submission-in-flight "
+            "paint-submission={} reusable-submission={} swapchain-epoch={}",
+            tv_trace_provenance.tv_session_id, tv_trace_provenance.title_present_id,
+            tv_trace_provenance.submitted_frame, tv_paint_attempt, execute_ui_drawers,
+            current_paint_submission_index, reusable_submission_index,
+            diagnostic_swapchain_epoch_);
+      }
       return PaintResult::kNotPresentedRetry;
     }
   }
-  const PaintContext::Submission& paint_submission =
+  PaintContext::Submission& paint_submission =
       *paint_context_.submissions[current_paint_submission_index % paint_submission_count];
 
-  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
-  const VkDevice device = vulkan_device_->device();
+  PaintContext::Submission::DiagnosticSwapchainProbe& completed_probe =
+      paint_submission.diagnostic_swapchain_probe();
+  if (completed_probe.pending) {
+    if (!(vulkan_device_->memory_types().host_coherent &
+          (uint32_t(1) << completed_probe.memory_type))) {
+      VkMappedMemoryRange invalidate_range;
+      invalidate_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      invalidate_range.pNext = nullptr;
+      invalidate_range.memory = completed_probe.memory;
+      invalidate_range.offset = 0;
+      invalidate_range.size = VK_WHOLE_SIZE;
+      if (dfn.vkInvalidateMappedMemoryRanges(device, 1, &invalidate_range) !=
+          VK_SUCCESS) {
+        REXLOG_WARN(
+            "VulkanPresenter: Failed to invalidate swapchain probe memory");
+      }
+    }
+
+    uint32_t rgb_nonzero_samples = 0;
+    uint32_t nonfinite_rgb_samples = 0;
+    uint32_t negative_rgb_samples = 0;
+    uint32_t nonfinite_alpha_samples = 0;
+    uint32_t negative_alpha_samples = 0;
+    uint32_t zero_alpha_samples = 0;
+    std::array<float,
+               PaintContext::Submission::kDiagnosticSwapchainProbeSampleCount>
+        luminance_samples{};
+    float luminance_min = std::numeric_limits<float>::infinity();
+    float luminance_max = -std::numeric_limits<float>::infinity();
+    double luminance_sum = 0.0;
+    float alpha_min = std::numeric_limits<float>::infinity();
+    float alpha_max = -std::numeric_limits<float>::infinity();
+    VkDeviceSize sampled_byte_count = 0;
+    if (completed_probe.format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+      sampled_byte_count =
+          PaintContext::Submission::kDiagnosticSwapchainProbeSampleCount * 8;
+      const uint16_t* sample =
+          reinterpret_cast<const uint16_t*>(completed_probe.mapping);
+      for (uint32_t i = 0;
+           i < PaintContext::Submission::kDiagnosticSwapchainProbeSampleCount;
+           ++i, sample += 4) {
+        const float red = IEEEHalfToFloat(sample[0]);
+        const float green = IEEEHalfToFloat(sample[1]);
+        const float blue = IEEEHalfToFloat(sample[2]);
+        const float alpha = IEEEHalfToFloat(sample[3]);
+        const bool finite = std::isfinite(red) && std::isfinite(green) &&
+                            std::isfinite(blue);
+        nonfinite_rgb_samples += uint32_t(!finite);
+        rgb_nonzero_samples +=
+            uint32_t(red != 0.0f || green != 0.0f || blue != 0.0f);
+        negative_rgb_samples +=
+            uint32_t(red < 0.0f || green < 0.0f || blue < 0.0f);
+        const float luminance = finite
+                                    ? 0.2126f * std::max(red, 0.0f) +
+                                          0.7152f * std::max(green, 0.0f) +
+                                          0.0722f * std::max(blue, 0.0f)
+                                    : 0.0f;
+        luminance_samples[i] = luminance;
+        luminance_min = std::min(luminance_min, luminance);
+        luminance_max = std::max(luminance_max, luminance);
+        luminance_sum += double(luminance);
+        const bool alpha_finite = std::isfinite(alpha);
+        nonfinite_alpha_samples += uint32_t(!alpha_finite);
+        negative_alpha_samples += uint32_t(alpha_finite && alpha < 0.0f);
+        zero_alpha_samples += uint32_t(alpha_finite && alpha == 0.0f);
+        if (alpha_finite) {
+          alpha_min = std::min(alpha_min, alpha);
+          alpha_max = std::max(alpha_max, alpha);
+        }
+      }
+    } else {
+      sampled_byte_count =
+          PaintContext::Submission::kDiagnosticSwapchainProbeSampleCount * 4;
+      const uint8_t* sample = completed_probe.mapping;
+      for (uint32_t i = 0;
+           i < PaintContext::Submission::kDiagnosticSwapchainProbeSampleCount;
+           ++i, sample += 4) {
+        const bool bgra =
+            completed_probe.format == VK_FORMAT_B8G8R8A8_UNORM ||
+            completed_probe.format == VK_FORMAT_B8G8R8A8_SRGB;
+        const float red = float(sample[bgra ? 2 : 0]) / 255.0f;
+        const float green = float(sample[1]) / 255.0f;
+        const float blue = float(sample[bgra ? 0 : 2]) / 255.0f;
+        const float alpha = float(sample[3]) / 255.0f;
+        rgb_nonzero_samples +=
+            uint32_t(red != 0.0f || green != 0.0f || blue != 0.0f);
+        const float luminance =
+            0.2126f * red + 0.7152f * green + 0.0722f * blue;
+        luminance_samples[i] = luminance;
+        luminance_min = std::min(luminance_min, luminance);
+        luminance_max = std::max(luminance_max, luminance);
+        luminance_sum += double(luminance);
+        zero_alpha_samples += uint32_t(alpha == 0.0f);
+        alpha_min = std::min(alpha_min, alpha);
+        alpha_max = std::max(alpha_max, alpha);
+      }
+    }
+    std::sort(luminance_samples.begin(), luminance_samples.end());
+    constexpr size_t kLuminanceP50Index = 127;
+    constexpr size_t kLuminanceP90Index = 230;
+    constexpr size_t kLuminanceP99Index = 253;
+    const double luminance_mean =
+        luminance_sum /
+        double(PaintContext::Submission::kDiagnosticSwapchainProbeSampleCount);
+    if (!std::isfinite(alpha_min)) {
+      alpha_min = 0.0f;
+      alpha_max = 0.0f;
+    }
+    const uint64_t checksum = std::hash<std::string_view>{}(std::string_view(
+        reinterpret_cast<const char*>(completed_probe.mapping),
+        size_t(sampled_byte_count)));
+    const GuestOutputProvenance& provenance = completed_probe.provenance;
+    REXLOG_INFO(
+        "gta4-tv-swapchain-content: session={} present={} frame={} attempt={} "
+        "paint-submission={} swapchain-epoch={} swapchain-image={} format={} "
+        "guest-pass={} full-black-fallback={} rgb-nonzero={}/{} nonfinite={} "
+        "rgb-negative={} luma-min={:.9f} luma-mean={:.9f} luma-p50={:.9f} "
+        "luma-p90={:.9f} luma-p99={:.9f} luma-max={:.9f} "
+        "alpha-min={:.9f} alpha-max={:.9f} alpha-zero={} "
+        "alpha-negative={} alpha-nonfinite={} full-black={} checksum={:016X}",
+        provenance.tv_session_id, provenance.title_present_id,
+        provenance.submitted_frame, completed_probe.paint_attempt,
+        completed_probe.paint_submission, completed_probe.swapchain_epoch,
+        completed_probe.swapchain_image, uint32_t(completed_probe.format),
+        completed_probe.guest_pass, completed_probe.full_black_fallback,
+        rgb_nonzero_samples,
+        PaintContext::Submission::kDiagnosticSwapchainProbeSampleCount,
+        nonfinite_rgb_samples, negative_rgb_samples, luminance_min,
+        luminance_mean, luminance_samples[kLuminanceP50Index],
+        luminance_samples[kLuminanceP90Index],
+        luminance_samples[kLuminanceP99Index], luminance_max, alpha_min,
+        alpha_max, zero_alpha_samples, negative_alpha_samples,
+        nonfinite_alpha_samples, rgb_nonzero_samples == 0, checksum);
+    completed_probe.pending = false;
+  }
 
   VkCommandPool draw_command_pool = paint_submission.draw_command_pool();
   if (dfn.vkResetCommandPool(device, draw_command_pool, 0) != VK_SUCCESS) {
@@ -1735,21 +2033,48 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   // safe to return early from this function in case of an error.
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
-  uint32_t swapchain_image_index;
+  uint32_t swapchain_image_index = UINT32_MAX;
   // An occluded, minimized, or drawable-starved surface must not block this
   // thread forever. A timeout drops only this paint attempt.
   const uint64_t acquire_timeout_nanoseconds =
       uint64_t(REXCVAR_GET(vulkan_present_acquire_timeout_ms)) * 1000000ull;
   const uint64_t paint_acquire_begin = rex::chrono::Clock::QueryHostTickCount();
+  gpu_flight::Record("present.acquire-begin", uint64_t(uintptr_t(paint_context_.swapchain)),
+                     current_paint_submission_index, tv_trace_provenance.submitted_frame,
+                     uint64_t(uintptr_t(acquire_semaphore)), diagnostic_swapchain_epoch_);
   VkResult acquire_result = dfn.vkAcquireNextImageKHR(
       device, paint_context_.swapchain, acquire_timeout_nanoseconds, acquire_semaphore,
       VK_NULL_HANDLE, &swapchain_image_index);
+  gpu_flight::Record("present.acquire-end", uint64_t(uintptr_t(paint_context_.swapchain)),
+                     current_paint_submission_index, tv_trace_provenance.submitted_frame,
+                     swapchain_image_index, diagnostic_swapchain_epoch_, int32_t(acquire_result));
+  if (acquire_result < VK_SUCCESS && acquire_result != VK_ERROR_OUT_OF_DATE_KHR &&
+      acquire_result != VK_ERROR_SURFACE_LOST_KHR &&
+      acquire_result != VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
+    gpu_flight::Fail("present.acquire", int32_t(acquire_result),
+                     uint64_t(uintptr_t(paint_context_.swapchain)), current_paint_submission_index,
+                     tv_trace_provenance.submitted_frame);
+  }
   paint_acquire_ticks = rex::chrono::Clock::QueryHostTickCount() - paint_acquire_begin;
+  const auto log_tv_acquire_exit = [&](const char* result, const char* reason) {
+    if (!tv_trace_carried) {
+      return;
+    }
+    REXLOG_INFO(
+        "gta4-tv-paint-attempt: session={} present={} frame={} attempt={} ui={} "
+        "provenance=carry result={} reason={} paint-submission={} "
+        "swapchain-epoch={} acquire={}",
+        tv_trace_provenance.tv_session_id, tv_trace_provenance.title_present_id,
+        tv_trace_provenance.submitted_frame, tv_paint_attempt, execute_ui_drawers,
+        result, reason, current_paint_submission_index, diagnostic_swapchain_epoch_,
+        int32_t(acquire_result));
+  };
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
       break;
     case VK_ERROR_DEVICE_LOST:
+      log_tv_acquire_exit("gpu-lost", "acquire-device-lost");
       REXLOG_ERROR(
           "VulkanPresenter: Failed to acquire the swapchain image as the "
           "device has been lost");
@@ -1757,6 +2082,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_ERROR_OUT_OF_DATE_KHR:
     case VK_ERROR_SURFACE_LOST_KHR:
     case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
+      log_tv_acquire_exit("connection-outdated", "acquire-surface-outdated");
       // Not an error, reporting just as info (may normally occur while resizing
       // on some platforms).
       REXLOG_INFO(
@@ -1765,9 +2091,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       return PaintResult::kNotPresentedConnectionOutdated;
     case VK_TIMEOUT:
     case VK_NOT_READY:
+      log_tv_acquire_exit("retry", "acquire-not-ready");
       REXLOG_WARN("VulkanPresenter: Timed out while acquiring a swapchain image");
       return PaintResult::kNotPresentedRetry;
     default:
+      log_tv_acquire_exit("not-presented", "acquire-failed");
       REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image");
       return PaintResult::kNotPresented;
   }
@@ -1821,6 +2149,20 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // the consumer critical section now as everything here either will be using
     // the new reference or is exclusively owned by main target painting (and
     // multiple threads can't paint the main target at the same time).
+  }
+
+  bool log_tv_paint = tv_trace_carried;
+  bool tv_provenance_is_current = false;
+  if (guest_output_properties.provenance.diagnostic_trace) {
+    diagnostic_tv_provenance_ = guest_output_properties.provenance;
+    diagnostic_tv_paint_carry_remaining_ = PaintContext::kSubmissionCount;
+    tv_trace_provenance = guest_output_properties.provenance;
+    tv_provenance_is_current = true;
+    log_tv_paint = true;
+  } else if (guest_output_properties.provenance.title_present_id &&
+             guest_output_properties.provenance.tv_session_id ==
+                 diagnostic_tv_provenance_.tv_session_id) {
+    diagnostic_tv_paint_carry_remaining_ = 0;
   }
 
   if (guest_output_image) {
@@ -2319,6 +2661,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   // If hasn't presented the guest output, begin the pass to clear and, if
   // needed, to draw the UI.
+  const bool guest_output_pass_recorded = swapchain_image_pass_begun;
+  const bool full_black_fallback_recorded = !swapchain_image_pass_begun;
   if (!swapchain_image_pass_begun) {
     dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
                              VK_SUBPASS_CONTENTS_INLINE);
@@ -2346,6 +2690,105 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   }
 
   dfn.vkCmdEndRenderPass(draw_command_buffer);
+
+  bool swapchain_probe_recorded = false;
+  PaintContext::Submission::DiagnosticSwapchainProbe& swapchain_probe =
+      paint_submission.diagnostic_swapchain_probe();
+  if (paint_context_.swapchain_probe_enabled) {
+    if (log_tv_paint) {
+      const VkDeviceSize pixel_stride = swapchain_probe.mapping
+                                            ? GetDiagnosticSwapchainProbePixelStride(
+                                                  paint_context_.swapchain_render_pass_format)
+                                            : 0;
+      if (pixel_stride) {
+        std::array<
+            VkBufferImageCopy,
+            PaintContext::Submission::kDiagnosticSwapchainProbeSampleCount>
+            copy_regions;
+        uint32_t region_index = 0;
+        for (uint32_t grid_y = 0;
+             grid_y <
+             PaintContext::Submission::kDiagnosticSwapchainProbeGridHeight;
+             ++grid_y) {
+          for (uint32_t grid_x = 0;
+               grid_x <
+               PaintContext::Submission::kDiagnosticSwapchainProbeGridWidth;
+               ++grid_x, ++region_index) {
+            VkBufferImageCopy& region = copy_regions[region_index];
+            region.bufferOffset = VkDeviceSize(region_index) * pixel_stride;
+            region.bufferRowLength = 0;
+            region.bufferImageHeight = 0;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.mipLevel = 0;
+            region.imageSubresource.baseArrayLayer = 0;
+            region.imageSubresource.layerCount = 1;
+            region.imageOffset.x = int32_t(
+                uint64_t(paint_context_.swapchain_extent.width) *
+                (uint64_t(grid_x) * 2 + 1) /
+                (uint64_t(
+                     PaintContext::Submission::
+                         kDiagnosticSwapchainProbeGridWidth) *
+                 2));
+            region.imageOffset.y = int32_t(
+                uint64_t(paint_context_.swapchain_extent.height) *
+                (uint64_t(grid_y) * 2 + 1) /
+                (uint64_t(
+                     PaintContext::Submission::
+                         kDiagnosticSwapchainProbeGridHeight) *
+                 2));
+            region.imageOffset.z = 0;
+            region.imageExtent.width = 1;
+            region.imageExtent.height = 1;
+            region.imageExtent.depth = 1;
+          }
+        }
+
+        dfn.vkCmdCopyImageToBuffer(
+            draw_command_buffer,
+            paint_context_.swapchain_images[swapchain_image_index],
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain_probe.buffer,
+            uint32_t(copy_regions.size()), copy_regions.data());
+
+        VkBufferMemoryBarrier readback_barrier;
+        readback_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        readback_barrier.pNext = nullptr;
+        readback_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        readback_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        readback_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        readback_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        readback_barrier.buffer = swapchain_probe.buffer;
+        readback_barrier.offset = 0;
+        readback_barrier.size = VK_WHOLE_SIZE;
+        dfn.vkCmdPipelineBarrier(
+            draw_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+            &readback_barrier, 0, nullptr);
+        swapchain_probe_recorded = true;
+      }
+    }
+
+    VkImageMemoryBarrier present_barrier;
+    present_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    present_barrier.pNext = nullptr;
+    present_barrier.srcAccessMask =
+        swapchain_probe_recorded ? VK_ACCESS_TRANSFER_READ_BIT : 0;
+    present_barrier.dstAccessMask = 0;
+    present_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    present_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    present_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    present_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    present_barrier.image =
+        paint_context_.swapchain_images[swapchain_image_index];
+    present_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    present_barrier.subresourceRange.baseMipLevel = 0;
+    present_barrier.subresourceRange.levelCount = 1;
+    present_barrier.subresourceRange.baseArrayLayer = 0;
+    present_barrier.subresourceRange.layerCount = 1;
+    dfn.vkCmdPipelineBarrier(
+        draw_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
+        1, &present_barrier);
+  }
 
   dfn.vkEndCommandBuffer(draw_command_buffer);
 
@@ -2383,6 +2826,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   submit_info.pCommandBuffers = command_buffers;
   submit_info.signalSemaphoreCount = 1;
   submit_info.pSignalSemaphores = &present_semaphore;
+  VkResult submit_result = VK_SUCCESS;
   {
     VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
         paint_context_.submission_tracker.AcquireFenceToAdvanceSubmission());
@@ -2392,13 +2836,24 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     if (execute_ui_drawers) {
       ui_fence_acquisition = ui_submission_tracker_.AcquireFenceToAdvanceSubmission();
     }
-    VkResult submit_result;
     const uint64_t paint_submit_begin = rex::chrono::Clock::QueryHostTickCount();
     {
       const VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+      gpu_flight::Record("present.submit-begin", uint64_t(uintptr_t(draw_command_buffer)),
+                         current_paint_submission_index, tv_trace_provenance.submitted_frame,
+                         swapchain_image_index, uint64_t(uintptr_t(fence_acqusition.fence())));
       submit_result =
           dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
+      gpu_flight::Record("present.submit-end", uint64_t(uintptr_t(draw_command_buffer)),
+                         current_paint_submission_index, tv_trace_provenance.submitted_frame,
+                         swapchain_image_index, uint64_t(uintptr_t(present_semaphore)),
+                         int32_t(submit_result));
+      if (submit_result < VK_SUCCESS) {
+        gpu_flight::Fail("present.submit", int32_t(submit_result),
+                         uint64_t(uintptr_t(draw_command_buffer)), current_paint_submission_index,
+                         tv_trace_provenance.submitted_frame);
+      }
       if (ui_fence_acquisition.fence() != VK_NULL_HANDLE && submit_result == VK_SUCCESS) {
         if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr,
                               ui_fence_acquisition.fence()) != VK_SUCCESS) {
@@ -2408,6 +2863,32 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     }
     paint_submit_ticks = rex::chrono::Clock::QueryHostTickCount() - paint_submit_begin;
     if (submit_result != VK_SUCCESS) {
+      if (log_tv_paint) {
+        const auto& provenance = tv_trace_provenance;
+        REXLOG_INFO(
+            "gta4-tv-paint: session={} present={} frame={} final={} movie={} rect={} "
+            "bink={}:{} attempt={} ui={} provenance={} origin={} caller={:08X} "
+            "mailbox={} mailbox-version={} guest-image={} effects={} guest-pass={} "
+            "full-black={} paint-submission={} swapchain-epoch={} swapchain-image={} "
+            "acquire={} submit={} present=not-attempted",
+            provenance.tv_session_id, provenance.title_present_id,
+            provenance.submitted_frame, provenance.tv_final_sequence,
+            provenance.tv_movie_sequence, provenance.tv_rect_sequence,
+            provenance.tv_bink_sequence, provenance.tv_bink_result,
+            tv_paint_attempt, execute_ui_drawers,
+            tv_provenance_is_current ? "current" : "carry",
+            provenance.present_origin, provenance.guest_caller,
+            guest_output_mailbox_index == UINT32_MAX
+                ? -1
+                : int32_t(guest_output_mailbox_index),
+            guest_output_mailbox_index == UINT32_MAX
+                ? 0
+                : guest_output_images_[guest_output_mailbox_index].version,
+            bool(guest_output_image), guest_output_effect_count,
+            guest_output_pass_recorded, full_black_fallback_recorded,
+            current_paint_submission_index, diagnostic_swapchain_epoch_,
+            swapchain_image_index, int32_t(acquire_result), int32_t(submit_result));
+      }
       REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers");
       fence_acqusition.SubmissionFailedOrDropped();
       ui_fence_acquisition.SubmissionFailedOrDropped();
@@ -2427,6 +2908,18 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     }
   }
 
+  if (swapchain_probe_recorded) {
+    swapchain_probe.pending = true;
+    swapchain_probe.provenance = tv_trace_provenance;
+    swapchain_probe.paint_attempt = tv_paint_attempt;
+    swapchain_probe.paint_submission = current_paint_submission_index;
+    swapchain_probe.swapchain_epoch = diagnostic_swapchain_epoch_;
+    swapchain_probe.swapchain_image = swapchain_image_index;
+    swapchain_probe.format = paint_context_.swapchain_render_pass_format;
+    swapchain_probe.guest_pass = guest_output_pass_recorded;
+    swapchain_probe.full_black_fallback = full_black_fallback_recorded;
+  }
+
   VkPresentInfoKHR present_info;
   present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
   present_info.pNext = nullptr;
@@ -2438,14 +2931,58 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pResults = nullptr;
   VkResult present_result;
   const uint64_t paint_present_begin = rex::chrono::Clock::QueryHostTickCount();
+  gpu_flight::Record("present.queue-begin", uint64_t(uintptr_t(paint_context_.swapchain)),
+                     current_paint_submission_index, tv_trace_provenance.submitted_frame,
+                     swapchain_image_index, uint64_t(uintptr_t(present_semaphore)));
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
+  gpu_flight::Record("present.queue-end", uint64_t(uintptr_t(paint_context_.swapchain)),
+                     current_paint_submission_index, tv_trace_provenance.submitted_frame,
+                     swapchain_image_index, diagnostic_swapchain_epoch_, int32_t(present_result));
+  if (present_result < VK_SUCCESS && present_result != VK_ERROR_OUT_OF_DATE_KHR &&
+      present_result != VK_ERROR_SURFACE_LOST_KHR &&
+      present_result != VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
+    gpu_flight::Fail("present.queue", int32_t(present_result),
+                     uint64_t(uintptr_t(paint_context_.swapchain)), current_paint_submission_index,
+                     tv_trace_provenance.submitted_frame);
+  }
   paint_present_ticks = rex::chrono::Clock::QueryHostTickCount() - paint_present_begin;
   PublishPaintTiming(paint_acquire_ticks, paint_submit_ticks, paint_present_ticks,
                      rex::chrono::Clock::QueryHostTickCount() - paint_timing_begin);
+
+  if (log_tv_paint) {
+    const auto& provenance = tv_trace_provenance;
+    REXLOG_INFO(
+        "gta4-tv-paint: session={} present={} frame={} final={} movie={} rect={} "
+        "bink={}:{} attempt={} ui={} provenance={} origin={} caller={:08X} "
+        "mailbox={} mailbox-version={} guest-image={} effects={} guest-pass={} "
+        "full-black={} paint-submission={} swapchain-epoch={} swapchain-image={} "
+        "swapchain={}x{} acquire={} submit={} present={} selected={:08X}@{} commands={}",
+        provenance.tv_session_id, provenance.title_present_id,
+        provenance.submitted_frame, provenance.tv_final_sequence,
+        provenance.tv_movie_sequence, provenance.tv_rect_sequence,
+        provenance.tv_bink_sequence, provenance.tv_bink_result,
+        tv_paint_attempt, execute_ui_drawers,
+        tv_provenance_is_current ? "current" : "carry",
+        provenance.present_origin, provenance.guest_caller,
+        guest_output_mailbox_index == UINT32_MAX
+            ? -1
+            : int32_t(guest_output_mailbox_index),
+        guest_output_mailbox_index == UINT32_MAX
+            ? 0
+            : guest_output_images_[guest_output_mailbox_index].version,
+        bool(guest_output_image), guest_output_effect_count,
+        guest_output_pass_recorded, full_black_fallback_recorded,
+        current_paint_submission_index, diagnostic_swapchain_epoch_,
+        swapchain_image_index, paint_context_.swapchain_extent.width,
+        paint_context_.swapchain_extent.height, int32_t(acquire_result),
+        int32_t(submit_result), int32_t(present_result),
+        provenance.selected_texture, provenance.selected_generation,
+        provenance.native_command_count);
+  }
 
   if (rex::diagnostics::IsEnabled(
           rex::diagnostics::Category::kPresenter)) {

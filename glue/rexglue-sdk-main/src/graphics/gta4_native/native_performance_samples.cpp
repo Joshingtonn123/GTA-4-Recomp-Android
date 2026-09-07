@@ -186,6 +186,47 @@ bool FrameSampleRing::CopyNewest(size_t offset, FrameSample* sample) const {
   return true;
 }
 
+void FrameSampleCompletionQueue::Clear() {
+  slots_ = {};
+  size_ = 0;
+}
+
+bool FrameSampleCompletionQueue::Complete(size_t slot, uint64_t sequence, bool publish,
+                                          const FrameSample& sample) {
+  if (slot >= slots_.size() || !sequence || slots_[slot]) {
+    return false;
+  }
+  for (const auto& completed : slots_) {
+    if (completed && completed->sequence == sequence) {
+      return false;
+    }
+  }
+  slots_[slot] = CompletedSample{sequence, publish, sample};
+  ++size_;
+  return true;
+}
+
+bool FrameSampleCompletionQueue::PopNext(uint64_t sequence, bool* publish, FrameSample* sample) {
+  if (!sequence || !publish || !sample) {
+    return false;
+  }
+  for (auto& completed : slots_) {
+    if (!completed || completed->sequence != sequence) {
+      continue;
+    }
+    *publish = completed->publish;
+    *sample = completed->sample;
+    completed.reset();
+    --size_;
+    return true;
+  }
+  return false;
+}
+
+bool FrameSampleCompletionQueue::occupied(size_t slot) const {
+  return slot < slots_.size() && slots_[slot].has_value();
+}
+
 const char* GpuRangeName(GpuRange range) {
   static constexpr std::array<const char*, kGpuRangeCount> kNames = {
       "frame",
@@ -240,6 +281,11 @@ const char* CpuRangeName(CpuRange range) {
       "command-setup",   "texture-preparation", "command-recording", "command-finalize",
       "queue-submit",      "render-callback", "publish",       "presenter-acquire",
       "presenter-submit",  "presenter-present", "presenter-total", "outside-renderer",
+      "slot-cleanup", "profile-readback",
+      "pipeline-compile-jobs", "pipeline-wait",
+      "housekeeping-surface-release", "housekeeping-texture-reclamation",
+      "housekeeping-texture-retirement", "housekeeping-buffer-reclamation",
+      "housekeeping-persistent-buffer-reclamation",
   };
   const size_t index = EnumIndex(range);
   return index < kNames.size() ? kNames[index] : "unknown";
@@ -287,6 +333,8 @@ const char* CounterName(Counter counter) {
       "pipelines-live",
       "unavailable-gpu-ranges",
       "dropped-gpu-ranges",
+      "coarse-gpu-timing",
+      "pipeline-request-reuses",
   };
   const size_t index = EnumIndex(counter);
   return index < kNames.size() ? kNames[index] : "unknown";

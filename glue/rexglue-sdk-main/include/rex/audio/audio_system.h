@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <queue>
+#include <shared_mutex>
 
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -78,8 +79,21 @@ class AudioSystem : public system::IAudioSystem {
 
   rex::thread::global_critical_region global_critical_region_;
   static const size_t kMaximumClientCount = 8;
+  struct ClientDispatchState {
+    ClientDispatchState(uint32_t callback, uint32_t wrapped_callback_arg)
+        : callback(callback), wrapped_callback_arg(wrapped_callback_arg) {}
+
+    // The audio worker holds a shared lock for the complete guest callback.
+    // Unregistration takes the exclusive lock before returning, which makes
+    // the guest callback argument safe to release immediately afterwards.
+    std::shared_mutex mutex;
+    uint32_t callback = 0;
+    uint32_t wrapped_callback_arg = 0;
+    bool accepting = true;
+  };
   struct Client {
     std::shared_ptr<AudioDriver> driver;
+    std::shared_ptr<ClientDispatchState> dispatch;
     uint32_t callback = 0;
     uint32_t callback_arg = 0;
     uint32_t wrapped_callback_arg = 0;

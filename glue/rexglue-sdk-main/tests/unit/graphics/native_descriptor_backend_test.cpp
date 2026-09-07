@@ -8,7 +8,7 @@ namespace {
 NativeDescriptorPolicyInputs FullySupportedPolicy() {
   NativeDescriptorPolicyInputs inputs{};
   inputs.request = NativeDescriptorBackendRequest::kAuto;
-  inputs.indexing_features = {true, true, true, true};
+  inputs.indexing_features = {true, true, true, true, true};
   inputs.limits.max_per_stage_sampled_images = 16384;
   inputs.limits.max_descriptor_set_sampled_images = 16384;
   inputs.limits.max_per_stage_samplers = 16384;
@@ -45,6 +45,20 @@ void CommitAllWrites(NativeDescriptorEpochTable& table, uint32_t frame_copy) {
   const NativeDescriptorWriteBatch batch = table.BeginFrameCopyWrites(frame_copy);
   REQUIRE(batch);
   REQUIRE(table.CommitFrameCopyWrites(batch) == NativeDescriptorStatus::kSuccess);
+}
+
+NativeDescriptorPageCapacityInputs PageCapacityInputs() {
+  NativeDescriptorPageCapacityInputs inputs{};
+  inputs.limits = {65536, 65536, 4096, 4096, 100000, 1000000};
+  inputs.desired_sampled_images_per_set = 4096;
+  inputs.desired_samplers = 512;
+  inputs.minimum_sampled_images_per_set = 27;
+  inputs.minimum_samplers = 27;
+  inputs.sampled_image_set_count = 4;
+  inputs.frame_copy_count = 1;
+  inputs.storage_descriptors_per_copy = 1;
+  inputs.pool_storage_descriptors = 2;
+  return inputs;
 }
 
 }  // namespace
@@ -152,6 +166,14 @@ TEST_CASE("native descriptor policy requires update-after-bind layout features w
   inputs.indexing_features.descriptor_binding_sampler_update_after_bind = false;
   CHECK(ChooseNativeDescriptorBackend(inputs).backend == NativeDescriptorBackend::kCached);
 
+  inputs.request = NativeDescriptorBackendRequest::kIndexed;
+  CHECK(ChooseNativeDescriptorBackend(inputs).status ==
+        NativeDescriptorStatus::kMissingUpdateAfterBindFeatures);
+
+  inputs = FullySupportedPolicy();
+  inputs.indexing_features.descriptor_binding_update_unused_while_pending = false;
+  CHECK(ChooseNativeDescriptorBackend(inputs).backend ==
+        NativeDescriptorBackend::kCached);
   inputs.request = NativeDescriptorBackendRequest::kIndexed;
   CHECK(ChooseNativeDescriptorBackend(inputs).status ==
         NativeDescriptorStatus::kMissingUpdateAfterBindFeatures);
@@ -350,6 +372,206 @@ TEST_CASE("native descriptor table reports capacity and handle errors",
   CHECK(table.Update({99, 1}, {30, 0}) == NativeDescriptorStatus::kInvalidSlot);
   CHECK(table.Update(allocation.handle, {0, 0}) == NativeDescriptorStatus::kInvalidDescriptor);
   CHECK(table.BeginFrameCopyWrites(2).status == NativeDescriptorStatus::kInvalidFrameCopy);
+}
+
+TEST_CASE("native descriptor page capacity probes the largest supported fixed layouts",
+          "[gta4-native][descriptor][page]") {
+  std::vector<uint32_t> image_probes;
+  std::vector<uint32_t> sampler_probes;
+  const NativeDescriptorPageCapacity capacity = NegotiateNativeDescriptorPageCapacity(
+      PageCapacityInputs(), [&](NativeDescriptorKind kind, uint32_t count) {
+        (kind == NativeDescriptorKind::kSampledImage ? image_probes : sampler_probes)
+            .push_back(count);
+        return count <= (kind == NativeDescriptorKind::kSampledImage ? 1211u : 300u);
+      });
+
+  REQUIRE(capacity);
+  CHECK(capacity.sampled_images_per_set == 1211);
+  CHECK(capacity.samplers == 300);
+  CHECK(capacity.sampled_images_per_stage == 4844);
+  CHECK(capacity.resources_per_stage == 5145);
+  CHECK(capacity.descriptors_per_copy == 5144);
+  CHECK(capacity.descriptors_per_page == 5144);
+  CHECK(capacity.required_pool_descriptors == 5146);
+  CHECK(capacity.maximum_page_count == 194);
+  CHECK(capacity.sampled_image_probe_count == image_probes.size());
+  CHECK(capacity.sampler_probe_count == sampler_probes.size());
+  CHECK_FALSE(image_probes.empty());
+  CHECK_FALSE(sampler_probes.empty());
+}
+
+TEST_CASE("native descriptor page capacity reserves separate storage pools exactly",
+          "[gta4-native][descriptor][page]") {
+  // Python-checked minimum shape: 27*4 sampled images + 27 samplers = 135
+  // page descriptors, plus two frame-slot storage descriptors = 137 pool
+  // descriptors. The pipeline exposes 136 resources per stage because only
+  // one frame-slot storage set is bound at a time.
+  NativeDescriptorPageCapacityInputs inputs = PageCapacityInputs();
+  inputs.limits.max_descriptors_in_all_pools = 137;
+  const auto supported = [](NativeDescriptorKind, uint32_t) { return true; };
+  NativeDescriptorPageCapacity capacity =
+      NegotiateNativeDescriptorPageCapacity(inputs, supported);
+  REQUIRE(capacity);
+  CHECK(capacity.sampled_images_per_set == 27);
+  CHECK(capacity.samplers == 27);
+  CHECK(capacity.resources_per_stage == 136);
+  CHECK(capacity.descriptors_per_page == 135);
+  CHECK(capacity.required_pool_descriptors == 137);
+
+  inputs.limits.max_descriptors_in_all_pools = 136;
+  capacity = NegotiateNativeDescriptorPageCapacity(inputs, supported);
+  CHECK_FALSE(capacity);
+  CHECK(capacity.status == NativeDescriptorStatus::kInsufficientDeviceLimits);
+}
+
+TEST_CASE("native stable descriptor slots remain fixed for a resource lifetime",
+          "[gta4-native][descriptor][stable]") {
+  NativeStableDescriptorSlotTable table({0, 2});
+  REQUIRE(table.valid());
+  const NativeDescriptorAllocation first = table.Allocate();
+  const NativeDescriptorAllocation second = table.Allocate();
+  REQUIRE(first);
+  REQUIRE(second);
+  CHECK(first.handle.page == 0);
+  CHECK(first.handle.index == 0);
+  CHECK(second.handle.index == 1);
+  CHECK(table.IsLive(first.handle));
+  CHECK(table.IsLive(second.handle));
+  CHECK(table.counters().publish_requirements == 2);
+  CHECK(table.Allocate().status == NativeDescriptorStatus::kCapacityExhausted);
+}
+
+TEST_CASE("native stable descriptor publication failure returns its slot in O(1)",
+          "[gta4-native][descriptor][stable]") {
+  NativeStableDescriptorSlotTable table({0, 1});
+  const NativeDescriptorAllocation failed_publication = table.Allocate();
+  REQUIRE(failed_publication);
+  REQUIRE(table.AbortUnsubmitted(failed_publication.handle) ==
+          NativeDescriptorStatus::kSuccess);
+  CHECK(table.live_count() == 0);
+  CHECK(table.retiring_count() == 0);
+  CHECK(table.free_count() == 1);
+  CHECK(table.counters().abort_calls == 1);
+  CHECK(table.counters().aborted_unsubmitted_slots == 1);
+  CHECK(table.AbortUnsubmitted(failed_publication.handle) ==
+        NativeDescriptorStatus::kSlotNotLive);
+
+  const NativeDescriptorAllocation replacement = table.Allocate();
+  REQUIRE(replacement);
+  CHECK(replacement.handle.index == failed_publication.handle.index);
+  CHECK(replacement.handle.generation != failed_publication.handle.generation);
+}
+
+TEST_CASE("native stable descriptor reclaim clears before generation reuse",
+          "[gta4-native][descriptor][stable]") {
+  NativeStableDescriptorSlotTable table({0, 1});
+  const NativeDescriptorAllocation first = table.Allocate();
+  REQUIRE(first);
+  REQUIRE(table.Retire(first.handle, 9) == NativeDescriptorStatus::kSuccess);
+
+  uint64_t clear_calls = 0;
+  const auto clear = [&](NativeDescriptorSlotHandle handle) {
+    ++clear_calls;
+    return handle == first.handle;
+  };
+  CHECK(table.Reclaim(first.handle, 8, clear) ==
+        NativeDescriptorStatus::kGpuSubmissionPending);
+  CHECK(clear_calls == 0);
+  CHECK(table.Allocate().status == NativeDescriptorStatus::kCapacityExhausted);
+  CHECK(table.Reclaim(first.handle, 9, clear) == NativeDescriptorStatus::kSuccess);
+  CHECK(clear_calls == 1);
+
+  const NativeDescriptorAllocation recycled = table.Allocate();
+  REQUIRE(recycled);
+  CHECK(recycled.handle.page == first.handle.page);
+  CHECK(recycled.handle.index == first.handle.index);
+  CHECK(recycled.handle.generation != first.handle.generation);
+  CHECK(table.IsRetirementComplete(first.handle));
+}
+
+TEST_CASE("native stable descriptor clear failure cannot expose a retired slot",
+          "[gta4-native][descriptor][stable]") {
+  NativeStableDescriptorSlotTable table({0, 1});
+  const NativeDescriptorAllocation allocation = table.Allocate();
+  REQUIRE(allocation);
+  REQUIRE(table.Retire(allocation.handle, 0) == NativeDescriptorStatus::kSuccess);
+  CHECK(table.Reclaim(allocation.handle, 0,
+                      [](NativeDescriptorSlotHandle) { return false; }) ==
+        NativeDescriptorStatus::kDescriptorClearFailed);
+  CHECK(table.IsRetiring(allocation.handle));
+  CHECK(table.Allocate().status == NativeDescriptorStatus::kCapacityExhausted);
+  CHECK(table.Reclaim(allocation.handle, 0,
+                      [](NativeDescriptorSlotHandle) { return true; }) ==
+        NativeDescriptorStatus::kSuccess);
+  CHECK(table.counters().clear_callbacks == 2);
+  CHECK(table.counters().reclaimed_slots == 1);
+}
+
+TEST_CASE("native stable descriptor high-cardinality work stays O(1) per lifetime",
+          "[gta4-native][descriptor][stable]") {
+  // Python-checked expectations for N=65,536:
+  // allocations=2*N=131,072, allocation calls=2*N+2=131,074,
+  // reclaim calls=N+1=65,537, and successful clears=N=65,536.
+  constexpr uint32_t kSlotCount = 65536;
+  NativeStableDescriptorSlotTable table({0, kSlotCount});
+  REQUIRE(table.valid());
+  std::vector<NativeDescriptorSlotHandle> first_generation;
+  first_generation.reserve(kSlotCount);
+  for (uint32_t index = 0; index < kSlotCount; ++index) {
+    const NativeDescriptorAllocation allocation = table.Allocate();
+    REQUIRE(allocation);
+    first_generation.push_back(allocation.handle);
+  }
+  CHECK(table.Allocate().status == NativeDescriptorStatus::kCapacityExhausted);
+  for (NativeDescriptorSlotHandle handle : first_generation) {
+    REQUIRE(table.Retire(handle, 7) == NativeDescriptorStatus::kSuccess);
+  }
+
+  uint64_t clear_calls = 0;
+  const auto clear = [&](NativeDescriptorSlotHandle) {
+    ++clear_calls;
+    return true;
+  };
+  CHECK(table.Reclaim(first_generation.front(), 6, clear) ==
+        NativeDescriptorStatus::kGpuSubmissionPending);
+  CHECK(clear_calls == 0);
+  CHECK(table.Allocate().status == NativeDescriptorStatus::kCapacityExhausted);
+  for (NativeDescriptorSlotHandle handle : first_generation) {
+    REQUIRE(table.Reclaim(handle, 7, clear) == NativeDescriptorStatus::kSuccess);
+  }
+  REQUIRE(clear_calls == kSlotCount);
+
+  for (uint32_t index = 0; index < kSlotCount; ++index) {
+    const NativeDescriptorAllocation allocation = table.Allocate();
+    REQUIRE(allocation);
+    CHECK(allocation.handle.page == first_generation[index].page);
+    CHECK(allocation.handle.index == first_generation[index].index);
+    CHECK(allocation.handle.generation != first_generation[index].generation);
+  }
+  const NativeStableDescriptorSlotCounters& counters = table.counters();
+  CHECK(counters.allocation_calls == 131074);
+  CHECK(counters.retirement_calls == 65536);
+  CHECK(counters.reclaim_calls == 65537);
+  CHECK(counters.publish_requirements == 131072);
+  CHECK(counters.clear_callbacks == 65536);
+  CHECK(counters.reclaimed_slots == 65536);
+}
+
+TEST_CASE("native descriptor negotiation falls back when one complete tuple is unsupported",
+          "[gta4-native][descriptor][page]") {
+  const NativeDescriptorPageCapacity capacity = NegotiateNativeDescriptorPageCapacity(
+      PageCapacityInputs(), [](NativeDescriptorKind kind, uint32_t count) {
+        return count <= (kind == NativeDescriptorKind::kSampledImage ? 26u : 512u);
+      });
+  CHECK_FALSE(capacity);
+  CHECK(capacity.status == NativeDescriptorStatus::kLayoutUnsupported);
+
+  NativeDescriptorPolicyInputs policy_inputs = FullySupportedPolicy();
+  policy_inputs.layout_support = {true, false, 0, 0};
+  const NativeDescriptorPolicyDecision decision = ChooseNativeDescriptorBackend(policy_inputs);
+  REQUIRE(decision);
+  CHECK(decision.backend == NativeDescriptorBackend::kCached);
+  CHECK(decision.indexed_rejection == NativeDescriptorStatus::kLayoutUnsupported);
 }
 
 }  // namespace rex::graphics::gta4_native

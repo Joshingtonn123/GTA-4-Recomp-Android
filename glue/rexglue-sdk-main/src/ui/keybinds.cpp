@@ -10,6 +10,8 @@
  */
 #include <rex/ui/keybinds.h>
 #include <rex/cvar.h>
+#include <rex/input/input_trace.h>
+#include <rex/logging.h>
 #include <mutex>
 #include <string>
 #include <deque>
@@ -97,7 +99,9 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
     {"Quote", VirtualKey::kOem7},
     // Control
     {"Escape", VirtualKey::kEscape},
+    {"Esc", VirtualKey::kEscape},
     {"Return", VirtualKey::kReturn},
+    {"Enter", VirtualKey::kReturn},
     {"Space", VirtualKey::kSpace},
     {"Tab", VirtualKey::kTab},
     {"Backspace", VirtualKey::kBack},
@@ -141,6 +145,10 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
     {"LMB", VirtualKey::kLButton},
     {"RMB", VirtualKey::kRButton},
     {"MMB", VirtualKey::kMButton},
+    {"Mouse4", VirtualKey::kXButton1},
+    {"Mouse5", VirtualKey::kXButton2},
+    {"X1", VirtualKey::kXButton1},
+    {"X2", VirtualKey::kXButton2},
 };
 
 VirtualKey ParseVirtualKey(std::string_view name) {
@@ -149,6 +157,20 @@ VirtualKey ParseVirtualKey(std::string_view name) {
 }
 
 std::string VirtualKeyToString(VirtualKey vk) {
+  // Aliases share a value; never let unordered-map iteration choose the
+  // spelling saved into a configuration or shown by the binding editor.
+  switch (vk) {
+    case VirtualKey::kEscape:
+      return "Escape";
+    case VirtualKey::kReturn:
+      return "Return";
+    case VirtualKey::kXButton1:
+      return "Mouse4";
+    case VirtualKey::kXButton2:
+      return "Mouse5";
+    default:
+      break;
+  }
   for (const auto& [name, key] : kKeyNames) {
     if (key == vk) {
       return name;
@@ -212,6 +234,15 @@ bool ProcessKeyEvent(KeyEvent& e) {
   // System binds are one-shot actions such as toggling an overlay. Repeated
   // key-down events must not toggle them again while the key is still held.
   if (e.prev_state()) {
+    if (rex::input::IsInputTraceEnabled()) {
+      REXLOG_INFO(
+          "input-e2e: seq={} stage=system-keybind key={} vk={} "
+          "result=rejected reason=repeat",
+          e.input_trace_sequence(),
+          rex::input::InputTraceVirtualKeyName(
+              static_cast<uint32_t>(e.virtual_key())),
+          static_cast<uint32_t>(e.virtual_key()));
+    }
     return false;
   }
 
@@ -221,10 +252,29 @@ bool ProcessKeyEvent(KeyEvent& e) {
       continue;
     VirtualKey vk = ParseVirtualKey(entry.current_key);
     if (vk != VirtualKey::kNone && e.virtual_key() == vk) {
+      if (rex::input::IsInputTraceEnabled()) {
+        REXLOG_INFO(
+            "input-e2e: seq={} stage=system-keybind key={} vk={} "
+            "result=consumed binding={} configured-key={}",
+            e.input_trace_sequence(),
+            rex::input::InputTraceVirtualKeyName(
+                static_cast<uint32_t>(e.virtual_key())),
+            static_cast<uint32_t>(e.virtual_key()), entry.name,
+            entry.current_key);
+      }
       entry.callback();
       e.set_handled(true);
       return true;
     }
+  }
+  if (rex::input::IsInputTraceEnabled()) {
+    REXLOG_INFO(
+        "input-e2e: seq={} stage=system-keybind key={} vk={} "
+        "result=forwarded reason=no-match",
+        e.input_trace_sequence(),
+        rex::input::InputTraceVirtualKeyName(
+            static_cast<uint32_t>(e.virtual_key())),
+        static_cast<uint32_t>(e.virtual_key()));
   }
   return false;
 }

@@ -13,6 +13,7 @@ add_library(rexcore OBJECT
     filesystem.cpp
     filesystem_wildcard.cpp
     gta4_transition.cpp
+    gpu_flight_recorder.cpp
     input_trace.cpp
     logging.cpp
     memory.cpp

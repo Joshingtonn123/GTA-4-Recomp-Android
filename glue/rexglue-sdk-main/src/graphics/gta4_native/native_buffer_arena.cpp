@@ -90,6 +90,7 @@ NativeBufferArenaResult NativeBufferArena::Reserve(uint64_t size) {
   }
 
   uint64_t offset = 0;
+  best_block->empty_since_epoch.reset();
   if (!new_block) {
     Range& range = best_block->free_ranges[best_range_index];
     offset = range.offset;
@@ -215,6 +216,38 @@ NativeBufferArenaRelease NativeBufferArena::Cancel(uint64_t allocation_id) {
 
 NativeBufferArenaRelease NativeBufferArena::Release(uint64_t allocation_id) {
   return ReleaseRecord(allocations_.find(allocation_id), false);
+}
+
+std::vector<uint64_t> NativeBufferArena::TrimFreeBlocks(uint64_t retained_free_capacity,
+                                                       uint64_t completed_epoch,
+                                                       uint64_t grace_epochs) {
+  std::vector<uint64_t> removed;
+  for (auto it = blocks_.begin(); it != blocks_.end();) {
+    Block& block = it->second;
+    if (!block.backing_ready || block.free_ranges.size() != 1 ||
+        block.free_ranges.front().offset != 0 ||
+        block.free_ranges.front().size != block.capacity) {
+      block.empty_since_epoch.reset();
+      ++it;
+      continue;
+    }
+    if (!block.empty_since_epoch) {
+      block.empty_since_epoch = completed_epoch;
+    }
+    if (block.capacity <= retained_free_capacity) {
+      retained_free_capacity -= block.capacity;
+      ++it;
+      continue;
+    }
+    if (completed_epoch < *block.empty_since_epoch ||
+        completed_epoch - *block.empty_since_epoch < grace_epochs) {
+      ++it;
+      continue;
+    }
+    removed.push_back(block.id);
+    it = blocks_.erase(it);
+  }
+  return removed;
 }
 
 std::optional<NativeBufferArenaAllocation> NativeBufferArena::GetAllocation(

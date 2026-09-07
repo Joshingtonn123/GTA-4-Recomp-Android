@@ -112,6 +112,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   bool any_connected = false;
   bool first_result = true;
   X_INPUT_STATE merged = {};
+  BeginInputTracePoll();
 
   for (size_t driver_index = 0; driver_index < drivers_.size(); ++driver_index) {
     auto& driver = drivers_[driver_index];
@@ -124,7 +125,9 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
                            (result == X_ERROR_SUCCESS &&
                             !GamepadStatesEqual(trace.gamepad, state.gamepad));
       if (changed) {
-        const uint64_t sequence = NextInputTraceSequence();
+        const uint64_t causal_sequence = InputTraceCausalSequence();
+        const uint64_t sequence =
+            causal_sequence != 0 ? causal_sequence : NextInputTraceSequence();
         REXLOG_INFO(
             "input-e2e: seq={} stage=driver-state driver={} user={} result={:08X} packet={} "
             "buttons={:04X} triggers={}/{} sticks={}/{}/{}/{}",
@@ -197,7 +200,9 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     tracker.available = true;
     merged.packet_number = tracker.packet_number;
     if (IsInputTraceEnabled() && merged_changed) {
-      const uint64_t sequence = NextInputTraceSequence();
+      const uint64_t causal_sequence = InputTraceCausalSequence();
+      const uint64_t sequence =
+          causal_sequence != 0 ? causal_sequence : NextInputTraceSequence();
       REXLOG_INFO(
           "input-e2e: seq={} stage=merged-state user={} packet={} buttons={:04X} "
           "triggers={}/{} sticks={}/{}/{}/{}",

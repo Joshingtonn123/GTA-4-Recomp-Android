@@ -118,6 +118,12 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
                                     const MemoryPurpose memory_purpose, VkImage& image_out,
                                     VkDeviceMemory& memory_out, uint32_t* const memory_type_out,
                                     VkDeviceSize* const memory_size_out) {
+  // Legacy image-format queries describe ordinary images exactly. Extended
+  // creation chains (external memory, format lists, etc.) require their own
+  // matching properties2 query and continue through the existing creation path.
+  if (!create_info.pNext && !IsImageCreateInfoSupported(vulkan_device, create_info)) {
+    return false;
+  }
   const VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
@@ -170,6 +176,26 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
     *memory_size_out = memory_allocate_info.allocationSize;
   }
   return true;
+}
+
+bool IsImageCreateInfoSupported(const VulkanDevice* vulkan_device,
+                                const VkImageCreateInfo& create_info) {
+  if (!vulkan_device || create_info.pNext) {
+    return false;
+  }
+  VkImageFormatProperties properties{};
+  if (vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceImageFormatProperties(
+          vulkan_device->physical_device(), create_info.format, create_info.imageType,
+          create_info.tiling, create_info.usage, create_info.flags, &properties) != VK_SUCCESS) {
+    return false;
+  }
+  return create_info.extent.width && create_info.extent.height && create_info.extent.depth &&
+         create_info.extent.width <= properties.maxExtent.width &&
+         create_info.extent.height <= properties.maxExtent.height &&
+         create_info.extent.depth <= properties.maxExtent.depth && create_info.mipLevels &&
+         create_info.mipLevels <= properties.maxMipLevels && create_info.arrayLayers &&
+         create_info.arrayLayers <= properties.maxArrayLayers &&
+         (properties.sampleCounts & create_info.samples) != 0;
 }
 
 VkPipeline CreateComputePipeline(const VulkanDevice* const vulkan_device,

@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <utility>
@@ -17,6 +18,7 @@
 
 #include <rex/assert.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/submission_completion.h>
 
 namespace rex {
 namespace ui {
@@ -40,6 +42,14 @@ namespace vulkan {
 // one.
 class VulkanSubmissionTracker {
  public:
+  struct DebugSnapshot {
+    uint64_t current_submission = 0;
+    uint64_t completed_submission = 0;
+    size_t pending_fence_count = 0;
+    size_t reclaimed_fence_count = 0;
+    bool fence_acquired = false;
+  };
+
   class FenceAcquisition {
    public:
     FenceAcquisition() : submission_tracker_(nullptr), fence_(VK_NULL_HANDLE) {}
@@ -102,7 +112,12 @@ class VulkanSubmissionTracker {
   // is the required form of backpressure for UI-thread presentation, where a
   // blocking fence wait may prevent the window system from making progress.
   bool IsSubmissionComplete(uint64_t submission_index) {
-    return UpdateAndGetCompletedSubmission() >= submission_index;
+    return SubmissionCompletionReached(UpdateAndGetCompletedSubmission(), submission_index);
+  }
+
+  DebugSnapshot GetDebugSnapshot() const {
+    return {submission_current_, submission_completed_on_gpu_, fences_pending_.size(),
+            fences_reclaimed_.size(), fence_acquired_ != VK_NULL_HANDLE};
   }
 
   // Returns whether the expected GPU signal has actually been reached (rather
@@ -118,6 +133,9 @@ class VulkanSubmissionTracker {
   [[nodiscard]] FenceAcquisition AcquireFenceToAdvanceSubmission();
 
  private:
+  // Tracker mutation is intentionally externally serialized by the owning
+  // queue thread. AwaitSubmissionCompletion may block indefinitely, so an
+  // internal coarse lock would deadlock any design that submits elsewhere.
   const VulkanDevice* vulkan_device_;
   uint64_t submission_current_ = 1;
   // Last submission with a successful fence signal as well as a successful

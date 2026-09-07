@@ -22,6 +22,13 @@
 
 namespace rex::filesystem {
 
+namespace {
+
+constexpr size_t kMaximumSvodTraversalDepth = 256;
+constexpr size_t kMaximumSvodEntries = 500000;
+
+}  // namespace
+
 StfsContainerDevice::StfsContainerDevice(const std::string_view mount_path,
                                          const std::filesystem::path& host_path, bool log_host_path)
     : Device(mount_path),
@@ -361,17 +368,36 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSVOD() {
   root_entry->write_timestamp_ = root_creation_timestamp;
   root_entry_ = std::unique_ptr<Entry>(root_entry);
 
-  // Traverse all child entries
-  return ReadEntrySVOD(root_data.block, 0, root_entry);
+  // Traverse all child entries. SVOD directory metadata is untrusted, so keep
+  // traversal state across the whole tree to reject cycles and pathological
+  // graphs before they can exhaust the native stack or heap.
+  svod_visited_entries_.clear();
+  svod_entry_count_ = 0;
+  return ReadEntrySVOD(root_data.block, 0, root_entry, 0);
 }
 
 StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, uint32_t ordinal,
-                                                              StfsContainerEntry* parent) {
+                                                              StfsContainerEntry* parent,
+                                                              size_t depth) {
+  if (!parent || depth > kMaximumSvodTraversalDepth ||
+      svod_entry_count_ >= kMaximumSvodEntries) {
+    REXFS_ERROR("ReadEntrySVOD rejected an invalid or excessively deep directory graph");
+    return Error::kErrorDamagedFile;
+  }
   // For games with a large amount of files, the ordinal offset can overrun
   // the current block and potentially hit a hash block.
   size_t ordinal_offset = ordinal * 0x4;
   size_t block_offset = ordinal_offset / 0x800;
   size_t true_ordinal_offset = ordinal_offset % 0x800;
+  const uint64_t canonical_block = uint64_t{block} + block_offset;
+  const uint64_t canonical_ordinal = true_ordinal_offset / 0x4;
+  const uint64_t entry_key = (canonical_block << 32) | canonical_ordinal;
+  if (!svod_visited_entries_.insert(entry_key).second) {
+    REXFS_ERROR("ReadEntrySVOD detected a directory cycle at block 0x{:X}, ordinal 0x{:X}",
+                block, ordinal);
+    return Error::kErrorDamagedFile;
+  }
+  ++svod_entry_count_;
 
   // Calculate the file & address of the block
   size_t entry_address, entry_file;
@@ -379,7 +405,12 @@ StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, ui
   entry_address += true_ordinal_offset;
 
   // Read directory entry
-  auto& file = files_.at(entry_file);
+  const auto file_it = files_.find(entry_file);
+  if (file_it == files_.end() || !file_it->second) {
+    REXFS_ERROR("ReadEntrySVOD referenced missing fragment {}", entry_file);
+    return Error::kErrorDamagedFile;
+  }
+  auto& file = file_it->second;
   rex::filesystem::Seek(file, entry_address, SEEK_SET);
 
 #pragma pack(push, 1)
@@ -409,7 +440,7 @@ StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, ui
 
   // Read the left node
   if (dir_entry.node_l) {
-    auto node_result = ReadEntrySVOD(block, dir_entry.node_l, parent);
+    auto node_result = ReadEntrySVOD(block, dir_entry.node_l, parent, depth + 1);
     if (node_result != Error::kSuccess) {
       return node_result;
     }
@@ -436,7 +467,7 @@ StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, ui
 
     if (dir_entry.length) {
       // If length is greater than 0, traverse the directory's children
-      auto directory_result = ReadEntrySVOD(dir_entry.data_block, 0, entry.get());
+      auto directory_result = ReadEntrySVOD(dir_entry.data_block, 0, entry.get(), depth + 1);
       if (directory_result != Error::kSuccess) {
         return directory_result;
       }
@@ -465,6 +496,10 @@ StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, ui
 
         size_t offset, file_index;
         BlockToOffsetSVOD(block_index, &offset, &file_index);
+        if (!files_.contains(file_index)) {
+          REXFS_ERROR("ReadEntrySVOD file data referenced missing fragment {}", file_index);
+          return Error::kErrorDamagedFile;
+        }
 
         block_index++;
         remaining_size -= BLOCK_SIZE;
@@ -487,7 +522,7 @@ StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, ui
 
   // Read the right node.
   if (dir_entry.node_r) {
-    auto node_result = ReadEntrySVOD(block, dir_entry.node_r, parent);
+    auto node_result = ReadEntrySVOD(block, dir_entry.node_r, parent, depth + 1);
     if (node_result != Error::kSuccess) {
       return node_result;
     }
@@ -592,6 +627,11 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
       if (dir_entry.directory_index == 0xFFFF) {
         parent_entry = root_entry;
       } else {
+        if (dir_entry.directory_index >= all_entries.size()) {
+          REXFS_ERROR("ReadSTFS entry referenced invalid parent index {} (entry count {})",
+                      dir_entry.directory_index.get(), all_entries.size());
+          return Error::kErrorDamagedFile;
+        }
         parent_entry = all_entries[dir_entry.directory_index];
       }
 
@@ -623,12 +663,21 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
       if (entry->attributes() & system::X_FILE_ATTRIBUTE_NORMAL) {
         uint32_t block_index = dir_entry.start_block_number();
         size_t remaining_size = dir_entry.length;
+        const size_t expected_blocks = dir_entry.allocated_data_blocks();
         while (remaining_size && block_index != kEndOfChain) {
+          if (entry->block_list_.size() >= expected_blocks) {
+            REXFS_ERROR("STFS block chain for {} exceeds its declared allocation", name);
+            return Error::kErrorDamagedFile;
+          }
           size_t block_size = std::min(static_cast<size_t>(kBlockSize), remaining_size);
           size_t offset = BlockToOffsetSTFS(block_index);
           entry->block_list_.push_back({0, offset, block_size});
           remaining_size -= block_size;
           auto block_hash = GetBlockHash(block_index);
+          if (!block_hash) {
+            REXFS_ERROR("STFS block chain for {} references an invalid hash entry", name);
+            return Error::kErrorDamagedFile;
+          }
           block_index = block_hash->level0_next_block();
         }
 
@@ -639,7 +688,7 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
               "bytes missing)",
               name, dir_entry.length.get() - remaining_size, dir_entry.length.get(),
               remaining_size);
-          assert_always();
+          return Error::kErrorDamagedFile;
         }
 
         // Check that the number of blocks retrieved from hash entries matches
@@ -649,7 +698,7 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
               "STFS failed to read correct block-chain for entry {}, read {} "
               "blocks, expected {}",
               entry->name_, entry->block_list_.size(), dir_entry.allocated_data_blocks());
-          assert_always();
+          return Error::kErrorDamagedFile;
         }
       }
 
@@ -657,6 +706,10 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
     }
 
     auto block_hash = GetBlockHash(table_block_index);
+    if (!block_hash) {
+      REXFS_ERROR("STFS file table references an invalid hash entry");
+      return Error::kErrorDamagedFile;
+    }
     table_block_index = block_hash->level0_next_block();
     if (table_block_index == kEndOfChain) {
       break;
@@ -666,7 +719,7 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
   if (n + 1 != descriptor.file_table_block_count) {
     REXFS_WARN("STFS read {} file table blocks, but STFS headers expected {}!", n + 1,
                descriptor.file_table_block_count);
-    assert_always();
+    return Error::kErrorDamagedFile;
   }
 
   return Error::kSuccess;

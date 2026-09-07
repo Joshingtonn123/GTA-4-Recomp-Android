@@ -1,4 +1,5 @@
 #include "smaa_pipeline.h"
+#include "smaa_source_sync.h"
 
 #include <algorithm>
 #include <array>
@@ -437,28 +438,13 @@ bool SmaaPipeline::Record(VkCommandBuffer command_buffer, const ui::vulkan::Vulk
                           Output& result, const NativeGpuTimingSink* timing) {
   result = {};
   if (!command_buffer || !device || !frame_descriptor_pool || !source_image || !source_view ||
-      !extent.width || !extent.height || quality >= SmaaQuality::kCount ||
+      source_layout == VK_IMAGE_LAYOUT_UNDEFINED || !extent.width || !extent.height ||
+      quality >= SmaaQuality::kCount ||
       !EnsureStaticResources(device, pipeline_cache) || !EnsureExtentResources(device, extent)) {
     return false;
   }
   const auto& dfn = device->functions();
   const VkDevice vk_device = device->device();
-
-  VkImageMemoryBarrier source_barrier{};
-  source_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  source_barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-  source_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  source_barrier.oldLayout = source_layout;
-  source_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  source_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  source_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  source_barrier.image = source_image;
-  source_barrier.subresourceRange =
-      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
-  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                           &source_barrier);
-  source_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
   std::array<VkDescriptorSet, kDescriptorSetCount> sets{};
   VkDescriptorSetAllocateInfo allocation{};
@@ -470,7 +456,27 @@ bool SmaaPipeline::Record(VkCommandBuffer command_buffer, const ui::vulkan::Vulk
     return false;
   }
   if (timing) {
+    // Include the source transition in SMAA's setup timing, before any edge
+    // work starts, so a capture can observe its synchronization cost.
     timing->Switch(command_buffer, performance::GpuRange::kSmaaLookupUpload);
+  }
+  const SmaaSourceSynchronization source_sync = GetSmaaSourceSynchronization(source_layout);
+  if (source_sync.needs_barrier) {
+    VkImageMemoryBarrier source_barrier{};
+    source_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    source_barrier.srcAccessMask = source_sync.access;
+    source_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    source_barrier.oldLayout = source_layout;
+    source_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    source_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    source_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    source_barrier.image = source_image;
+    source_barrier.subresourceRange =
+        ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
+    dfn.vkCmdPipelineBarrier(command_buffer, source_sync.stages,
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                            &source_barrier);
+    source_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   }
   if (!RecordLookupUpload(command_buffer, device)) {
     return false;

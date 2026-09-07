@@ -1,13 +1,17 @@
 // Exact XenosRecomp source for deferred_lighting_ps20.bin
 // (XXH3 0x458818340E2283DE), with only the FusionShaders smooth-volume
 // polynomial enabled below.
+#ifndef GTA4_LIGHT_VOLUME_SUPPORT_BITS
+#define GTA4_LIGHT_VOLUME_SUPPORT_BITS 0x3F59999A
+#endif
 #ifndef SHADER_COMMON_H_INCLUDED
 #define SHADER_COMMON_H_INCLUDED
 
 #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
 #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
 #define SPEC_CONSTANT_ALPHA_TEST_FUNCTION_SHIFT 8
-#define SPEC_CONSTANT_ALPHA_TEST_FUNCTION_MASK  7
+#define SPEC_CONSTANT_ALPHA_TEST_FUNCTION_MASK  0x700
+#define SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK 0x702
 
 #ifdef UNLEASHED_RECOMP
     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
@@ -27,19 +31,6 @@
 #define FLT_MAX asfloat(0x7f7fffff)
 #endif
 
-bool AlphaTestPass(float alpha, float reference, uint function)
-{
-    if (function == 0u) return false;
-    if (function == 1u) return alpha < reference;
-    if (function == 2u) return alpha == reference;
-    if (function == 3u) return alpha <= reference;
-    if (function == 4u) return alpha > reference;
-    if (function == 5u) return isnan(alpha) || isnan(reference) || alpha != reference;
-    if (function == 6u) return alpha >= reference;
-    if (function == 7u) return true;
-    return false;
-}
-
 #ifdef __spirv__
 
 struct PushConstants
@@ -52,6 +43,7 @@ struct PushConstants
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
 
 #ifdef GTA4_RECOMP
+#define GetTextureLodBias(SLOT) vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 752 + (SLOT) * 4)
 #define g_Booleans                  vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 528)
 #define g_SwappedTexcoords          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 532)
 #define g_SwappedNormals            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 536)
@@ -64,6 +56,8 @@ struct PushConstants
 #define g_AlphaThreshold            vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 580)
 #define g_conditionalSurveyIndex    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 584)
 #define g_conditionalRenderingIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 588)
+#define g_AlphaToMask               vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 736)
+#define g_AlphaToMaskSampleCount    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 740)
 #else
 #define g_Booleans                  vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 320)
 #define g_SwappedTexcoords          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 324)
@@ -105,6 +99,7 @@ struct PushConstants
 };
 
 #ifdef GTA4_RECOMP
+#define GetTextureLodBias(SLOT) (*(reinterpret_cast<device float*>(g_PushConstants.SharedConstants + 752 + (SLOT) * 4)))
 #define g_Booleans (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 528)))
 #define g_SwappedTexcoords (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 532)))
 #define g_SwappedNormals (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 536)))
@@ -135,6 +130,7 @@ struct PushConstants
 #else
 
 #ifdef GTA4_RECOMP
+#define GetTextureLodBias(SLOT) g_TextureLodBias[(SLOT) / 4][(SLOT) % 4]
 #define DEFINE_SHARED_CONSTANTS() \
     uint g_Booleans : packoffset(c33.x); \
     uint g_SwappedTexcoords : packoffset(c33.y); \
@@ -147,7 +143,8 @@ struct PushConstants
     bool g_ClipPlaneEnabled : packoffset(c36.x); \
     float g_AlphaThreshold : packoffset(c36.y); \
     uint g_conditionalSurveyIndex : packoffset(c36.z); \
-    uint g_conditionalRenderingIndex : packoffset(c36.w);
+    uint g_conditionalRenderingIndex : packoffset(c36.w); \
+    float4 g_TextureLodBias[7] : packoffset(c47);
 #else
 #define DEFINE_SHARED_CONSTANTS() \
     uint g_Booleans : packoffset(c20.x); \
@@ -166,6 +163,56 @@ struct PushConstants
 
 uint g_SpecConstants();
 
+#endif
+
+#if defined(GTA4_RECOMP) && defined(__spirv__)
+uint ComputeXenosAlphaToMask(float alpha, float2 position, uint alphaToMask,
+                             uint sampleCount)
+{
+    if ((alphaToMask & 0x100u) == 0u)
+        return 0xFFFFFFFFu;
+
+    uint offsetIndex = (uint(position.x) & 1u) | ((uint(position.y) & 1u) << 1u);
+    uint offset = (alphaToMask >> (offsetIndex << 1u)) & 3u;
+    float thresholdOffset = float(offset);
+    uint sampleMask = 0u;
+
+    if (sampleCount == 1u)
+    {
+        if (alpha >= 1.0 - thresholdOffset * 0.25)
+            sampleMask |= 1u;
+    }
+    else if (sampleCount == 2u)
+    {
+        // Xenos top and bottom samples map to Vulkan samples 1 and 0.
+        if (alpha >= 0.5 - thresholdOffset * 0.125)
+            sampleMask |= 2u;
+        if (alpha >= 1.0 - thresholdOffset * 0.125)
+            sampleMask |= 1u;
+    }
+    else if (sampleCount == 4u)
+    {
+        // Xenos TL, BL, TR, BR map to Vulkan TL, TR, BL, BR.
+        if (alpha >= 0.75 - thresholdOffset * 0.0625)
+            sampleMask |= 1u;
+        if (alpha >= 0.25 - thresholdOffset * 0.0625)
+            sampleMask |= 4u;
+        if (alpha >= 0.5 - thresholdOffset * 0.0625)
+            sampleMask |= 2u;
+        if (alpha >= 1.0 - thresholdOffset * 0.0625)
+            sampleMask |= 8u;
+    }
+    else
+    {
+        return 0xFFFFFFFFu;
+    }
+
+    return sampleMask;
+}
+#endif
+
+#ifndef GTA4_RECOMP
+#define GetTextureLodBias(SLOT) 0.0
 #endif
 
 float4 cube(float4 value)
@@ -297,46 +344,46 @@ float4 tfetch2D(constant Texture2DDescriptorHeap* textureHeap,
                 constant SamplerDescriptorHeap* samplerHeap,
                 uint resourceDescriptorIndex,
                 uint samplerDescriptorIndex,
-                float2 texCoord, float2 offset)
+                float2 texCoord, float2 offset, float lodBias = 0.0)
 {
     texture2d<float> texture = textureHeap[resourceDescriptorIndex].tex;
     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
-    return texture.sample(sampler, texCoord + offset / (float2)getTexture2DDimensions(texture));
+    return texture.sample(sampler, texCoord + offset / (float2)getTexture2DDimensions(texture), bias(lodBias));
 }
 
 float4 tfetch2DArray(constant Texture2DArrayDescriptorHeap* textureHeap,
                      constant SamplerDescriptorHeap* samplerHeap,
                      uint resourceDescriptorIndex,
                      uint samplerDescriptorIndex,
-                     float3 texCoord, float3 offset)
+                     float3 texCoord, float3 offset, float lodBias = 0.0)
 {
     texture2d_array<float> texture = textureHeap[resourceDescriptorIndex].tex;
     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
     uint3 dimensions = getTexture2DArrayDimensions(texture);
-    return texture.sample(sampler, texCoord.xy + offset.xy / float2(dimensions.xy), uint(texCoord.z * dimensions.z));
+    return texture.sample(sampler, texCoord.xy + offset.xy / float2(dimensions.xy), uint(texCoord.z * dimensions.z), bias(lodBias));
 }
 
 float4 tfetch3D(constant Texture3DDescriptorHeap* textureHeap,
                 constant SamplerDescriptorHeap* samplerHeap,
                 uint resourceDescriptorIndex,
                 uint samplerDescriptorIndex,
-                float3 texCoord, float3 offset)
+                float3 texCoord, float3 offset, float lodBias = 0.0)
 {
     texture3d<float> texture = textureHeap[resourceDescriptorIndex].tex;
     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
-    return texture.sample(sampler, texCoord + offset / float3(getTexture3DDimensions(texture)));
+    return texture.sample(sampler, texCoord + offset / float3(getTexture3DDimensions(texture)), bias(lodBias));
 }
 
 float4 tfetchCube(constant TextureCubeDescriptorHeap* textureHeap,
                   constant SamplerDescriptorHeap* samplerHeap,
                   uint resourceDescriptorIndex,
                   uint samplerDescriptorIndex,
-                  float3 texCoord)
+                  float3 texCoord, float lodBias = 0.0)
 {
     texturecube<float> texture = textureHeap[resourceDescriptorIndex].tex;
     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
     float3 dir = cubeDir(texCoord);
-    return texture.sample(sampler, dir);
+    return texture.sample(sampler, dir, bias(lodBias));
 }
 
 float2 getWeights2D(constant Texture2DDescriptorHeap* textureHeap,
@@ -406,49 +453,51 @@ uint3 getTexture3DDimensions(Texture3D<float4> texture)
 // Pixel shaders need implicit derivatives for authored mip selection,
 // trilinear filtering and anisotropic footprints. Vertex shaders still use
 // explicit level zero because implicit derivatives are not available there.
-float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+// Vulkan applies sampler bias after either explicit or implicit base LOD;
+// the host has already clamped lodBias to the device sampler-bias limit.
+float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lodBias = 0.0)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
 #ifdef XENOS_RECOMP_PIXEL_SHADER
-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lodBias);
 #else
-    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), 0);
+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), 0.0 + lodBias);
 #endif
 }
 
-float4 tfetch2DArray(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
+float4 tfetch2DArray(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset, float lodBias = 0.0)
 {
     Texture2DArray<float4> texture = g_Texture2DArrayDescriptorHeap[resourceDescriptorIndex];
     uint3 dimensions = getTexture2DArrayDimensions(texture);
 #ifdef XENOS_RECOMP_PIXEL_SHADER
-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z));
+    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), lodBias);
 #else
-    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), 0);
+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), 0.0 + lodBias);
 #endif
 }
 
-float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
+float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset, float lodBias = 0.0)
 {
     Texture3D<float4> texture = g_Texture3DDescriptorHeap[resourceDescriptorIndex];
     uint3 dimensions = getTexture3DDimensions(texture);
 #ifdef XENOS_RECOMP_PIXEL_SHADER
-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex],
-                          texCoord + offset / dimensions);
+    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+                          texCoord + offset / dimensions, lodBias);
 #else
     return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
-                               texCoord + offset / dimensions, 0);
+                               texCoord + offset / dimensions, 0.0 + lodBias);
 #endif
 }
 
-float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lodBias = 0.0)
 {
     float3 dir = cubeDir(texCoord);
 #ifdef XENOS_RECOMP_PIXEL_SHADER
-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(
-        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir);
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleBias(
+        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, lodBias);
 #else
     return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(
-        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, 0);
+        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, 0.0 + lodBias);
 #endif
 }
 
@@ -557,7 +606,7 @@ float4 tfetch2DBicubic(constant Texture2DDescriptorHeap* textureHeap,
                        constant SamplerDescriptorHeap* samplerHeap,
                        uint resourceDescriptorIndex,
                        uint samplerDescriptorIndex,
-                       float2 texCoord, float2 offset)
+                       float2 texCoord, float2 offset, float lodBias = 0.0)
 {
     texture2d<float> texture = textureHeap[resourceDescriptorIndex].tex;
     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
@@ -581,17 +630,17 @@ float4 tfetch2DBicubic(constant Texture2DDescriptorHeap* textureHeap,
     float h1y = h1(fy);
 
     float4 r =
-        g0(fy) * (g0x * texture.sample(sampler, float2(px + h0x, py + h0y) / float2(dimensions)) +
-              g1x * texture.sample(sampler, float2(px + h1x, py + h0y) / float2(dimensions))) +
-        g1(fy) * (g0x * texture.sample(sampler, float2(px + h0x, py + h1y) / float2(dimensions)) +
-              g1x * texture.sample(sampler, float2(px + h1x, py + h1y) / float2(dimensions)));
+        g0(fy) * (g0x * texture.sample(sampler, float2(px + h0x, py + h0y) / float2(dimensions), bias(lodBias)) +
+              g1x * texture.sample(sampler, float2(px + h1x, py + h0y) / float2(dimensions), bias(lodBias))) +
+        g1(fy) * (g0x * texture.sample(sampler, float2(px + h0x, py + h1y) / float2(dimensions), bias(lodBias)) +
+              g1x * texture.sample(sampler, float2(px + h1x, py + h1y) / float2(dimensions), bias(lodBias)));
 
     return r;
 }
 
 #else
 
-float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lodBias = 0.0)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
     SamplerState samplerState = g_SamplerDescriptorHeap[samplerDescriptorIndex];
@@ -615,10 +664,10 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
     float h1y = h1(fy);
 
     float4 r =
-        g0(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
-        g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
+        g0(fy) * (g0x * texture.SampleBias(samplerState, float2(px + h0x, py + h0y) / float2(dimensions), lodBias) +
+            g1x * texture.SampleBias(samplerState, float2(px + h1x, py + h0y) / float2(dimensions), lodBias)) +
+        g1(fy) * (g0x * texture.SampleBias(samplerState, float2(px + h0x, py + h1y) / float2(dimensions), lodBias) +
+            g1x * texture.SampleBias(samplerState, float2(px + h1x, py + h1y) / float2(dimensions), lodBias));
 
     return r;
 }
@@ -822,6 +871,9 @@ struct PixelShaderOutput
 	float4 oC0 [[color(0)]];
 #else
 	float4 oC0 : SV_Target0;
+#ifdef __spirv__
+	uint oMask : SV_Coverage;
+#endif
 #endif
 };
 #ifdef __air__
@@ -860,6 +912,9 @@ PixelShaderOutput shaderMain(
 	PixelShaderOutput output = PixelShaderOutput{};
 #else
 	PixelShaderOutput output = (PixelShaderOutput)0;
+#endif
+#ifdef __spirv__
+	output.oMask = 0xFFFFFFFFu;
 #endif
 #ifdef __air__
 	float4 c252 = as_type<float4>(uint4(0x0, 0x0, 0x0, 0x0));
@@ -926,7 +981,7 @@ PixelShaderOutput shaderMain(
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		GBufferTextureSampler3_Texture2DDescriptorIndex, GBufferTextureSampler3_SamplerDescriptorIndex, r3.xy, float2(0, 0)).x;
+		GBufferTextureSampler3_Texture2DDescriptorIndex, GBufferTextureSampler3_SamplerDescriptorIndex, r3.xy, float2(0, 0), GetTextureLodBias(0)).x;
 	r2.w = (float)((dot(r1.zxy, r1.zxy)));
 	r3.xyz = (float3)((r0.yxz * r1.xzy));
 	r5.xyz = (float3)((r0.xzy * r1.yxz + -r3.xyz));
@@ -956,7 +1011,12 @@ PixelShaderOutput shaderMain(
 	// windowed with smoothstep, giving zero slope at both the center and the
 	// conservative 0.85-radius boundary. Retain GTA IV's authored 0.66 scale
 	// for the integrated volume brightness and denominator below.
-	const float smoothBoundary = authoredRadius * 0.85;
+#ifdef __air__
+	const float supportRadiusScale = as_type<float>(uint(GTA4_LIGHT_VOLUME_SUPPORT_BITS));
+#else
+	const float supportRadiusScale = asfloat(uint(GTA4_LIGHT_VOLUME_SUPPORT_BITS));
+#endif
+	const float smoothBoundary = authoredRadius * supportRadiusScale;
 	const float normalizedDistance =
 		saturate((smoothBoundary - r1.x) / smoothBoundary);
 	const float smoothFalloff = normalizedDistance * normalizedDistance *
@@ -979,9 +1039,20 @@ PixelShaderOutput shaderMain(
 	output.oC0.w = 0.0;
 	BRANCH if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)
 	{
-		uint alphaTestFunction = (g_SpecConstants() >> SPEC_CONSTANT_ALPHA_TEST_FUNCTION_SHIFT) & SPEC_CONSTANT_ALPHA_TEST_FUNCTION_MASK;
-		bool alphaTestPass = AlphaTestPass(output.oC0.w, g_AlphaThreshold, alphaTestFunction);
+		uint alphaTestFunction = (g_SpecConstants() >> SPEC_CONSTANT_ALPHA_TEST_FUNCTION_SHIFT) & 7u;
+		bool alphaTestPass =
+			(alphaTestFunction == 0u && false) ||
+			(alphaTestFunction == 1u && output.oC0.w < g_AlphaThreshold) ||
+			(alphaTestFunction == 2u && output.oC0.w == g_AlphaThreshold) ||
+			(alphaTestFunction == 3u && output.oC0.w <= g_AlphaThreshold) ||
+			(alphaTestFunction == 4u && output.oC0.w > g_AlphaThreshold) ||
+			(alphaTestFunction == 5u && (any(isnan(float2(output.oC0.w, g_AlphaThreshold))) || output.oC0.w != g_AlphaThreshold)) ||
+			(alphaTestFunction == 6u && output.oC0.w >= g_AlphaThreshold) ||
+			(alphaTestFunction == 7u && true);
 		clip(alphaTestPass ? 1.0 : -1.0);
 	}
+	#ifdef __spirv__
+	output.oMask = ComputeXenosAlphaToMask(output.oC0.w, input.iPos.xy, g_AlphaToMask, g_AlphaToMaskSampleCount);
+	#endif
 	return output;
 }

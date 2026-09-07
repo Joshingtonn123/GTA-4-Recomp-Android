@@ -109,6 +109,23 @@ struct RawImage {
   std::vector<uint8_t> data;
 };
 
+struct GuestOutputProvenance {
+  uint64_t tv_session_id = 0;
+  uint64_t title_present_id = 0;
+  uint64_t selected_generation = 0;
+  uint64_t tv_final_sequence = 0;
+  uint64_t tv_movie_sequence = 0;
+  uint64_t tv_rect_sequence = 0;
+  uint64_t tv_bink_sequence = 0;
+  uint32_t submitted_frame = 0;
+  uint32_t present_origin = 0;
+  uint32_t guest_caller = 0;
+  uint32_t selected_texture = 0;
+  uint32_t native_command_count = 0;
+  uint32_t tv_bink_result = 0;
+  bool diagnostic_trace = false;
+};
+
 // The presenter displays up to two layers of content on a host surface:
 // - Guest output image, focusing on lowering latency and maintaining stable
 //   frame pacing, with various scaling and sharpening methods and letterboxing;
@@ -369,7 +386,8 @@ class Presenter {
   // primitives required by the GuestOutputRefreshContext implementation.
   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
-                          std::function<bool(GuestOutputRefreshContext& context)> refresher);
+                          std::function<bool(GuestOutputRefreshContext& context)> refresher,
+                          GuestOutputProvenance provenance = {});
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
@@ -425,6 +443,7 @@ class Presenter {
     uint32_t display_aspect_ratio_x;
     uint32_t display_aspect_ratio_y;
     bool is_8bpc;
+    GuestOutputProvenance provenance;
 
     GuestOutputProperties() { SetToInactive(); }
 
@@ -439,6 +458,7 @@ class Presenter {
       display_aspect_ratio_x = 0;
       display_aspect_ratio_y = 0;
       is_8bpc = false;
+      provenance = {};
     }
   };
 

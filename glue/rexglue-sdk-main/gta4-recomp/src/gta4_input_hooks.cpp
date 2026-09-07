@@ -3,6 +3,8 @@
 #include "gta4_input_action_routing.h"
 #include "gta4_map_pan_policy.h"
 #include "gta4_pc_input_bridge.h"
+#include "gta4_vehicle_weapon_policy.h"
+#include "gta4_vehicle_mouse_policy.h"
 #include "gta4_touch_coordinator.h"
 #include "input/context_touch_controls.h"
 #include "input/user_music_player.h"
@@ -23,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
 
 REXCVAR_DEFINE_BOOL(gta4_native_input_trace, false, "GTA IV/Input",
                     "Trace native keyboard/mouse poll epochs and action injection");
@@ -59,6 +62,8 @@ enum class Action : uint32_t {
   kPickup = 23,
   kSniperZoomIn = 24,
   kSniperZoomOut = 25,
+  kSniperZoomInAlternate = 26,
+  kSniperZoomOutAlternate = 27,
   kCover = 28,
   kReload = 29,
   kVehicleMoveLeft = 30,
@@ -101,6 +106,7 @@ enum class Action : uint32_t {
   kFrontendUp = 65,
   kFrontendLeft = 66,
   kFrontendRight = 67,
+  kFrontendScrollY = 75,
   kFrontendPause = 76,
   kFrontendAccept = 77,
   kFrontendCancel = 78,
@@ -116,13 +122,43 @@ enum class Action : uint32_t {
   kMapY = 73,
 };
 
+constexpr Action kFrontendButtonActions[] = {
+    Action::kFrontendDown, Action::kFrontendUp,
+    Action::kFrontendLeft, Action::kFrontendRight,
+    Action::kFrontendPause, Action::kFrontendAccept, Action::kFrontendCancel,
+    Action::kFrontendX, Action::kFrontendY,
+    Action::kFrontendLeftShoulder, Action::kFrontendRightShoulder,
+    Action::kFrontendLeftTrigger, Action::kFrontendRightTrigger,
+};
+constexpr Action kPhoneButtonActions[] = {
+    Action::kPhoneTakeOut, Action::kPhonePutAway,
+};
+
 // These values are recovered from generated sub_822B7DD0/sub_822B7CD8 and
 // sub_821B4768. tools/verify_gta4_input_layout.py verifies all derived offsets.
 constexpr uint32_t kActionArrayOffset = 2328;
 constexpr uint32_t kActionStride = 12;
 constexpr uint32_t kActionCurrentOffset = 2;
+constexpr uint32_t kActionPreviousOffset = 3;
+// sub_822B7DD0 caches the previous signed action-75 value here, and
+// sub_8224FFC8 consumes it for right-stick vertical scroll edge events.
+constexpr uint32_t kFrontendScrollPreviousOffset = 4212;
 constexpr uint32_t kControlUserIndexOffset = 3412;
 constexpr uint32_t kLastInputTimeOffset = 4200;
+// Generated sub_828CC9D0 converts the XInput state into one of four retail
+// controller records before native PC actions are merged. The record geometry
+// and addresses are independently checked by
+// /tmp/verify_controller_record_layout.py.
+constexpr uint32_t kRetailControllerRecordsAddress = 0x831C4FF8;
+constexpr uint32_t kRetailControllerRecordStride = 56;
+constexpr uint32_t kRetailControllerRecordCount = 4;
+constexpr uint32_t kRetailControllerFlagsOffset = 4;
+constexpr uint32_t kRetailControllerAFlag = 0x40;
+constexpr uint32_t kRetailControllerStartFlag = 0x800;
+constexpr uint32_t kRetailControllerDpadUpFlag = 0x1000;
+constexpr uint32_t kRetailControllerDpadDownFlag = 0x4000;
+constexpr uint32_t kRetailControllerDpadLeftFlag = 0x8000;
+constexpr uint32_t kRetailControllerDpadRightFlag = 0x2000;
 constexpr uint32_t kGameInputTimeAddress = 0x82C6C2A4;
 constexpr uint32_t kGameplayTimeStepAddress = 0x82C6C2AC;
 constexpr uint32_t kCurrentScreenAddress = 0x82BFA124;
@@ -134,11 +170,14 @@ constexpr uint32_t kMapZoomMaximum = 5;
 // Generated sub_8224FFC8 reads and clears this one-shot frontend refresh flag.
 // The address is independently derived by tools/verify_gta4_input_layout.py.
 constexpr uint32_t kFrontendOneShotFlagAddress = 0x82BFA129;
+// Registered IS_PAUSE_MENU_ACTIVE native sub_825DAA40, via sub_825DD3E8.
+constexpr uint32_t kPauseMenuTransitionAddress = 0x82BFA13C;
+constexpr uint32_t kPauseMenuVisibleAddress = 0x82BFA144;
 // The registered CAN_PHONE_BE_SEEN_ON_SCREEN native (sub_8217D3E0) loads the
 // active phone render object through this index/table pair, then evaluates
 // sub_821C2FA8. That retail leaf returns the object's byte-17 hidden state;
 // CAN_PHONE_BE_SEEN_ON_SCREEN returns its inverse. The absolute addresses are
-// derived from the generated instructions by /tmp/compute_phone_globals.py.
+// checked against generated instructions by verify_gta4_keyboard_consumers.py.
 constexpr uint32_t kPhoneRenderIndexAddress = 0x82B3A0F0;
 constexpr uint32_t kPhoneRenderObjectTableAddress = 0x82B39990;
 // The retail data definition reserves 0x100 bytes at dword_82B39990 before
@@ -147,6 +186,13 @@ constexpr uint32_t kPhoneRenderObjectTableAddress = 0x82B39990;
 // more broadly, so reject an out-of-range startup/corruption value first.
 constexpr uint32_t kPhoneRenderObjectCount = 64;
 constexpr uint32_t kPhoneHiddenStateOffset = 17;
+// CREATE_MOBILE_PHONE (sub_8217C958) sets this byte and
+// DESTROY_MOBILE_PHONE (sub_82146BE8) clears it. The persistent HUD widget
+// queried by CAN_PHONE_BE_SEEN_ON_SCREEN is not proof that a phone exists.
+// Generated sub_823CA860/sub_823CE3A8 additionally reject the offscreen state
+// written by SCRIPT_IS_MOVING_MOBILE_PHONE_OFFSCREEN (sub_8217D3C0).
+constexpr uint32_t kPhoneCreatedAddress = 0x831D4DD4;
+constexpr uint32_t kPhoneMovingOffscreenAddress = 0x831D534C;
 constexpr uint32_t kPhoneConsumerDisableFlagAOffset = 528;
 constexpr uint32_t kPhoneConsumerDisableFlagBOffset = 529;
 constexpr uint32_t kPhoneConsumerStateOffset = 640;
@@ -156,6 +202,10 @@ constexpr uint32_t kPlayerInfoPedOffset = 1400;
 constexpr uint32_t kPedVehicleFlagsOffset = 572;
 constexpr uint32_t kPedVehicleOffset = 2688;
 constexpr uint32_t kVehicleDriverOffset = 3904;
+// IS_CHAR_IN_ANY_HELI (sub_825C4400) tests the retail class kind, including
+// derived helicopter models, rather than one particular vtable address.
+constexpr uint32_t kVehicleClassOffset = 4836;
+constexpr uint32_t kHelicopterVehicleClass = 4;
 // SET_PLAYER_CAN_DROP_WEAPONS_IN_CAR writes this byte. Generated
 // sub_8237FC98/sub_82384518 read it after the action-42 trigger and before
 // executing the GTA Race drop-weapon operation.
@@ -164,7 +214,6 @@ constexpr uint32_t kRadioEntityVehicleOffset = 40;
 constexpr uint32_t kRadioEntityStateOffset = 108;
 constexpr uint32_t kRadioEntityStationOffset = 110;
 constexpr uint32_t kPedInVehicleFlag = 0x20000000;
-constexpr uint32_t kHeliVtable = 0x8200B8D4;
 constexpr uint32_t kMaximumLocalPlayers = 4;
 constexpr uint32_t kGuestPointerSize = 4;
 constexpr uint8_t kPressed = 255;
@@ -173,6 +222,8 @@ constexpr int32_t kFullPositive = 255;
 constexpr double kReferenceFrameSeconds = 0x1.1111120000000p-5;
 constexpr double kMouseUnitsPerCount = 0x1.8000000000000p+3;
 constexpr uint32_t kDirectWeaponPredicateCaller = 0x823CFD54;
+constexpr uint32_t kVehicleWeaponPressPredicateCaller = 0x823CFB28;
+constexpr uint32_t kVehicleWeaponReleasePredicateCaller = 0x823CFAF0;
 constexpr uint32_t kDirectWeaponSelectionCaller = 0x823CFD94;
 constexpr uint32_t kRadioOffPredicateCaller = 0x822D4A18;
 constexpr uint32_t kPedWeaponManagerOffset = 640;
@@ -202,6 +253,8 @@ struct DirectWeaponRequest {
   uint32_t user = 0;
   uint32_t ped = 0;
   uint32_t slot = 0;
+  KeyboardWeaponRequest request = KeyboardWeaponRequest::kDirect;
+  bool in_vehicle = false;
   bool armed = false;
   bool predicate_forced = false;
 };
@@ -228,9 +281,16 @@ struct InputEpoch {
   uint32_t poll_caller = 0;
   uint32_t phone_render_index = 0;
   uint32_t phone_render_object = 0;
+  bool phone_created = false;
+  bool phone_moving_offscreen = false;
+  bool phone_render_visible = false;
+  uint32_t pause_menu_transition = 0;
+  bool pause_menu_visible = false;
   bool frontend_active = false;
   bool phone_visible = false;
   bool map_active = false;
+  bool helicopter_controls = false;
+  KeyboardEscapeRoute escape_route = KeyboardEscapeRoute::kPause;
   bool gamepad_valid = false;
   bool valid = false;
   bool trace_sample = false;
@@ -257,7 +317,16 @@ std::array<uint8_t, 256> g_trace_last_keys{};
 uint64_t g_trace_last_reset_generation = 0;
 rex::ui::MouseEvent::MotionSource g_trace_last_source = rex::ui::MouseEvent::MotionSource::kGeneric;
 std::array<uint8_t, 256> g_last_functional_keys{};
+KeyboardEscapeState g_escape_state;
+using FrontendControlHistory =
+    std::array<KeyboardActionHistory, std::size(kFrontendButtonActions)>;
+std::unordered_map<uint32_t, FrontendControlHistory> g_frontend_history;
+using PhoneControlHistory =
+    std::array<KeyboardActionHistory, std::size(kPhoneButtonActions)>;
+std::unordered_map<uint32_t, PhoneControlHistory> g_phone_history;
+std::unordered_map<uint32_t, KeyboardActionHistory> g_frontend_scroll_history;
 DirectWeaponRequest g_direct_weapon_request;
+thread_local VehicleWeaponCandidatePolicy g_vehicle_weapon_candidates;
 RadioOffRequest g_radio_off_request;
 uint64_t g_last_map_epoch_sequence = 0;
 bool g_user_music_vehicle_active = false;
@@ -273,6 +342,11 @@ struct PauseTabInputState {
 struct GtaActionTraceSnapshot {
   uint32_t screen = 0;
   uint32_t control = 0;
+  uint8_t sprint = 0;
+  uint8_t jump = 0;
+  uint8_t enter = 0;
+  uint8_t duck = 0;
+  uint8_t pickup = 0;
   uint8_t accelerate = 0;
   uint8_t brake = 0;
   uint8_t steer_left = 0;
@@ -291,6 +365,8 @@ struct GtaActionTraceSnapshot {
   uint8_t frontend_accept = 0;
   uint8_t frontend_cancel = 0;
   uint8_t frontend_pause = 0;
+  uint8_t frontend_x = 0;
+  uint8_t frontend_y = 0;
 
   bool operator==(const GtaActionTraceSnapshot&) const = default;
 };
@@ -392,7 +468,8 @@ bool ForceParachuteControlResult(uint8_t* base, uint32_t call_context,
              IsPressed(epoch, VirtualKey::kLButton)) ||
             (parachute.state == kParachuteDeployedState &&
              action == kParachuteDetachAction &&
-             IsPressed(epoch, VirtualKey::kF));
+             GTA4_TouchVirtualKeyPressed(epoch.sequence,
+                                         static_cast<uint16_t>(VirtualKey::kF)));
   } else if (parachute.state == kParachuteDeployedState) {
     force = ((action == kParachuteLeftBrakeAction ||
               action == kParachutePcLeftBrakeAction) &&
@@ -498,7 +575,8 @@ VehicleInputContext ReadVehicleInputContext(uint8_t* base) {
 
   context.vehicle_vtable = LoadU32(base, context.vehicle);
   context.is_driver = LoadU32(base, context.vehicle + kVehicleDriverOffset) == context.ped;
-  context.is_heli = context.vehicle_vtable == kHeliVtable;
+  context.is_heli =
+      LoadU32(base, context.vehicle + kVehicleClassOffset) == kHelicopterVehicleClass;
   context.can_drop_weapon =
       LoadU8(base, kPlayerCanDropWeaponsInCarAddress) != 0;
   return context;
@@ -512,6 +590,15 @@ bool IsDown(const NativeInputState& state, VirtualKey key) {
   const auto index = static_cast<uint16_t>(key);
   return (index < state.keys.size() && state.keys[index] != 0) ||
          GTA4_TouchVirtualKeyDown(index);
+}
+
+bool IsNativeActionDown(const InputEpoch& epoch, VirtualKey key) {
+  // Touch controls are virtual PC actions and do not pass through MnK's
+  // hardware keyboard/controller bridge. Preserve their action injection.
+  const auto index = static_cast<uint16_t>(key);
+  return GTA4_TouchVirtualKeyDown(index) ||
+         (!IsKeyboardControllerKey(key, epoch.helicopter_controls) &&
+          index < epoch.state.keys.size() && epoch.state.keys[index] != 0);
 }
 
 bool IsPressed(const InputEpoch& epoch, VirtualKey key) {
@@ -544,14 +631,33 @@ uint64_t KeyEventSequence(const InputEpoch& epoch, VirtualKey key) {
              : rex::input::NextInputTraceSequence();
 }
 
+// Every physical key consumed by the native GTA input bridge, plus the
+// configured PC control surface (letter/number rows and navigation keys).
+// Trace only edges below so held movement keys don't flood persistent logs.
+constexpr VirtualKey kControlTraceKeys[] = {
+    VirtualKey::kLButton, VirtualKey::kRButton, VirtualKey::kXButton1,
+    VirtualKey::kBack, VirtualKey::kTab, VirtualKey::kReturn,
+    VirtualKey::kShift, VirtualKey::kControl, VirtualKey::kCapital,
+    VirtualKey::kEscape, VirtualKey::kSpace,
+    VirtualKey::kLeft, VirtualKey::kUp, VirtualKey::kRight,
+    VirtualKey::kDown, VirtualKey::kDelete,
+    VirtualKey::k0, VirtualKey::k1, VirtualKey::k2, VirtualKey::k3,
+    VirtualKey::k4, VirtualKey::k5, VirtualKey::k6, VirtualKey::k7,
+    VirtualKey::k8, VirtualKey::k9,
+    VirtualKey::kA, VirtualKey::kB, VirtualKey::kC, VirtualKey::kD,
+    VirtualKey::kE, VirtualKey::kF, VirtualKey::kG, VirtualKey::kH,
+    VirtualKey::kI, VirtualKey::kJ, VirtualKey::kK, VirtualKey::kL,
+    VirtualKey::kM, VirtualKey::kN, VirtualKey::kO, VirtualKey::kP,
+    VirtualKey::kQ, VirtualKey::kR, VirtualKey::kS, VirtualKey::kT,
+    VirtualKey::kU, VirtualKey::kV, VirtualKey::kW, VirtualKey::kX,
+    VirtualKey::kY, VirtualKey::kZ,
+    VirtualKey::kNumpad0, VirtualKey::kNumpad2, VirtualKey::kNumpad4,
+    VirtualKey::kNumpad6, VirtualKey::kNumpad8, VirtualKey::kOem3,
+};
+
 bool EpochHasFocusedTraceInput(const InputEpoch& epoch) {
-  constexpr VirtualKey kFocusedKeys[] = {
-      VirtualKey::kEscape, VirtualKey::kUp,     VirtualKey::kDown,
-      VirtualKey::kLeft,   VirtualKey::kRight,  VirtualKey::kReturn,
-      VirtualKey::kBack,   VirtualKey::kDelete,
-  };
-  for (VirtualKey key : kFocusedKeys) {
-    if (IsChanged(epoch, key) || IsDown(epoch.state, key)) {
+  for (VirtualKey key : kControlTraceKeys) {
+    if (IsChanged(epoch, key)) {
       return true;
     }
   }
@@ -559,13 +665,8 @@ bool EpochHasFocusedTraceInput(const InputEpoch& epoch) {
 }
 
 uint64_t FocusedTraceSequence(const InputEpoch& epoch) {
-  constexpr VirtualKey kFocusedKeys[] = {
-      VirtualKey::kEscape, VirtualKey::kUp,     VirtualKey::kDown,
-      VirtualKey::kLeft,   VirtualKey::kRight,  VirtualKey::kReturn,
-      VirtualKey::kBack,   VirtualKey::kDelete,
-  };
-  for (VirtualKey key : kFocusedKeys) {
-    if (IsChanged(epoch, key) || IsDown(epoch.state, key)) {
+  for (VirtualKey key : kControlTraceKeys) {
+    if (IsChanged(epoch, key)) {
       return KeyEventSequence(epoch, key);
     }
   }
@@ -575,10 +676,26 @@ uint64_t FocusedTraceSequence(const InputEpoch& epoch) {
 }
 
 bool FrontendActive(const PPCContext& parent, uint8_t* base) {
+  const bool pause_visible = LoadU8(base, kPauseMenuVisibleAddress) != 0;
+  if (pause_visible) {
+    return RetailPauseMenuActive(
+        pause_visible, LoadU32(base, kPauseMenuTransitionAddress));
+  }
+  // Non-pause frontend widgets still use their own activation state. A pause
+  // menu may own keyboard navigation while this particular widget is inactive.
   PPCContext nested = parent;
   nested.r3.u32 = 0;
   __imp__sub_8224EEF8(nested, base);
   return nested.r3.u8 != 0;
+}
+
+bool ConfigureKeyboardControllerForPoll(const PPCContext& parent, uint8_t* base) {
+  const VehicleInputContext vehicle = ReadVehicleInputContext(base);
+  const bool helicopter_controls = UseHelicopterControllerBindings(
+      vehicle.is_driver, vehicle.is_heli, FrontendActive(parent, base));
+  rex::input::mnk::SetNativeControllerCompatibilityBindings(
+      KeyboardControllerBindings(helicopter_controls));
+  return helicopter_controls;
 }
 
 uint32_t SelectInterfaceControl(const PPCContext& parent, uint8_t* base) {
@@ -594,11 +711,16 @@ uint32_t SelectInterfaceControl(const PPCContext& parent, uint8_t* base) {
 struct PhoneVisibilityContext {
   uint32_t render_index = 0;
   uint32_t render_object = 0;
+  bool created = false;
+  bool moving_offscreen = false;
+  bool render_visible = false;
   bool visible = false;
 };
 
 PhoneVisibilityContext ReadPhoneVisibilityContext(uint8_t* base) {
   PhoneVisibilityContext context;
+  context.created = LoadU8(base, kPhoneCreatedAddress) != 0;
+  context.moving_offscreen = LoadU8(base, kPhoneMovingOffscreenAddress) != 0;
   context.render_index = LoadU32(base, kPhoneRenderIndexAddress);
   if (context.render_index >= kPhoneRenderObjectCount) {
     return context;
@@ -610,9 +732,11 @@ PhoneVisibilityContext ReadPhoneVisibilityContext(uint8_t* base) {
   // CAN_PHONE_BE_SEEN_ON_SCREEN native. Treat a missing object as not visible
   // instead of dereferencing it; the retail path assumes initialization has
   // already installed the object.
-  context.visible =
+  context.render_visible =
       context.render_object &&
       LoadU8(base, context.render_object + kPhoneHiddenStateOffset) == 0;
+  context.visible = PhoneOwnsKeyboard(context.created, context.moving_offscreen,
+                                     context.render_visible);
   return context;
 }
 
@@ -666,6 +790,11 @@ GtaActionTraceSnapshot CaptureActionTrace(uint8_t* base, uint32_t control) {
   return {
       .screen = LoadU32(base, kCurrentScreenAddress),
       .control = control,
+      .sprint = ReadActionRaw(base, control, Action::kSprint),
+      .jump = ReadActionRaw(base, control, Action::kJump),
+      .enter = ReadActionRaw(base, control, Action::kEnter),
+      .duck = ReadActionRaw(base, control, Action::kDuck),
+      .pickup = ReadActionRaw(base, control, Action::kPickup),
       .accelerate = ReadActionRaw(base, control, Action::kVehicleAccelerate),
       .brake = ReadActionRaw(base, control, Action::kVehicleBrake),
       .steer_left = ReadActionRaw(base, control, Action::kVehicleMoveLeft),
@@ -686,6 +815,8 @@ GtaActionTraceSnapshot CaptureActionTrace(uint8_t* base, uint32_t control) {
       .frontend_accept = ReadActionRaw(base, control, Action::kFrontendAccept),
       .frontend_cancel = ReadActionRaw(base, control, Action::kFrontendCancel),
       .frontend_pause = ReadActionRaw(base, control, Action::kFrontendPause),
+      .frontend_x = ReadActionRaw(base, control, Action::kFrontendX),
+      .frontend_y = ReadActionRaw(base, control, Action::kFrontendY),
   };
 }
 
@@ -696,37 +827,41 @@ void TraceFocusedKeyRoutes(uint8_t* base, const InputEpoch& epoch,
   if (!rex::input::IsInputTraceEnabled() || !epoch.valid) {
     return;
   }
-  constexpr VirtualKey kFocusedKeys[] = {
-      VirtualKey::kEscape, VirtualKey::kUp,     VirtualKey::kDown,
-      VirtualKey::kLeft,   VirtualKey::kRight,  VirtualKey::kReturn,
-      VirtualKey::kBack,   VirtualKey::kDelete,
-  };
   const GtaActionTraceSnapshot replay =
       CaptureActionTrace(base, replay_control);
   const GtaActionTraceSnapshot active =
       CaptureActionTrace(base, active_gameplay_control);
-  for (VirtualKey key : kFocusedKeys) {
-    if (!IsChanged(epoch, key) && !IsDown(epoch.state, key)) {
+  for (VirtualKey key : kControlTraceKeys) {
+    if (!IsChanged(epoch, key)) {
       continue;
     }
     const auto index = static_cast<uint16_t>(key);
     REXLOG_INFO(
         "input-e2e: seq={} stage={} epoch={} key={} vk={} down={} changed={} "
         "pressed={} frontend-active={} phone-visible={} map-active={} "
+        "gamepad-valid={} packet={} buttons={:04X} "
         "replay-control={:08X} active-control={:08X} "
+        "replay-face={}/{}/{}/{}/{} active-face={}/{}/{}/{}/{} "
         "replay-phone={}/{} replay-frontend={}/{}/{}/{}:{}/{}/{} "
-        "active-phone={}/{} active-frontend={}/{}/{}/{}:{}/{}/{}",
+        "replay-frontend-xy={}/{} active-phone={}/{} "
+        "active-frontend={}/{}/{}/{}:{}/{}/{} active-frontend-xy={}/{}",
         KeyEventSequence(epoch, key), stage, epoch.sequence,
         rex::input::InputTraceVirtualKeyName(index), index,
         IsDown(epoch.state, key), IsChanged(epoch, key), IsPressed(epoch, key),
         epoch.frontend_active, epoch.phone_visible, epoch.map_active,
-        replay_control, active_gameplay_control, replay.phone_take_out,
+        epoch.gamepad_valid, epoch.gamepad_packet, epoch.gamepad_buttons,
+        replay_control, active_gameplay_control,
+        replay.sprint, replay.jump, replay.enter, replay.duck, replay.pickup,
+        active.sprint, active.jump, active.enter, active.duck, active.pickup,
+        replay.phone_take_out,
         replay.phone_put_away, replay.frontend_down, replay.frontend_up,
         replay.frontend_left, replay.frontend_right, replay.frontend_pause,
-        replay.frontend_accept, replay.frontend_cancel, active.phone_take_out,
+        replay.frontend_accept, replay.frontend_cancel, replay.frontend_x,
+        replay.frontend_y, active.phone_take_out,
         active.phone_put_away, active.frontend_down, active.frontend_up,
         active.frontend_left, active.frontend_right, active.frontend_pause,
-        active.frontend_accept, active.frontend_cancel);
+        active.frontend_accept, active.frontend_cancel, active.frontend_x,
+        active.frontend_y);
   }
 }
 
@@ -745,17 +880,21 @@ void TraceActionState(const char* stage, const InputEpoch& epoch,
   REXLOG_INFO(
       "input-e2e: seq={} stage={} epoch={} screen={} frontend-active={} "
       "phone-visible={} map-active={} control={:08X} "
+      "face=sprint:{}/jump:{}/enter:{}/duck:{}/pickup:{} "
       "vehicle=accelerate:{}/brake:{}/steer:{}/{}:pitch:{}/{}:exit:{} "
       "phone=take-out:{}/put-away:{} "
-      "frontend=direction:{}/{}/{}/{}:shoulder:{}/{}:accept:{}:cancel:{}:pause:{}",
+      "frontend=direction:{}/{}/{}/{}:shoulder:{}/{}:accept:{}:cancel:{}:pause:{}:x:{}:y:{}",
       host_sequence, stage, epoch.sequence, snapshot.screen, epoch.frontend_active,
       epoch.phone_visible, epoch.map_active, snapshot.control,
+      snapshot.sprint, snapshot.jump, snapshot.enter, snapshot.duck,
+      snapshot.pickup,
       snapshot.accelerate, snapshot.brake, snapshot.steer_left, snapshot.steer_right,
       snapshot.pitch_up, snapshot.pitch_down, snapshot.exit_vehicle,
       snapshot.phone_take_out, snapshot.phone_put_away, snapshot.frontend_down,
       snapshot.frontend_up, snapshot.frontend_left, snapshot.frontend_right,
       snapshot.frontend_left_shoulder, snapshot.frontend_right_shoulder,
-      snapshot.frontend_accept, snapshot.frontend_cancel, snapshot.frontend_pause);
+      snapshot.frontend_accept, snapshot.frontend_cancel, snapshot.frontend_pause,
+      snapshot.frontend_x, snapshot.frontend_y);
 }
 
 void ProcessPauseTabShoulders(PPCContext& parent, uint8_t* base,
@@ -767,7 +906,6 @@ void ProcessPauseTabShoulders(PPCContext& parent, uint8_t* base,
   g_pause_tab_input.epoch = epoch.sequence;
   const uint32_t screen = LoadU32(base, kCurrentScreenAddress);
   const bool keyboard_left_down = epoch.valid && IsDown(epoch.state, VirtualKey::kQ);
-  const bool keyboard_right_down = epoch.valid && IsDown(epoch.state, VirtualKey::kF);
   const bool gamepad_left_down =
       epoch.gamepad_valid &&
       (epoch.gamepad_buttons & rex::input::X_INPUT_GAMEPAD_LEFT_SHOULDER) != 0;
@@ -775,7 +913,7 @@ void ProcessPauseTabShoulders(PPCContext& parent, uint8_t* base,
       epoch.gamepad_valid &&
       (epoch.gamepad_buttons & rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
   const bool left_down = keyboard_left_down || gamepad_left_down;
-  const bool right_down = keyboard_right_down || gamepad_right_down;
+  const bool right_down = gamepad_right_down;
 
   if (!epoch.frontend_active ||
       !gta4::frontend_menu::policy::IsPauseTabScreen(screen)) {
@@ -797,9 +935,9 @@ void ProcessPauseTabShoulders(PPCContext& parent, uint8_t* base,
     if (rex::input::IsInputTraceEnabled()) {
       REXLOG_INFO(
           "input-e2e: seq={} stage=pause-tab result=armed epoch={} screen={} "
-          "shoulders={}/{} keyboard={}/{} gamepad={}/{} buttons={:04X}",
+          "shoulders={}/{} keyboard-left={} gamepad={}/{} buttons={:04X}",
           rex::input::NextInputTraceSequence(), epoch.sequence, screen, left_down, right_down,
-          keyboard_left_down, keyboard_right_down, gamepad_left_down, gamepad_right_down,
+          keyboard_left_down, gamepad_left_down, gamepad_right_down,
           epoch.gamepad_buttons);
     }
     return;
@@ -961,6 +1099,20 @@ void ArmContextRequests(uint8_t* base) {
         .user = g_epoch.state.user_index,
         .ped = context.ped,
         .slot = requested_slot,
+        .in_vehicle = context.vehicle != 0,
+        .armed = true,
+    };
+  } else if (!pressed_slot_count && context.ped && context.vehicle &&
+             IsPressed(g_epoch, VirtualKey::kQ) !=
+                 IsPressed(g_epoch, VirtualKey::kZ)) {
+    g_direct_weapon_request = {
+        .epoch = g_epoch.sequence,
+        .user = g_epoch.state.user_index,
+        .ped = context.ped,
+        .request = IsPressed(g_epoch, VirtualKey::kQ)
+                       ? KeyboardWeaponRequest::kNext
+                       : KeyboardWeaponRequest::kPrevious,
+        .in_vehicle = true,
         .armed = true,
     };
   }
@@ -1013,9 +1165,7 @@ struct ButtonBinding {
 constexpr ButtonBinding kButtonBindings[] = {
     {VirtualKey::kShift, Action::kSprint},
     {VirtualKey::kSpace, Action::kJump},
-    {VirtualKey::kF, Action::kEnter},
     {VirtualKey::kLButton, Action::kAttack},
-    {VirtualKey::kDown, Action::kAttack2},
     {VirtualKey::kRButton, Action::kAim},
     {VirtualKey::kC, Action::kLookBehind},
     {VirtualKey::kR, Action::kReload},
@@ -1023,16 +1173,12 @@ constexpr ButtonBinding kButtonBindings[] = {
     {VirtualKey::kE, Action::kPickup},
     {VirtualKey::kControl, Action::kDuck},
     {VirtualKey::kV, Action::kNextCamera},
-    {VirtualKey::kUp, Action::kPhoneTakeOut},
     {VirtualKey::kEscape, Action::kPhonePutAway},
-    {VirtualKey::kBack, Action::kPhonePutAway},
-    {VirtualKey::kDelete, Action::kPhonePutAway},
     {VirtualKey::kLButton, Action::kVehicleAttack},
     {VirtualKey::kRButton, Action::kVehicleAttack2},
     {VirtualKey::kW, Action::kVehicleAccelerate},
     {VirtualKey::kS, Action::kVehicleBrake},
     {VirtualKey::kH, Action::kVehicleHeadlight},
-    {VirtualKey::kF, Action::kVehicleExit},
     {VirtualKey::kSpace, Action::kVehicleHandbrake},
     {VirtualKey::kW, Action::kVehicleHotwireLeft},
     {VirtualKey::kS, Action::kVehicleHotwireRight},
@@ -1047,89 +1193,129 @@ constexpr ButtonBinding kButtonBindings[] = {
     {VirtualKey::kR, Action::kMeleeAttack2},
     {VirtualKey::kQ, Action::kMeleeKick},
     {VirtualKey::kSpace, Action::kMeleeBlock},
-    {VirtualKey::kDown, Action::kFrontendDown},
     {VirtualKey::kS, Action::kFrontendDown},
-    {VirtualKey::kUp, Action::kFrontendUp},
     {VirtualKey::kW, Action::kFrontendUp},
-    {VirtualKey::kLeft, Action::kFrontendLeft},
     {VirtualKey::kA, Action::kFrontendLeft},
-    {VirtualKey::kRight, Action::kFrontendRight},
     {VirtualKey::kD, Action::kFrontendRight},
     {VirtualKey::kEscape, Action::kFrontendPause},
-    {VirtualKey::kReturn, Action::kFrontendAccept},
-    {VirtualKey::kSpace, Action::kFrontendAccept},
     {VirtualKey::kLButton, Action::kFrontendAccept},
-    {VirtualKey::kBack, Action::kFrontendCancel},
-    {VirtualKey::kDelete, Action::kFrontendCancel},
     {VirtualKey::kEscape, Action::kFrontendCancel},
+    {VirtualKey::kXButton1, Action::kFrontendCancel},
     {VirtualKey::kR, Action::kFrontendX},
+    {VirtualKey::kSpace, Action::kFrontendY},
     {VirtualKey::kE, Action::kFrontendY},
     {VirtualKey::kQ, Action::kFrontendLeftShoulder},
-    {VirtualKey::kF, Action::kFrontendRightShoulder},
     {VirtualKey::kRButton, Action::kFrontendLeftTrigger},
     {VirtualKey::kLButton, Action::kFrontendRightTrigger},
     {VirtualKey::kT, Action::kZoomRadar},
     {VirtualKey::kTab, Action::kZoomRadar},
 };
 
-bool IsArrowDirectionKey(VirtualKey key) {
-  return key == VirtualKey::kUp || key == VirtualKey::kDown ||
-         key == VirtualKey::kLeft || key == VirtualKey::kRight;
-}
-
-bool IsWasdDirectionKey(VirtualKey key) {
-  return key == VirtualKey::kW || key == VirtualKey::kA ||
-         key == VirtualKey::kS || key == VirtualKey::kD;
-}
-
 bool ShouldInjectInterfaceBinding(const ButtonBinding& binding,
                                   const InputEpoch& epoch) {
-  const bool interface_active = epoch.frontend_active || epoch.phone_visible;
-  if (binding.action == Action::kPhoneTakeOut) {
-    // D-pad/Up is also the retail phone's second-step keypad action. Keep it
-    // active while the phone is visible, but never open the phone through an
-    // unrelated pause/frontend screen.
-    return !epoch.frontend_active || epoch.phone_visible;
-  }
-  if (binding.action == Action::kPhonePutAway) {
-    return epoch.phone_visible;
-  }
-  if (!IsFrontendAction(binding.action)) {
-    return false;
-  }
+  return ShouldInjectKeyboardInterfaceAction(
+      static_cast<uint32_t>(binding.action), binding.key,
+      {.frontend_active = epoch.frontend_active,
+       .phone_visible = epoch.phone_visible,
+       .map_active = epoch.map_active,
+       .helicopter_controls = epoch.helicopter_controls,
+       .escape_route = epoch.escape_route});
+}
 
-  switch (binding.action) {
-    case Action::kFrontendDown:
-    case Action::kFrontendUp:
-    case Action::kFrontendLeft:
-    case Action::kFrontendRight:
-      // The phone owns the cursor keys. WASD remains the pause/frontend alias
-      // and must not steal movement while the in-world phone is open.
-      return (IsArrowDirectionKey(binding.key) && interface_active) ||
-             (IsWasdDirectionKey(binding.key) && epoch.frontend_active &&
-              !epoch.phone_visible);
-    case Action::kFrontendPause:
-      // Escape closes the phone through PUT_AWAY/CANCEL below. Only emit the
-      // pause action when no visible phone owns Escape.
-      return !epoch.phone_visible;
-    case Action::kFrontendAccept:
-      if (!interface_active) {
-        return false;
-      }
-      return binding.key == VirtualKey::kReturn ||
-             (epoch.frontend_active && !epoch.phone_visible && !epoch.map_active &&
-              (binding.key == VirtualKey::kSpace ||
-               binding.key == VirtualKey::kLButton));
-    case Action::kFrontendCancel:
-      if (!interface_active) {
-        return false;
-      }
-      return binding.key == VirtualKey::kBack ||
-             binding.key == VirtualKey::kDelete ||
-             (binding.key == VirtualKey::kEscape && epoch.phone_visible);
-    default:
-      return epoch.frontend_active;
+template <size_t Count>
+void PrepareKeyboardHistory(uint8_t* base, uint32_t control,
+                             uint64_t epoch, bool replayed,
+                             const Action (&actions)[Count],
+                             std::array<KeyboardActionHistory, Count>& history) {
+  for (size_t index = 0; index < history.size(); ++index) {
+    const uint32_t address = ActionAddress(control, actions[index]);
+    const KeyboardActionBytes observed{
+        LoadU8(base, address + kActionCurrentOffset),
+        LoadU8(base, address + kActionPreviousOffset)};
+    const KeyboardActionBytes prepared =
+        history[index].Prepare(epoch, replayed, observed);
+    if (prepared.current != observed.current) {
+      StoreU8(base, address + kActionCurrentOffset, prepared.current);
+    }
+    if (prepared.previous != observed.previous) {
+      StoreU8(base, address + kActionPreviousOffset, prepared.previous);
+    }
   }
+}
+
+template <size_t Count>
+void CommitKeyboardHistory(uint8_t* base, uint32_t control,
+                            const Action (&actions)[Count],
+                            std::array<KeyboardActionHistory, Count>& history) {
+  for (size_t index = 0; index < history.size(); ++index) {
+    const uint32_t address = ActionAddress(control, actions[index]);
+    history[index].Commit({LoadU8(base, address + kActionCurrentOffset),
+                           LoadU8(base, address + kActionPreviousOffset)});
+  }
+}
+
+void PrepareFrontendHistory(uint8_t* base, uint32_t control,
+                             uint64_t epoch, bool replayed) {
+  PrepareKeyboardHistory(base, control, epoch, replayed,
+                         kFrontendButtonActions, g_frontend_history[control]);
+}
+
+void CommitFrontendHistory(uint8_t* base, uint32_t control) {
+  CommitKeyboardHistory(base, control, kFrontendButtonActions,
+                        g_frontend_history[control]);
+}
+
+void PreparePhoneHistory(uint8_t* base, uint32_t control,
+                          uint64_t epoch, bool replayed) {
+  PrepareKeyboardHistory(base, control, epoch, replayed,
+                         kPhoneButtonActions, g_phone_history[control]);
+}
+
+void CommitPhoneHistory(uint8_t* base, uint32_t control) {
+  CommitKeyboardHistory(base, control, kPhoneButtonActions,
+                        g_phone_history[control]);
+}
+
+void InjectFrontendScroll(const PPCContext& parent, uint8_t* base,
+                           uint32_t control, const InputEpoch& epoch,
+                           bool replayed) {
+  if (!epoch.valid || !control ||
+      LoadU32(base, control + kControlUserIndexOffset) != epoch.state.user_index) {
+    return;
+  }
+  const uint32_t address = ActionAddress(control, Action::kFrontendScrollY);
+  auto& history = g_frontend_scroll_history[control];
+  const KeyboardActionBytes observed{
+      LoadU8(base, address + kActionCurrentOffset),
+      LoadU8(base, address + kActionPreviousOffset)};
+  if (history.initialized && !replayed && history.epoch != epoch.sequence &&
+      observed == history.written) {
+    // Match the generated replay's call exactly, including GTA's signed
+    // deadzone/response curve. Do not approximate it from the encoded byte.
+    PPCContext nested = parent;
+    nested.r3.u64 = (static_cast<uint64_t>(LoadU32(base, address)) << 32) |
+                    LoadU32(base, address + 4);
+    nested.r4.u64 = static_cast<uint64_t>(LoadU32(base, address + 8)) << 32;
+    __imp__sub_822B7958(nested, base);
+    StoreU32(base, control + kFrontendScrollPreviousOffset, nested.r3.u32);
+  }
+  const KeyboardActionBytes prepared =
+      history.Prepare(epoch.sequence, replayed, observed);
+  if (prepared.current != observed.current) {
+    StoreU8(base, address + kActionCurrentOffset, prepared.current);
+  }
+  if (prepared.previous != observed.previous) {
+    StoreU8(base, address + kActionPreviousOffset, prepared.previous);
+  }
+  const int32_t requested = KeyboardFrontendScroll(
+      epoch.state.mouse_wheel, epoch.frontend_active, epoch.map_active);
+  if (requested) {
+    MergeSignedAction(base, control, Action::kFrontendScrollY, requested);
+    StoreU32(base, control + kLastInputTimeOffset,
+             LoadU32(base, kGameInputTimeAddress));
+  }
+  history.Commit({LoadU8(base, address + kActionCurrentOffset),
+                   LoadU8(base, address + kActionPreviousOffset)});
 }
 
 bool InjectFrontendFallbackActions(uint8_t* base, uint32_t control,
@@ -1138,6 +1324,8 @@ bool InjectFrontendFallbackActions(uint8_t* base, uint32_t control,
       LoadU32(base, control + kControlUserIndexOffset) != epoch.state.user_index) {
     return false;
   }
+
+  PrepareFrontendHistory(base, control, epoch.sequence, false);
 
   bool requested = false;
   for (const ButtonBinding& binding : kButtonBindings) {
@@ -1155,6 +1343,7 @@ bool InjectFrontendFallbackActions(uint8_t* base, uint32_t control,
     StoreU32(base, control + kLastInputTimeOffset,
              LoadU32(base, kGameInputTimeAddress));
   }
+  CommitFrontendHistory(base, control);
   return requested;
 }
 
@@ -1164,6 +1353,8 @@ bool InjectPhoneActions(uint8_t* base, uint32_t control,
       LoadU32(base, control + kControlUserIndexOffset) != epoch.state.user_index) {
     return false;
   }
+
+  PreparePhoneHistory(base, control, epoch.sequence, false);
 
   bool requested = false;
   for (const ButtonBinding& binding : kButtonBindings) {
@@ -1181,12 +1372,13 @@ bool InjectPhoneActions(uint8_t* base, uint32_t control,
     StoreU32(base, control + kLastInputTimeOffset,
              LoadU32(base, kGameInputTimeAddress));
   }
+  CommitPhoneHistory(base, control);
   return requested;
 }
 
-int32_t DigitalAxis(const NativeInputState& state, VirtualKey negative, VirtualKey positive) {
-  const bool negative_down = IsDown(state, negative);
-  const bool positive_down = IsDown(state, positive);
+int32_t NativeDigitalAxis(const InputEpoch& epoch, VirtualKey negative, VirtualKey positive) {
+  const bool negative_down = IsNativeActionDown(epoch, negative);
+  const bool positive_down = IsNativeActionDown(epoch, positive);
   if (negative_down == positive_down) {
     return 0;
   }
@@ -1201,7 +1393,7 @@ void ResetMouseConversion() {
 }
 
 InputEpoch CaptureEpoch(const PPCContext& entry_context, uint8_t* base,
-                        uint32_t caller) {
+                        uint32_t caller, bool helicopter_controls) {
   NativeInputState state{};
   const bool valid = rex::input::mnk::ConsumeNativeInputState(&state);
   const uint32_t input_user = valid ? state.user_index : 0;
@@ -1218,7 +1410,10 @@ InputEpoch CaptureEpoch(const PPCContext& entry_context, uint8_t* base,
   const uint32_t screen = LoadU32(base, kCurrentScreenAddress);
 
   std::lock_guard lock(g_epoch_mutex);
+  const bool controller_context_changed =
+      g_epoch.helicopter_controls != helicopter_controls;
   ++g_epoch.sequence;
+  g_epoch.helicopter_controls = helicopter_controls;
   g_epoch.valid = valid;
   g_epoch.gamepad_valid = gamepad_valid;
   g_epoch.gamepad_buttons = gamepad_buttons;
@@ -1227,6 +1422,11 @@ InputEpoch CaptureEpoch(const PPCContext& entry_context, uint8_t* base,
   g_epoch.poll_caller = caller;
   g_epoch.phone_render_index = phone.render_index;
   g_epoch.phone_render_object = phone.render_object;
+  g_epoch.phone_created = phone.created;
+  g_epoch.phone_moving_offscreen = phone.moving_offscreen;
+  g_epoch.phone_render_visible = phone.render_visible;
+  g_epoch.pause_menu_transition = LoadU32(base, kPauseMenuTransitionAddress);
+  g_epoch.pause_menu_visible = LoadU8(base, kPauseMenuVisibleAddress) != 0;
   g_epoch.frontend_active = frontend_active;
   g_epoch.phone_visible = phone.visible;
   g_epoch.map_active = frontend_active && screen == kMapScreen;
@@ -1236,7 +1436,8 @@ InputEpoch CaptureEpoch(const PPCContext& entry_context, uint8_t* base,
   g_epoch.map_mouse_y = 0;
   g_epoch.pressed_keys = {};
   g_epoch.changed_keys = {};
-  g_epoch.trace_sample = !g_trace_state_initialized || valid != g_trace_last_valid ||
+  g_epoch.trace_sample = controller_context_changed ||
+                         !g_trace_state_initialized || valid != g_trace_last_valid ||
                          frontend_active != g_trace_last_frontend_active ||
                          phone.visible != g_trace_last_phone_visible ||
                          g_epoch.map_active != g_trace_last_map_active ||
@@ -1245,6 +1446,7 @@ InputEpoch CaptureEpoch(const PPCContext& entry_context, uint8_t* base,
   if (!valid) {
     g_epoch.state = {};
     g_last_functional_keys = {};
+    g_escape_state = {};
     g_direct_weapon_request = {};
     g_radio_off_request = {};
     g_trace_state_initialized = true;
@@ -1261,10 +1463,15 @@ InputEpoch CaptureEpoch(const PPCContext& entry_context, uint8_t* base,
   g_epoch.state = state;
   for (size_t index = 0; index < state.keys.size(); ++index) {
     g_epoch.pressed_keys[index] =
-        state.keys[index] != 0 && g_last_functional_keys[index] == 0;
+        state.pressed_keys[index] != 0 ||
+        (state.keys[index] != 0 && g_last_functional_keys[index] == 0);
     g_epoch.changed_keys[index] =
+        state.pressed_keys[index] != 0 ||
         state.keys[index] != g_last_functional_keys[index];
   }
+  g_epoch.escape_route = g_escape_state.Update(
+      IsDown(state, VirtualKey::kEscape),
+      IsPressed(g_epoch, VirtualKey::kEscape), frontend_active, phone.visible);
   g_last_functional_keys = state.keys;
   g_epoch.trace_sample |= state.keys != g_trace_last_keys || state.mouse_has_motion ||
                           state.mouse_wheel != 0 ||
@@ -1352,6 +1559,9 @@ void InjectEpoch(uint8_t* base, uint32_t control, uint32_t active_gameplay_contr
 
   bool gameplay_activity = false;
   bool context_activity = false;
+  const VehicleInputContext vehicle_context = ReadVehicleInputContext(base);
+  const bool helicopter_driver =
+      vehicle_context.vehicle && vehicle_context.is_driver && vehicle_context.is_heli;
   for (const ButtonBinding& binding : kButtonBindings) {
     const KeyboardActionRoute route =
         ClassifyKeyboardActionRoute(static_cast<uint32_t>(binding.action));
@@ -1364,18 +1574,10 @@ void InjectEpoch(uint8_t* base, uint32_t control, uint32_t active_gameplay_contr
         continue;
       }
       if (owns_gameplay && ShouldInjectInterfaceBinding(binding, epoch) &&
-          IsDown(epoch.state, binding.key)) {
+          IsNativeActionDown(epoch, binding.key)) {
         MergeButton(base, control, binding.action, kPressed);
         context_activity = true;
       }
-      continue;
-    }
-    // Cursor keys belong exclusively to the visible phone/frontend interface
-    // while it is active. In particular, Down is also GTA's on-foot Attack2 /
-    // detonate binding; allowing that record through alongside FrontendDown
-    // makes phone navigation trigger gameplay behind the phone.
-    if ((epoch.phone_visible || epoch.frontend_active) &&
-        IsArrowDirectionKey(binding.key)) {
       continue;
     }
     if (map_context &&
@@ -1383,10 +1585,21 @@ void InjectEpoch(uint8_t* base, uint32_t control, uint32_t active_gameplay_contr
          binding.key == VirtualKey::kRButton)) {
       continue;
     }
-    if (IsDown(epoch.state, binding.key) &&
+    if (helicopter_driver &&
+        (binding.action == Action::kVehicleAttack ||
+         binding.action == Action::kVehicleAttack2)) {
+      continue;
+    }
+    if (IsNativeActionDown(epoch, binding.key) &&
         (owns_gameplay || IsGlobalKeyboardAction(binding.action))) {
       gameplay_activity |= MergeButton(base, control, binding.action, kPressed);
     }
+  }
+  // Touch ENTER/EXIT is a virtual action source, independent of physical F/Y.
+  if (owns_gameplay && !map_context &&
+      GTA4_TouchVirtualKeyDown(static_cast<uint16_t>(VirtualKey::kF))) {
+    gameplay_activity |= MergeButton(base, control, Action::kEnter, kPressed);
+    gameplay_activity |= MergeButton(base, control, Action::kVehicleExit, kPressed);
   }
   if (!owns_gameplay) {
     if (gameplay_activity || context_activity) {
@@ -1410,29 +1623,22 @@ void InjectEpoch(uint8_t* base, uint32_t control, uint32_t active_gameplay_contr
     return;
   }
 
-  const VehicleInputContext vehicle_context = ReadVehicleInputContext(base);
   if (vehicle_context.vehicle) {
     // These are PC-only aliases whose Xbox action records are also consumed
     // outside their named context. Gate them on GTA's authoritative current
     // vehicle state instead of broadcasting them into on-foot gameplay.
-    if (IsDown(epoch.state, VirtualKey::kQ)) {
-      gameplay_activity |= MergeButton(base, control, Action::kNextWeapon, kPressed);
-    }
-    if (IsDown(epoch.state, VirtualKey::kZ)) {
-      gameplay_activity |= MergeButton(base, control, Action::kPrevWeapon, kPressed);
-    }
+    // Q/Z use the vehicle-only action-42 predicate in sub_823CF9C0.
+    // ArmContextRequests routes them at that consumer so they cannot also
+    // toggle headlights or drop a GTA Race weapon through the shared record.
     if (vehicle_context.is_driver && vehicle_context.is_heli) {
-      // The helicopter consumes the normal vehicle-primary record for its
-      // primary weapon. Numpad 0 is a PC-only alias, merged after the retail
-      // controller state so either device remains usable.
-      if (IsDown(epoch.state, VirtualKey::kNumpad0)) {
+      // Physical LMB/Shift now publish A/X through the controller. Preserve
+      // only the separate touch fire source and existing Numpad0 alias here.
+      if (GTA4_TouchVirtualKeyDown(static_cast<uint16_t>(VirtualKey::kLButton)) ||
+          IsDown(epoch.state, VirtualKey::kNumpad0)) {
         gameplay_activity |=
-            MergeButton(base, control, Action::kVehicleAttack, kPressed);
+            MergeButton(base, control, Action::kVehicleAttack2, kPressed);
       }
-      // Action 45 is INPUT_VEH_HANDBRAKE_ALT in the retail action table and
-      // is the context-sensitive helicopter secondary-fire record. Keeping
-      // this heli-only prevents Shift from duplicating normal handbrake.
-      if (IsDown(epoch.state, VirtualKey::kShift)) {
+      if (GTA4_TouchVirtualKeyDown(static_cast<uint16_t>(VirtualKey::kShift))) {
         gameplay_activity |= MergeButton(
             base, control, Action::kVehicleContextAction45, kPressed);
       }
@@ -1449,8 +1655,8 @@ void InjectEpoch(uint8_t* base, uint32_t control, uint32_t active_gameplay_contr
     }
   }
 
-  const int32_t horizontal = DigitalAxis(epoch.state, VirtualKey::kA, VirtualKey::kD);
-  const int32_t vertical = DigitalAxis(epoch.state, VirtualKey::kW, VirtualKey::kS);
+  const int32_t horizontal = NativeDigitalAxis(epoch, VirtualKey::kA, VirtualKey::kD);
+  const int32_t vertical = NativeDigitalAxis(epoch, VirtualKey::kW, VirtualKey::kS);
   gameplay_activity |= MergeAxis(base, control, Action::kMoveLeft, Action::kMoveRight, horizontal);
   gameplay_activity |= MergeAxis(base, control, Action::kMoveUp, Action::kMoveDown, vertical);
   gameplay_activity |=
@@ -1466,34 +1672,46 @@ void InjectEpoch(uint8_t* base, uint32_t control, uint32_t active_gameplay_contr
   int32_t vehicle_pitch = 0;
   if (vehicle_context.vehicle && vehicle_context.is_driver) {
     vehicle_pitch = vehicle_context.is_heli
-                        ? DigitalAxis(epoch.state, VirtualKey::kNumpad8,
-                                      VirtualKey::kNumpad2)
-                        : DigitalAxis(epoch.state, VirtualKey::kShift,
-                                      VirtualKey::kControl);
+                        ? NativeDigitalAxis(epoch, VirtualKey::kNumpad8,
+                                            VirtualKey::kNumpad2)
+                        : NativeDigitalAxis(epoch, VirtualKey::kShift,
+                                            VirtualKey::kControl);
   }
   gameplay_activity |=
       MergeAxis(base, control, Action::kVehicleMoveUp, Action::kVehicleMoveDown, vehicle_pitch);
 
+  // sub_825ED3C8 reads signed action 24 (26 for alternate pad controls).
+  // Negative input reduces the scope FOV; positive input increases it. The
+  // paired records are centered axes, so treating zoom-out as button 25
+  // leaves the actual consumer neutral and reverses zoom-in's direction.
   const char* wheel_route = "none";
-  if (epoch.state.mouse_wheel > 0) {
+  if (!epoch.frontend_active && epoch.state.mouse_wheel > 0) {
     if (!vehicle_context.vehicle) {
       wheel_route = "on-foot";
       gameplay_activity |=
           MergeButton(base, control, Action::kNextWeapon, kPressed);
       gameplay_activity |=
-          MergeButton(base, control, Action::kSniperZoomIn, kPressed);
+          MergeAxis(base, control, Action::kSniperZoomIn, Action::kSniperZoomOut,
+                    -kPressed);
+      gameplay_activity |=
+          MergeAxis(base, control, Action::kSniperZoomInAlternate,
+                    Action::kSniperZoomOutAlternate, -kPressed);
     } else if (vehicle_context.is_driver) {
       wheel_route = "driver-radio";
       gameplay_activity |=
           MergeButton(base, control, Action::kVehicleNextRadio, kPressed);
     }
-  } else if (epoch.state.mouse_wheel < 0) {
+  } else if (!epoch.frontend_active && epoch.state.mouse_wheel < 0) {
     if (!vehicle_context.vehicle) {
       wheel_route = "on-foot";
       gameplay_activity |=
           MergeButton(base, control, Action::kPrevWeapon, kPressed);
       gameplay_activity |=
-          MergeButton(base, control, Action::kSniperZoomOut, kPressed);
+          MergeAxis(base, control, Action::kSniperZoomIn, Action::kSniperZoomOut,
+                    kPressed);
+      gameplay_activity |=
+          MergeAxis(base, control, Action::kSniperZoomInAlternate,
+                    Action::kSniperZoomOutAlternate, kPressed);
     } else if (vehicle_context.is_driver) {
       wheel_route = "driver-radio";
       gameplay_activity |=
@@ -1501,15 +1719,36 @@ void InjectEpoch(uint8_t* base, uint32_t control, uint32_t active_gameplay_contr
     }
   }
 
+  const VehicleMouseActions mouse = RouteVehicleMouse(
+      helicopter_driver, IsDown(epoch.state, VirtualKey::kRButton),
+      epoch.mouse_x, epoch.mouse_y);
+  // sub_822ABEE0 consumes 32/33 through sub_822B8178 for pitch, and
+  // directly decodes 57/58 for yaw. Use the same actions as the numpad so
+  // the retail aircraft simulation and controller magnitudes remain intact.
+  gameplay_activity |= MergeAxis(base, control, Action::kVehicleMoveUp,
+                                Action::kVehicleMoveDown, mouse.helicopter_pitch);
+  if (mouse.helicopter_yaw) {
+    const uint32_t left = ActionAddress(control, Action::kVehicleFlyYawLeft);
+    const uint32_t right = ActionAddress(control, Action::kVehicleFlyYawRight);
+    const VehicleYawButtons yaw = MergeVehicleYawButtons(
+        ReadActionRaw(base, control, Action::kVehicleFlyYawLeft),
+        ReadActionRaw(base, control, Action::kVehicleFlyYawRight),
+        mouse.helicopter_yaw);
+    StoreU8(base, left + kActionCurrentOffset,
+            rex::input::mnk::EncodeActionMagnitude(LoadU8(base, left), yaw.left));
+    StoreU8(base, right + kActionCurrentOffset,
+            rex::input::mnk::EncodeActionMagnitude(LoadU8(base, right), yaw.right));
+    gameplay_activity = true;
+  }
   gameplay_activity |=
-      MergeAxis(base, control, Action::kLookLeft, Action::kLookRight, epoch.mouse_x);
-  gameplay_activity |= MergeAxis(base, control, Action::kLookUp, Action::kLookDown, epoch.mouse_y);
+      MergeAxis(base, control, Action::kLookLeft, Action::kLookRight, mouse.camera_x);
+  gameplay_activity |= MergeAxis(base, control, Action::kLookUp, Action::kLookDown, mouse.camera_y);
   gameplay_activity |=
-      MergeAxis(base, control, Action::kVehicleGunLeft, Action::kVehicleGunRight, epoch.mouse_x);
+      MergeAxis(base, control, Action::kVehicleGunLeft, Action::kVehicleGunRight, mouse.camera_x);
   gameplay_activity |=
-      MergeAxis(base, control, Action::kVehicleGunUp, Action::kVehicleGunDown, epoch.mouse_y);
+      MergeAxis(base, control, Action::kVehicleGunUp, Action::kVehicleGunDown, mouse.camera_y);
   gameplay_activity |=
-      MergeAxis(base, control, Action::kVehicleLookLeft, Action::kVehicleLookRight, epoch.mouse_x);
+      MergeAxis(base, control, Action::kVehicleLookLeft, Action::kVehicleLookRight, mouse.camera_x);
 
   if (gameplay_activity || context_activity) {
     StoreU32(base, control + kLastInputTimeOffset, LoadU32(base, kGameInputTimeAddress));
@@ -1572,7 +1811,9 @@ void InjectEpoch(uint8_t* base, uint32_t control, uint32_t active_gameplay_contr
         IsDown(epoch.state, VirtualKey::kNumpad0),
         IsDown(epoch.state, VirtualKey::kNumpad8),
         IsDown(epoch.state, VirtualKey::kNumpad2), epoch.state.mouse_wheel,
-        wheel_route, ReadActionRaw(base, control, Action::kVehicleAttack),
+        wheel_route, ReadActionRaw(base, control, helicopter_driver
+                                                   ? Action::kVehicleAttack2
+                                                   : Action::kVehicleAttack),
         ReadActionRaw(base, control, Action::kVehicleContextAction45),
         ReadActionRaw(base, control, Action::kVehicleMoveUp),
         ReadActionRaw(base, control, Action::kVehicleMoveDown),
@@ -1652,7 +1893,8 @@ void ApplyMapEpoch(const PPCContext& entry_context, uint8_t* base) {
   }
 }
 
-bool ConsumeDirectWeaponSelection(PPCContext& ctx) {
+bool ConsumeDirectWeaponSelection(PPCContext& ctx,
+                                   DirectWeaponRequest& request) {
   std::lock_guard lock(g_epoch_mutex);
   if (!g_direct_weapon_request.armed ||
       !g_direct_weapon_request.predicate_forced ||
@@ -1662,10 +1904,25 @@ bool ConsumeDirectWeaponSelection(PPCContext& ctx) {
     return false;
   }
 
-  ctx.r4.u32 = 0;
-  ctx.r5.u32 = g_direct_weapon_request.slot;
+  request = g_direct_weapon_request;
   g_direct_weapon_request.armed = false;
   return true;
+}
+
+uint32_t AvailableDirectWeaponSlot(const PPCContext& parent, uint8_t* base,
+                                  uint32_t manager, uint32_t requested_slot,
+                                  uint32_t original_slot) {
+  if (!requested_slot) {
+    return requested_slot;
+  }
+  // The generated forward search tests ownership, ammo and weapon fire type
+  // without changing the weapon manager. An unavailable number-row slot must
+  // leave the current weapon selected rather than selecting unarmed.
+  PPCContext nested = parent;
+  nested.r3.u32 = manager;
+  nested.r4.u32 = requested_slot - 1;
+  __imp__sub_823D52D0(nested, base);
+  return nested.r3.u32 == requested_slot ? requested_slot : original_slot;
 }
 
 void MaybeForceRadioOffPredicate(PPCContext& ctx, uint8_t* base,
@@ -1708,15 +1965,20 @@ void MaybeForceRadioOffPredicate(PPCContext& ctx, uint8_t* base,
 void MaybeForceDirectWeaponAction(PPCContext& ctx, uint8_t* base,
                                   uint32_t action_record, uint32_t caller) {
   std::lock_guard lock(g_epoch_mutex);
-  constexpr uint32_t kActionOffset =
+  const bool vehicle_caller =
+      caller == kVehicleWeaponPressPredicateCaller ||
+      caller == kVehicleWeaponReleasePredicateCaller;
+  const uint32_t action_offset =
       kActionArrayOffset +
-      static_cast<uint32_t>(Action::kNextWeapon) * kActionStride;
+      static_cast<uint32_t>(vehicle_caller ? Action::kVehicleHeadlight
+                                          : Action::kNextWeapon) * kActionStride;
   const uint32_t control =
-      action_record >= kActionOffset ? action_record - kActionOffset : 0;
+      action_record >= action_offset ? action_record - action_offset : 0;
   if (!g_direct_weapon_request.armed ||
       g_direct_weapon_request.predicate_forced ||
       g_direct_weapon_request.epoch != g_epoch.sequence ||
-      caller != kDirectWeaponPredicateCaller ||
+      (!vehicle_caller && caller != kDirectWeaponPredicateCaller) ||
+      vehicle_caller != g_direct_weapon_request.in_vehicle ||
       ctx.r29.u32 != g_direct_weapon_request.ped ||
       !control || LoadU32(base, control + kControlUserIndexOffset) !=
                       g_direct_weapon_request.user) {
@@ -1738,11 +2000,57 @@ void MaybeForceDirectWeaponAction(PPCContext& ctx, uint8_t* base,
 
 extern "C" void sub_828CCD60(PPCContext& ctx, uint8_t* base) {
   const uint32_t caller = ctx.lr;
+  // Select bindings before retail polls XInput, and use that same selection
+  // for this epoch's native overlay. No first-frame delay or duplicate keys.
+  const bool helicopter_controls =
+      gta4::input::ConfigureKeyboardControllerForPoll(ctx, base);
   __imp__sub_828CCD60(ctx, base);
   const gta4::input::InputEpoch epoch =
-      gta4::input::CaptureEpoch(ctx, base, caller);
+      gta4::input::CaptureEpoch(ctx, base, caller, helicopter_controls);
   gta4::input::ProcessPauseTabShoulders(ctx, base, epoch);
   GTA4_TouchConsumePoll(ctx, base, epoch.sequence);
+  if (rex::input::IsInputTraceEnabled() && epoch.valid) {
+    uint32_t retail_controller_flags = 0;
+    if (epoch.state.user_index < gta4::input::kRetailControllerRecordCount) {
+      const uint32_t retail_controller =
+          gta4::input::kRetailControllerRecordsAddress +
+          epoch.state.user_index * gta4::input::kRetailControllerRecordStride;
+      retail_controller_flags = gta4::input::LoadU32(
+          base, retail_controller + gta4::input::kRetailControllerFlagsOffset);
+    }
+    for (rex::ui::VirtualKey key : gta4::input::kControlTraceKeys) {
+      if (!gta4::input::IsChanged(epoch, key)) {
+        continue;
+      }
+      const auto index = static_cast<uint16_t>(key);
+      REXLOG_INFO(
+          "input-e2e: seq={} stage=gta-key-epoch epoch={} caller={:08X} "
+          "key={} vk={} down={} pressed={} user={} frontend-active={} "
+          "phone-visible={} map-active={} gamepad-valid={} packet={} "
+          "buttons={:04X} controller=a:{} x:{} start:{} dpad:{}/{}/{}/{} "
+          "retail-flags={:08X} mapped=a:{} start:{} dpad:{}/{}/{}/{}",
+          gta4::input::KeyEventSequence(epoch, key), epoch.sequence, caller,
+          rex::input::InputTraceVirtualKeyName(index), index,
+          gta4::input::IsDown(epoch.state, key),
+          gta4::input::IsPressed(epoch, key), epoch.state.user_index,
+          epoch.frontend_active, epoch.phone_visible, epoch.map_active,
+          epoch.gamepad_valid, epoch.gamepad_packet, epoch.gamepad_buttons,
+          (epoch.gamepad_buttons & rex::input::X_INPUT_GAMEPAD_A) != 0,
+          (epoch.gamepad_buttons & rex::input::X_INPUT_GAMEPAD_X) != 0,
+          (epoch.gamepad_buttons & rex::input::X_INPUT_GAMEPAD_START) != 0,
+          (epoch.gamepad_buttons & rex::input::X_INPUT_GAMEPAD_DPAD_UP) != 0,
+          (epoch.gamepad_buttons & rex::input::X_INPUT_GAMEPAD_DPAD_DOWN) != 0,
+          (epoch.gamepad_buttons & rex::input::X_INPUT_GAMEPAD_DPAD_LEFT) != 0,
+          (epoch.gamepad_buttons & rex::input::X_INPUT_GAMEPAD_DPAD_RIGHT) != 0,
+          retail_controller_flags,
+          (retail_controller_flags & gta4::input::kRetailControllerAFlag) != 0,
+          (retail_controller_flags & gta4::input::kRetailControllerStartFlag) != 0,
+          (retail_controller_flags & gta4::input::kRetailControllerDpadUpFlag) != 0,
+          (retail_controller_flags & gta4::input::kRetailControllerDpadDownFlag) != 0,
+          (retail_controller_flags & gta4::input::kRetailControllerDpadLeftFlag) != 0,
+          (retail_controller_flags & gta4::input::kRetailControllerDpadRightFlag) != 0);
+    }
+  }
   if (rex::input::IsInputTraceEnabled() && epoch.trace_sample) {
     const uint64_t host_sequence = epoch.state.last_key_event_sequence != 0
                                        ? epoch.state.last_key_event_sequence
@@ -1750,14 +2058,19 @@ extern "C" void sub_828CCD60(PPCContext& ctx, uint8_t* base) {
     REXLOG_INFO(
         "input-e2e: seq={} stage=gta-poll epoch={} caller={:08X} valid={} user={} "
         "frontend-active={} phone-visible={} phone-index={} phone-object={:08X} "
-        "map-active={} screen={} key-generation={} "
+        "phone-created={} phone-moving-offscreen={} phone-render-visible={} "
+        "pause-menu-visible={} pause-menu-transition={} "
+        "map-active={} helicopter-controls={} screen={} key-generation={} "
         "wasd={}/{}/{}/{} interface-keys={}/{}/{}/{}:{}/{}/{}/{} "
         "interface-changed={}/{}/{}/{}:{}/{}/{}/{} "
         "key-sequences=escape:{}:up:{}:down:{} "
         "mouse={}/{} wheel={} gamepad-valid={} packet={} buttons={:04X}",
         host_sequence, epoch.sequence, caller, epoch.valid, epoch.state.user_index,
         epoch.frontend_active, epoch.phone_visible, epoch.phone_render_index,
-        epoch.phone_render_object, epoch.map_active,
+        epoch.phone_render_object, epoch.phone_created,
+        epoch.phone_moving_offscreen, epoch.phone_render_visible,
+        epoch.pause_menu_visible, epoch.pause_menu_transition, epoch.map_active,
+        epoch.helicopter_controls,
         gta4::input::LoadU32(base, gta4::input::kCurrentScreenAddress),
         epoch.state.key_state_generation,
         gta4::input::IsDown(epoch.state, rex::ui::VirtualKey::kW),
@@ -1831,6 +2144,8 @@ extern "C" void sub_822B7DD0(PPCContext& ctx, uint8_t* base) {
         epoch.state.user_index, native_user_control);
   }
   if (native_user_control) {
+    gta4::input::PrepareFrontendHistory(base, control, epoch.sequence, true);
+    gta4::input::PreparePhoneHistory(base, control, epoch.sequence, true);
     gta4::input::TraceActionState(
         "gta-actions-controller", epoch,
         gta4::input::CaptureActionTrace(base, control),
@@ -1838,6 +2153,9 @@ extern "C" void sub_822B7DD0(PPCContext& ctx, uint8_t* base) {
   }
   gta4::input::InjectEpoch(base, control, active_gameplay_control, epoch, caller);
   if (native_user_control) {
+    gta4::input::InjectFrontendScroll(ctx, base, control, epoch, true);
+    gta4::input::CommitFrontendHistory(base, control);
+    gta4::input::CommitPhoneHistory(base, control);
     gta4::input::TraceActionState(
         "gta-actions-keyboard", epoch,
         gta4::input::CaptureActionTrace(base, control),
@@ -1883,6 +2201,7 @@ extern "C" void sub_8224FFC8(PPCContext& ctx, uint8_t* base) {
         gta4::input::g_interface_before_trace);
     injected_frontend = gta4::input::InjectFrontendFallbackActions(
         base, interface_control, epoch);
+    gta4::input::InjectFrontendScroll(ctx, base, interface_control, epoch, false);
     frontend_before =
         gta4::input::CaptureActionTrace(base, interface_control);
     gta4::input::TraceActionState(
@@ -2061,16 +2380,64 @@ extern "C" void sub_82252488(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_823D5800(PPCContext& ctx, uint8_t* base) {
   const uint32_t ped_weapon_manager = ctx.r3.u32;
-  const bool direct = gta4::input::ConsumeDirectWeaponSelection(ctx);
+  gta4::input::DirectWeaponRequest request;
+  const bool direct = gta4::input::ConsumeDirectWeaponSelection(ctx, request);
+  const auto previous_candidates = gta4::input::g_vehicle_weapon_candidates;
+  if (direct) {
+    const uint32_t original_slot =
+        gta4::input::LoadU32(base, ped_weapon_manager);
+    if (request.in_vehicle) {
+      gta4::input::g_vehicle_weapon_candidates = {
+          .manager = ped_weapon_manager,
+          .original_slot = original_slot,
+          .requested_slot = request.slot,
+          .request = request.request,
+      };
+    } else {
+      ctx.r4.u32 = 0;
+      ctx.r5.u32 = gta4::input::AvailableDirectWeaponSlot(
+          ctx, base, ped_weapon_manager, request.slot, original_slot);
+    }
+  }
   const uint32_t operation = ctx.r4.u32;
   const uint32_t slot = ctx.r5.u32;
   __imp__sub_823D5800(ctx, base);
+  gta4::input::g_vehicle_weapon_candidates = previous_candidates;
   if (direct && REXCVAR_GET(gta4_native_input_trace)) {
     REXLOG_INFO(
         "gta4-input: direct-weapon-select manager={:08X} operation={} "
         "slot={} result={}",
         ped_weapon_manager, operation, slot, ctx.r3.u32);
   }
+}
+
+extern "C" void sub_823D5358(PPCContext& ctx, uint8_t* base) {
+  auto& policy = gta4::input::g_vehicle_weapon_candidates;
+  switch (policy.Route(ctx.r3.u32, ctx.lr)) {
+    case gta4::input::VehicleWeaponCandidateRoute::kAscending:
+      // Reverse the vehicle's descending search; its generated caller still
+      // checks the returned candidate against the current vehicle's rules.
+      __imp__sub_823D52D0(ctx, base);
+      return;
+    case gta4::input::VehicleWeaponCandidateRoute::kRequestedSlot:
+      ctx.r3.u64 = gta4::input::AvailableDirectWeaponSlot(
+          ctx, base, policy.manager, policy.requested_slot,
+          policy.original_slot);
+      return;
+    case gta4::input::VehicleWeaponCandidateRoute::kOriginalSlot:
+      ctx.r3.u64 = policy.original_slot;
+      return;
+    case gta4::input::VehicleWeaponCandidateRoute::kRetail:
+      __imp__sub_823D5358(ctx, base);
+      return;
+  }
+}
+
+extern "C" void sub_822D3230(PPCContext& ctx, uint8_t* base) {
+  const uint32_t action_record = ctx.r3.u32;
+  const uint32_t caller = ctx.lr;
+  __imp__sub_822D3230(ctx, base);
+  gta4::input::MaybeForceDirectWeaponAction(ctx, base, action_record, caller);
 }
 
 extern "C" void sub_822D4158(PPCContext& ctx, uint8_t* base) {
@@ -2174,4 +2541,128 @@ extern "C" void sub_825D20A0(PPCContext& ctx, uint8_t* base) {
   if (forced && REXCVAR_GET(gta4_native_input_trace)) {
     REXLOG_INFO("gta4-input: parachute keyboard stick forced");
   }
+}
+
+namespace gta4::input {
+namespace {
+
+enum class ScriptInputQueryTraceKind : uint8_t {
+  kRawHeld,
+  kRawPressed,
+  kControlHeld,
+  kControlPressed,
+};
+
+void TraceUpScriptInputQuery(uint8_t* base, ScriptInputQueryTraceKind kind,
+                             uint32_t group, uint32_t index, uint32_t caller,
+                             uint32_t result) {
+  if (!rex::input::IsInputTraceEnabled()) {
+    return;
+  }
+  const InputEpoch epoch = ReadEpoch();
+  if (!epoch.valid ||
+      (!IsDown(epoch.state, VirtualKey::kUp) &&
+       !IsChanged(epoch, VirtualKey::kUp))) {
+    return;
+  }
+  struct QueryKey {
+    ScriptInputQueryTraceKind kind;
+    uint32_t group;
+    uint32_t index;
+  };
+  static thread_local uint64_t traced_epoch = 0;
+  static thread_local std::array<QueryKey, 64> traced_queries{};
+  static thread_local size_t traced_count = 0;
+  if (traced_epoch != epoch.sequence) {
+    traced_epoch = epoch.sequence;
+    traced_count = 0;
+  }
+  for (size_t entry = 0; entry < traced_count; ++entry) {
+    const QueryKey& key = traced_queries[entry];
+    if (key.kind == kind && key.group == group && key.index == index) {
+      return;
+    }
+  }
+  if (traced_count == traced_queries.size()) {
+    return;
+  }
+  traced_queries[traced_count++] = {kind, group, index};
+
+  // sub_825D1308/sub_825D1468 select these raw pad objects; button 8
+  // reads Up at +60/+140. sub_828CC9D0 maps XInput D-pad Up to internal
+  // device bit 0x1000 before sub_82208F50 builds these raw button records.
+  // sub_822094F8 maintains their current/history
+  // arrays independently of the semantic actions used by control queries.
+  const uint32_t selected_pad = LoadU32(base, 0x82A9172C);
+  const uint32_t raw_pad = group >= 4 ? 0x82B2A208
+                           : selected_pad < 4 ? 0x82B29F18 + selected_pad * 188
+                                              : 0;
+  const char* query = "control-pressed";
+  switch (kind) {
+    case ScriptInputQueryTraceKind::kRawHeld:
+      query = "raw-held";
+      break;
+    case ScriptInputQueryTraceKind::kRawPressed:
+      query = "raw-pressed";
+      break;
+    case ScriptInputQueryTraceKind::kControlHeld:
+      query = "control-held";
+      break;
+    case ScriptInputQueryTraceKind::kControlPressed:
+      break;
+  }
+  REXLOG_INFO(
+      "input-e2e: seq={} stage=gta-script-input epoch={} query={} group={} "
+      "index={} caller={:08X} result={} up={} up-pressed={} up-changed={} "
+      "frontend-active={} phone-visible={} phone-created={} selected-pad={} "
+      "raw-pad={:08X} raw-up-current={} raw-up-previous={}",
+      FocusedTraceSequence(epoch), epoch.sequence, query, group, index, caller,
+      result, IsDown(epoch.state, VirtualKey::kUp),
+      IsPressed(epoch, VirtualKey::kUp), IsChanged(epoch, VirtualKey::kUp),
+      epoch.frontend_active, epoch.phone_visible, epoch.phone_created,
+      selected_pad, raw_pad, raw_pad ? LoadU32(base, raw_pad + 60) : 0,
+      raw_pad ? LoadU32(base, raw_pad + 140) : 0);
+}
+
+}  // namespace
+}  // namespace gta4::input
+
+extern "C" void sub_825D1308(PPCContext& ctx, uint8_t* base) {
+  const uint32_t group = ctx.r3.u32;
+  const uint32_t button = ctx.r4.u32;
+  const uint32_t caller = ctx.lr;
+  __imp__sub_825D1308(ctx, base);
+  gta4::input::TraceUpScriptInputQuery(
+      base, gta4::input::ScriptInputQueryTraceKind::kRawHeld, group, button,
+      caller, ctx.r3.u32);
+}
+
+extern "C" void sub_825D1468(PPCContext& ctx, uint8_t* base) {
+  const uint32_t group = ctx.r3.u32;
+  const uint32_t button = ctx.r4.u32;
+  const uint32_t caller = ctx.lr;
+  __imp__sub_825D1468(ctx, base);
+  gta4::input::TraceUpScriptInputQuery(
+      base, gta4::input::ScriptInputQueryTraceKind::kRawPressed, group, button,
+      caller, ctx.r3.u32);
+}
+
+extern "C" void sub_825D1908(PPCContext& ctx, uint8_t* base) {
+  const uint32_t group = ctx.r3.u32;
+  const uint32_t action = ctx.r4.u32;
+  const uint32_t caller = ctx.lr;
+  __imp__sub_825D1908(ctx, base);
+  gta4::input::TraceUpScriptInputQuery(
+      base, gta4::input::ScriptInputQueryTraceKind::kControlHeld, group, action,
+      caller, ctx.r3.u32);
+}
+
+extern "C" void sub_825D1980(PPCContext& ctx, uint8_t* base) {
+  const uint32_t group = ctx.r3.u32;
+  const uint32_t action = ctx.r4.u32;
+  const uint32_t caller = ctx.lr;
+  __imp__sub_825D1980(ctx, base);
+  gta4::input::TraceUpScriptInputQuery(
+      base, gta4::input::ScriptInputQueryTraceKind::kControlPressed, group, action,
+      caller, ctx.r3.u32);
 }

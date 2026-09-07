@@ -53,6 +53,7 @@ struct PushConstants
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
 
 #ifdef GTA4_RECOMP
+#define GetTextureLodBias(SLOT) vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 752 + (SLOT) * 4)
 #define g_Booleans                  vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 528)
 #define g_SwappedTexcoords          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 532)
 #define g_SwappedNormals            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 536)
@@ -106,6 +107,7 @@ struct PushConstants
 };
 
 #ifdef GTA4_RECOMP
+#define GetTextureLodBias(SLOT) (*(reinterpret_cast<device float*>(g_PushConstants.SharedConstants + 752 + (SLOT) * 4)))
 #define g_Booleans (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 528)))
 #define g_SwappedTexcoords (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 532)))
 #define g_SwappedNormals (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 536)))
@@ -136,6 +138,7 @@ struct PushConstants
 #else
 
 #ifdef GTA4_RECOMP
+#define GetTextureLodBias(SLOT) g_TextureLodBias[(SLOT) / 4][(SLOT) % 4]
 #define DEFINE_SHARED_CONSTANTS() \
     uint g_Booleans : packoffset(c33.x); \
     uint g_SwappedTexcoords : packoffset(c33.y); \
@@ -148,7 +151,8 @@ struct PushConstants
     bool g_ClipPlaneEnabled : packoffset(c36.x); \
     float g_AlphaThreshold : packoffset(c36.y); \
     uint g_conditionalSurveyIndex : packoffset(c36.z); \
-    uint g_conditionalRenderingIndex : packoffset(c36.w);
+    uint g_conditionalRenderingIndex : packoffset(c36.w); \
+    float4 g_TextureLodBias[7] : packoffset(c47);
 #else
 #define DEFINE_SHARED_CONSTANTS() \
     uint g_Booleans : packoffset(c20.x); \
@@ -167,6 +171,10 @@ struct PushConstants
 
 uint g_SpecConstants();
 
+#endif
+
+#ifndef GTA4_RECOMP
+#define GetTextureLodBias(SLOT) 0.0
 #endif
 
 float4 cube(float4 value)
@@ -298,46 +306,46 @@ float4 tfetch2D(constant Texture2DDescriptorHeap* textureHeap,
                 constant SamplerDescriptorHeap* samplerHeap,
                 uint resourceDescriptorIndex,
                 uint samplerDescriptorIndex,
-                float2 texCoord, float2 offset)
+                float2 texCoord, float2 offset, float lodBias = 0.0)
 {
     texture2d<float> texture = textureHeap[resourceDescriptorIndex].tex;
     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
-    return texture.sample(sampler, texCoord + offset / (float2)getTexture2DDimensions(texture));
+    return texture.sample(sampler, texCoord + offset / (float2)getTexture2DDimensions(texture), bias(lodBias));
 }
 
 float4 tfetch2DArray(constant Texture2DArrayDescriptorHeap* textureHeap,
                      constant SamplerDescriptorHeap* samplerHeap,
                      uint resourceDescriptorIndex,
                      uint samplerDescriptorIndex,
-                     float3 texCoord, float3 offset)
+                     float3 texCoord, float3 offset, float lodBias = 0.0)
 {
     texture2d_array<float> texture = textureHeap[resourceDescriptorIndex].tex;
     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
     uint3 dimensions = getTexture2DArrayDimensions(texture);
-    return texture.sample(sampler, texCoord.xy + offset.xy / float2(dimensions.xy), uint(texCoord.z * dimensions.z));
+    return texture.sample(sampler, texCoord.xy + offset.xy / float2(dimensions.xy), uint(texCoord.z * dimensions.z), bias(lodBias));
 }
 
 float4 tfetch3D(constant Texture3DDescriptorHeap* textureHeap,
                 constant SamplerDescriptorHeap* samplerHeap,
                 uint resourceDescriptorIndex,
                 uint samplerDescriptorIndex,
-                float3 texCoord, float3 offset)
+                float3 texCoord, float3 offset, float lodBias = 0.0)
 {
     texture3d<float> texture = textureHeap[resourceDescriptorIndex].tex;
     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
-    return texture.sample(sampler, texCoord + offset / float3(getTexture3DDimensions(texture)));
+    return texture.sample(sampler, texCoord + offset / float3(getTexture3DDimensions(texture)), bias(lodBias));
 }
 
 float4 tfetchCube(constant TextureCubeDescriptorHeap* textureHeap,
                   constant SamplerDescriptorHeap* samplerHeap,
                   uint resourceDescriptorIndex,
                   uint samplerDescriptorIndex,
-                  float3 texCoord)
+                  float3 texCoord, float lodBias = 0.0)
 {
     texturecube<float> texture = textureHeap[resourceDescriptorIndex].tex;
     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
     float3 dir = cubeDir(texCoord);
-    return texture.sample(sampler, dir);
+    return texture.sample(sampler, dir, bias(lodBias));
 }
 
 float2 getWeights2D(constant Texture2DDescriptorHeap* textureHeap,
@@ -407,49 +415,51 @@ uint3 getTexture3DDimensions(Texture3D<float4> texture)
 // Pixel shaders need implicit derivatives for authored mip selection,
 // trilinear filtering and anisotropic footprints. Vertex shaders still use
 // explicit level zero because implicit derivatives are not available there.
-float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+// Vulkan applies sampler bias after either explicit or implicit base LOD;
+// the host has already clamped lodBias to the device sampler-bias limit.
+float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lodBias = 0.0)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
 #ifdef XENOS_RECOMP_PIXEL_SHADER
-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lodBias);
 #else
-    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), 0);
+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), 0.0 + lodBias);
 #endif
 }
 
-float4 tfetch2DArray(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
+float4 tfetch2DArray(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset, float lodBias = 0.0)
 {
     Texture2DArray<float4> texture = g_Texture2DArrayDescriptorHeap[resourceDescriptorIndex];
     uint3 dimensions = getTexture2DArrayDimensions(texture);
 #ifdef XENOS_RECOMP_PIXEL_SHADER
-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z));
+    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), lodBias);
 #else
-    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), 0);
+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), 0.0 + lodBias);
 #endif
 }
 
-float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
+float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset, float lodBias = 0.0)
 {
     Texture3D<float4> texture = g_Texture3DDescriptorHeap[resourceDescriptorIndex];
     uint3 dimensions = getTexture3DDimensions(texture);
 #ifdef XENOS_RECOMP_PIXEL_SHADER
-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex],
-                          texCoord + offset / dimensions);
+    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+                          texCoord + offset / dimensions, lodBias);
 #else
     return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
-                               texCoord + offset / dimensions, 0);
+                               texCoord + offset / dimensions, 0.0 + lodBias);
 #endif
 }
 
-float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lodBias = 0.0)
 {
     float3 dir = cubeDir(texCoord);
 #ifdef XENOS_RECOMP_PIXEL_SHADER
-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(
-        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir);
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleBias(
+        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, lodBias);
 #else
     return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(
-        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, 0);
+        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, 0.0 + lodBias);
 #endif
 }
 
@@ -558,7 +568,7 @@ float4 tfetch2DBicubic(constant Texture2DDescriptorHeap* textureHeap,
                        constant SamplerDescriptorHeap* samplerHeap,
                        uint resourceDescriptorIndex,
                        uint samplerDescriptorIndex,
-                       float2 texCoord, float2 offset)
+                       float2 texCoord, float2 offset, float lodBias = 0.0)
 {
     texture2d<float> texture = textureHeap[resourceDescriptorIndex].tex;
     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
@@ -582,17 +592,17 @@ float4 tfetch2DBicubic(constant Texture2DDescriptorHeap* textureHeap,
     float h1y = h1(fy);
 
     float4 r =
-        g0(fy) * (g0x * texture.sample(sampler, float2(px + h0x, py + h0y) / float2(dimensions)) +
-              g1x * texture.sample(sampler, float2(px + h1x, py + h0y) / float2(dimensions))) +
-        g1(fy) * (g0x * texture.sample(sampler, float2(px + h0x, py + h1y) / float2(dimensions)) +
-              g1x * texture.sample(sampler, float2(px + h1x, py + h1y) / float2(dimensions)));
+        g0(fy) * (g0x * texture.sample(sampler, float2(px + h0x, py + h0y) / float2(dimensions), bias(lodBias)) +
+              g1x * texture.sample(sampler, float2(px + h1x, py + h0y) / float2(dimensions), bias(lodBias))) +
+        g1(fy) * (g0x * texture.sample(sampler, float2(px + h0x, py + h1y) / float2(dimensions), bias(lodBias)) +
+              g1x * texture.sample(sampler, float2(px + h1x, py + h1y) / float2(dimensions), bias(lodBias)));
 
     return r;
 }
 
 #else
 
-float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lodBias = 0.0)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
     SamplerState samplerState = g_SamplerDescriptorHeap[samplerDescriptorIndex];
@@ -616,10 +626,10 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
     float h1y = h1(fy);
 
     float4 r =
-        g0(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
-        g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
+        g0(fy) * (g0x * texture.SampleBias(samplerState, float2(px + h0x, py + h0y) / float2(dimensions), lodBias) +
+            g1x * texture.SampleBias(samplerState, float2(px + h1x, py + h0y) / float2(dimensions), lodBias)) +
+        g1(fy) * (g0x * texture.SampleBias(samplerState, float2(px + h0x, py + h1y) / float2(dimensions), lodBias) +
+            g1x * texture.SampleBias(samplerState, float2(px + h1x, py + h1y) / float2(dimensions), lodBias));
 
     return r;
 }
@@ -1066,55 +1076,55 @@ PixelShaderOutput shaderMain(
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		GBufferTextureSampler3_Texture2DDescriptorIndex, GBufferTextureSampler3_SamplerDescriptorIndex, r0.xy, float2(0, 0)).x;
+		GBufferTextureSampler3_Texture2DDescriptorIndex, GBufferTextureSampler3_SamplerDescriptorIndex, r0.xy, float2(0, 0), GetTextureLodBias(1)).x;
 	r6.w = tfetch2D(
 #ifdef __air__
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		GBufferTextureSampler2_Texture2DDescriptorIndex, GBufferTextureSampler2_SamplerDescriptorIndex, r0.xy, float2(0, 0)).w;
+		GBufferTextureSampler2_Texture2DDescriptorIndex, GBufferTextureSampler2_SamplerDescriptorIndex, r0.xy, float2(0, 0), GetTextureLodBias(0)).w;
 	r7.xyz = tfetch2D(
 #ifdef __air__
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(-0.5, -1.5)).xyz;
+		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(-0.5, -1.5), GetTextureLodBias(2)).xyz;
 	r6.xyz = tfetch2D(
 #ifdef __air__
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0)).xyz;
+		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0), GetTextureLodBias(2)).xyz;
 	r8.xyz = tfetch2D(
 #ifdef __air__
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(1.5, -0.5)).xyz;
+		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(1.5, -0.5), GetTextureLodBias(2)).xyz;
 	r3.yzw = tfetch2D(
 #ifdef __air__
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(0.5, 1.5)).xyz;
+		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(0.5, 1.5), GetTextureLodBias(2)).xyz;
 	r5.xyz = tfetch2D(
 #ifdef __air__
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(-1.5, 0.5)).xyz;
+		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(-1.5, 0.5), GetTextureLodBias(2)).xyz;
 	r0.z = tfetch2D(
 #ifdef __air__
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r0.xy, float2(0, 0)).z;
+		StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r0.xy, float2(0, 0), GetTextureLodBias(6)).z;
 	r1.yzw = tfetch2D(
 #ifdef __air__
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		BloomSampler_Texture2DDescriptorIndex, BloomSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0)).xyz;
+		BloomSampler_Texture2DDescriptorIndex, BloomSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0), GetTextureLodBias(3)).xyz;
 	r9.xy = (float2)((r0.yx * c255.zz + c251.ww));
 	r10.w = (float)((-r9.x * dofProj.w));
 	r4.w = (float)((r0.z >= PLAYER_MASK.x));
@@ -1223,7 +1233,7 @@ PixelShaderOutput shaderMain(
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0)).xyz;
+		HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r0.xy, float2(0, 0), GetTextureLodBias(2)).xyz;
 	p0 = r4.w == 0.0;
 	ps = p0 ? 0.0 : 1.0;
 	if (p0)
@@ -1241,7 +1251,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			JitterSampler_Texture2DDescriptorIndex, JitterSampler_SamplerDescriptorIndex, r0.zw, float2(0, 0)).x;
+			JitterSampler_Texture2DDescriptorIndex, JitterSampler_SamplerDescriptorIndex, r0.zw, float2(0, 0), GetTextureLodBias(5)).x;
 	}
 	if (p0)
 	{
@@ -1283,7 +1293,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r12.xy, float2(0, 0)).xyz;
+			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r12.xy, float2(0, 0), GetTextureLodBias(2)).xyz;
 	}
 	if (p0)
 	{
@@ -1292,7 +1302,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r14.zw, float2(0, 0)).xyz;
+			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r14.zw, float2(0, 0), GetTextureLodBias(2)).xyz;
 	}
 	if (p0)
 	{
@@ -1301,7 +1311,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r14.xy, float2(0, 0)).xyz;
+			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r14.xy, float2(0, 0), GetTextureLodBias(2)).xyz;
 	}
 	if (p0)
 	{
@@ -1310,7 +1320,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r13.zw, float2(0, 0)).xyz;
+			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r13.zw, float2(0, 0), GetTextureLodBias(2)).xyz;
 	}
 	if (p0)
 	{
@@ -1319,7 +1329,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r13.xy, float2(0, 0)).xyz;
+			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r13.xy, float2(0, 0), GetTextureLodBias(2)).xyz;
 	}
 	if (p0)
 	{
@@ -1328,7 +1338,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r12.zw, float2(0, 0)).xyz;
+			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r12.zw, float2(0, 0), GetTextureLodBias(2)).xyz;
 	}
 	if (p0)
 	{
@@ -1337,7 +1347,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r8.zw, float2(0, 0)).xyz;
+			HDRSampler_Texture2DDescriptorIndex, HDRSampler_SamplerDescriptorIndex, r8.zw, float2(0, 0), GetTextureLodBias(2)).xyz;
 	}
 	if (p0)
 	{
@@ -1346,7 +1356,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r12.xy, float2(0, 0)).z;
+			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r12.xy, float2(0, 0), GetTextureLodBias(6)).z;
 	}
 	if (p0)
 	{
@@ -1355,7 +1365,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r14.xy, float2(0, 0)).z;
+			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r14.xy, float2(0, 0), GetTextureLodBias(6)).z;
 	}
 	if (p0)
 	{
@@ -1364,7 +1374,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r14.zw, float2(0, 0)).z;
+			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r14.zw, float2(0, 0), GetTextureLodBias(6)).z;
 	}
 	if (p0)
 	{
@@ -1373,7 +1383,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r13.zw, float2(0, 0)).z;
+			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r13.zw, float2(0, 0), GetTextureLodBias(6)).z;
 	}
 	if (p0)
 	{
@@ -1382,7 +1392,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r13.xy, float2(0, 0)).z;
+			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r13.xy, float2(0, 0), GetTextureLodBias(6)).z;
 	}
 	if (p0)
 	{
@@ -1391,7 +1401,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r8.zw, float2(0, 0)).z;
+			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r8.zw, float2(0, 0), GetTextureLodBias(6)).z;
 	}
 	if (p0)
 	{
@@ -1400,7 +1410,7 @@ PixelShaderOutput shaderMain(
 			g_Texture2DDescriptorHeap,
 			g_SamplerDescriptorHeap,
 #endif
-			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r12.zw, float2(0, 0)).z;
+			StencilCopySampler_Texture2DDescriptorIndex, StencilCopySampler_SamplerDescriptorIndex, r12.zw, float2(0, 0), GetTextureLodBias(6)).z;
 	}
 	if (p0)
 	{
@@ -1507,7 +1517,7 @@ PixelShaderOutput shaderMain(
 		g_Texture2DDescriptorHeap,
 		g_SamplerDescriptorHeap,
 #endif
-		AdapLumSampler_Texture2DDescriptorIndex, AdapLumSampler_SamplerDescriptorIndex, r3.xx, float2(0, 0)).x;
+		AdapLumSampler_Texture2DDescriptorIndex, AdapLumSampler_SamplerDescriptorIndex, r3.xx, float2(0, 0), GetTextureLodBias(4)).x;
 	ps = clamp(rcp(r0.x), -FLT_MAX, FLT_MAX);
 	r0.x = ps;
 	ps = ToneMapParams.y * r0.x;

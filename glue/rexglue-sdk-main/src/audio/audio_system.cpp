@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
@@ -149,10 +150,24 @@ void AudioSystem::WorkerThreadMain() {
     if (result.first == rex::thread::WaitResult::kSuccess) {
       auto index = result.second;
 
+      std::shared_ptr<ClientDispatchState> dispatch;
       auto global_lock = global_critical_region_.Acquire();
-      uint32_t client_callback = clients_[index].callback;
-      uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
+      dispatch = clients_[index].dispatch;
       global_lock.unlock();
+
+      // UnregisterClient removes the dispatch state from the table first, then
+      // takes this lock exclusively. A state copied just before removal either
+      // finishes its callback before unregistration returns, or observes
+      // accepting=false and does not enter guest code. This closes the window
+      // where a copied callback argument could outlive the guest audio engine.
+      std::optional<std::shared_lock<std::shared_mutex>> dispatch_lock;
+      if (dispatch) {
+        dispatch_lock.emplace(dispatch->mutex);
+      }
+      const uint32_t client_callback =
+          dispatch && dispatch->accepting ? dispatch->callback : 0;
+      const uint32_t client_callback_arg =
+          dispatch && dispatch->accepting ? dispatch->wrapped_callback_arg : 0;
 
       if (client_callback) {
         if (diag_pump_count < 10) {
@@ -273,7 +288,14 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   uint32_t ptr = memory()->SystemHeapAlloc(0x4);
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
-  clients_[index] = {driver, callback, callback_arg, ptr, true};
+  clients_[index] = {
+      .driver = driver,
+      .dispatch = std::make_shared<ClientDispatchState>(callback, ptr),
+      .callback = callback,
+      .callback_arg = callback_arg,
+      .wrapped_callback_arg = ptr,
+      .in_use = true,
+  };
 
   const uint32_t initial_credits =
       std::clamp(driver->RecommendedInitialCredits(queued_frames_), 1U, queued_frames_);
@@ -321,12 +343,22 @@ void AudioSystem::UnregisterClient(size_t index) {
 
   assert_true(index < kMaximumClientCount);
   std::shared_ptr<AudioDriver> driver;
+  std::shared_ptr<ClientDispatchState> dispatch;
   uint32_t wrapped_callback_arg = 0;
   {
     auto global_lock = global_critical_region_.Acquire();
     driver = std::move(clients_[index].driver);
+    dispatch = std::move(clients_[index].dispatch);
     wrapped_callback_arg = clients_[index].wrapped_callback_arg;
     clients_[index] = {};
+  }
+
+  // Do not allow guest teardown to continue until a callback that already
+  // left the client-table lock has returned. The callback may submit audio,
+  // so waiting under global_critical_region_ would deadlock.
+  if (dispatch) {
+    std::unique_lock dispatch_lock(dispatch->mutex);
+    dispatch->accepting = false;
   }
   driver.reset();
   if (wrapped_callback_arg) {
@@ -391,6 +423,8 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
     client.callback = stream->Read<uint32_t>();
     client.callback_arg = stream->Read<uint32_t>();
     client.wrapped_callback_arg = stream->Read<uint32_t>();
+    client.dispatch = std::make_shared<ClientDispatchState>(client.callback,
+                                                            client.wrapped_callback_arg);
 
     client.in_use = true;
 
