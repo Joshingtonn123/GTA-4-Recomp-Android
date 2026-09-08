@@ -17,6 +17,7 @@ const char* g_androidObbPath         = nullptr;
 // runtime points at the user-selected game directory instead of the
 // CMake-baked LIBERTY_RECOMP_EMBEDDED_GAME_PATH.
 const char* g_androidGameRoot        = nullptr;
+bool g_androidShowFps                = true;
 
 namespace {
 // Shared UTF-8 copy helper: allocates a NUL-terminated buffer via malloc so
@@ -133,4 +134,14 @@ Java_com_libertyrecomp_LibertySDLActivity_nativeSetGameRoot(
 {
     free(const_cast<char*>(g_androidGameRoot));
     g_androidGameRoot = CopyJString(env, gameRoot);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_libertyrecomp_LibertySDLActivity_nativeSetRuntimeOptions(
+    JNIEnv* env,
+    jclass /*clazz*/,
+    jstring /*renderer*/,
+    jboolean showFps)
+{
+    g_androidShowFps = showFps == JNI_TRUE;
 }

@@ -15,6 +15,7 @@ extern int      g_androidApiLevel;
 // allocated with malloc(), replaced at most once per process via
 // nativeSetGameRoot().
 extern "C" const char* g_androidGameRoot;
+extern "C" bool g_androidShowFps;
 
 // RAII helper: attaches the current thread to the VM if needed, and detaches
 // on destruction (only if this object performed the attach).

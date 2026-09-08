@@ -60,8 +60,10 @@ public class LibertySDLActivity extends SDLActivity {
 
     private static final String PREFS_NAME   = "liberty_recomp_prefs";
     private static final String PREF_GAME_DIR = "game_dir";
+    private static final String PREF_SHOW_FPS = "show_fps";
 
     private static final int REQ_PICK_FOLDER      = 1001;
+    private static final int REQ_PICK_ISO         = 1004;
     private static final int REQ_MANAGE_STORAGE   = 1002;
     private static final int REQ_LEGACY_STORAGE   = 1003;
 
@@ -88,12 +90,15 @@ public class LibertySDLActivity extends SDLActivity {
 
     private TextView mPathLabel;
     private TextView mStatusLabel;
+    private TextView mRendererLabel;
+    private TextView mIsoStatusLabel;
     private Button   mPlayBtn;
 
     // ─── Native bridges defined in LibertyRecomp/os/android/jni_glue.cpp ───
     private static native void nativeSetActivity(Activity activity, int apiLevel);
     private static native void nativeSetPaths(String internalPath, String obbPath);
     private static native void nativeSetGameRoot(String gameRoot);
+    private static native void nativeSetRuntimeOptions(String renderer, boolean showFps);
     // vibration_android.cpp
     private static native void nativeSetContext(Context context);
 
@@ -135,6 +140,7 @@ public class LibertySDLActivity extends SDLActivity {
             if (mGameDir != null && !mGameDir.isEmpty()) {
                 nativeSetGameRoot(mGameDir);
             }
+            nativeSetRuntimeOptions("vulkan", prefs().getBoolean(PREF_SHOW_FPS, true));
             Log.i(TAG, "Native context wired: game_dir=" + mGameDir
                 + ", internal=" + internal + ", obb=" + obb);
         } catch (UnsatisfiedLinkError e) {
@@ -204,6 +210,15 @@ public class LibertySDLActivity extends SDLActivity {
             return;
         }
 
+        if (requestCode == REQ_PICK_ISO) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null && mIsoStatusLabel != null) {
+                mIsoStatusLabel.setText("ISO selected. Extract it with extract-xiso on a desktop, then select the folder above. "
+                    + "This build does not silently redistribute or decompile copyrighted game data on-device.");
+                mIsoStatusLabel.setTextColor(C_MUTED);
+            }
+            return;
+        }
+
         if (requestCode == REQ_MANAGE_STORAGE) {
             refreshPickerStatus();
             return;
@@ -257,6 +272,8 @@ public class LibertySDLActivity extends SDLActivity {
 
         root.addView(buildPermissionCard());
         root.addView(buildFolderCard());
+        root.addView(buildIsoCard());
+        root.addView(buildSettingsCard());
 
         mPlayBtn = new Button(this);
         mPlayBtn.setText(getString(R.string.picker_play));
@@ -353,6 +370,65 @@ public class LibertySDLActivity extends SDLActivity {
         return card;
     }
 
+    private View buildIsoCard() {
+        LinearLayout card = newCard();
+
+        TextView label = new TextView(this);
+        label.setText("Xbox 360 ISO");
+        label.setTextSize(11f);
+        label.setTypeface(Typeface.DEFAULT_BOLD);
+        label.setTextColor(C_TEXT);
+        card.addView(label);
+
+        mIsoStatusLabel = new TextView(this);
+        mIsoStatusLabel.setText("Select a legally dumped ISO to see the extraction requirements.");
+        mIsoStatusLabel.setTextSize(13f);
+        mIsoStatusLabel.setTextColor(C_MUTED);
+        card.addView(mIsoStatusLabel);
+
+        Button pick = new Button(this);
+        pick.setText("Select ISO");
+        pick.setAllCaps(false);
+        pick.setOnClickListener(v -> pickIso());
+        card.addView(pick);
+        return card;
+    }
+
+    private View buildSettingsCard() {
+        LinearLayout card = newCard();
+
+        TextView label = new TextView(this);
+        label.setText("Runtime settings");
+        label.setTextSize(11f);
+        label.setTypeface(Typeface.DEFAULT_BOLD);
+        label.setTextColor(C_TEXT);
+        card.addView(label);
+
+        mRendererLabel = new TextView(this);
+        mRendererLabel.setTextSize(13f);
+        mRendererLabel.setTextColor(C_TEXT);
+        card.addView(mRendererLabel);
+
+        Button renderer = new Button(this);
+        renderer.setText("Renderer: Vulkan (Android)");
+        renderer.setAllCaps(false);
+        renderer.setOnClickListener(v -> Toast.makeText(this,
+            "Android currently ships the Vulkan renderer. OpenGL ES is not implemented by the native runtime.",
+            Toast.LENGTH_LONG).show());
+        card.addView(renderer);
+
+        Button fps = new Button(this);
+        fps.setAllCaps(false);
+        fps.setOnClickListener(v -> {
+            boolean enabled = !prefs().getBoolean(PREF_SHOW_FPS, true);
+            prefs().edit().putBoolean(PREF_SHOW_FPS, enabled).apply();
+            refreshPickerStatus();
+        });
+        card.addView(fps);
+        card.setTag("settings-card");
+        return card;
+    }
+
     private LinearLayout newCard() {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
@@ -394,6 +470,18 @@ public class LibertySDLActivity extends SDLActivity {
         boolean canPlay = haveStorageAccess() && mGameDir != null && missing == null;
         mPlayBtn.setEnabled(canPlay);
         mPlayBtn.setAlpha(canPlay ? 1f : 0.5f);
+        if (mRendererLabel != null) {
+            mRendererLabel.setText("Renderer: Vulkan 1.1 baseline; FPS overlay: "
+                + (prefs().getBoolean(PREF_SHOW_FPS, true) ? "on" : "off"));
+            View settings = findViewWithTag("settings-card");
+            if (settings instanceof ViewGroup) {
+                View fpsButton = ((ViewGroup) settings).getChildAt(3);
+                if (fpsButton instanceof Button) {
+                    ((Button) fpsButton).setText("FPS overlay: "
+                        + (prefs().getBoolean(PREF_SHOW_FPS, true) ? "on" : "off"));
+                }
+            }
+        }
     }
 
     private View findViewWithTag(String tag) {
@@ -420,6 +508,16 @@ public class LibertySDLActivity extends SDLActivity {
             i.putExtra(DocumentsContract.EXTRA_INITIAL_URI, initial);
         }
         startActivityForResult(i, REQ_PICK_FOLDER);
+    }
+
+    private void pickIso() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.setType("application/octet-stream");
+        i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
+            "application/octet-stream", "application/x-iso9660-image"});
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(i, REQ_PICK_ISO);
     }
 
     /**

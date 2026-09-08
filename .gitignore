@@ -661,6 +661,9 @@ docs/*.md
 # Claude and GitHub metadata - do not commit
 .claude/
 .github/
+!.github/
+!.github/workflows/
+!.github/workflows/android-apk.yml
 
 # Claude Code / AI agent artifacts
 .claude/

@@ -14,6 +14,7 @@
 #endif
 #ifdef __ANDROID__
 #include <dlfcn.h>
+#include <os/android/jni_glue.h>
 #endif
 #if REX_PLATFORM_CONSOLE
 #include <unistd.h>
@@ -549,6 +550,11 @@ int main(int argc, char *argv[])
     }
 
     Config::Load();
+
+#ifdef __ANDROID__
+    Config::GraphicsAPI = EGraphicsAPI::Vulkan;
+    Config::ShowFPS = g_androidShowFps;
+#endif
 
 #if !REX_PLATFORM_CONSOLE
     // Native PC input owns GTA's action records, but retail code also reads
