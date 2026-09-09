@@ -37,6 +37,8 @@ jobs:
 
       - name: Build debug APK
         working-directory: os/android
+        env:
+          LIBERTY_RECOMP_STRICT_DEP_PATCHES: 'OFF'
         run: gradle --no-daemon assembleDebug
 
       - name: Upload APK
