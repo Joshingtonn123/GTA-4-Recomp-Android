@@ -62,6 +62,31 @@ function(liberty_apply_dependency_patches repository_root)
             message(STATUS "LibertyRecomp dependency patch: ${name} not initialized; skipped")
             continue()
         endif()
+
+        set(strict_dependency_patches ON)
+        if(DEFINED ENV{LIBERTY_RECOMP_STRICT_DEP_PATCHES})
+            set(strict_dependency_patches "$ENV{LIBERTY_RECOMP_STRICT_DEP_PATCHES}")
+        endif()
+        string(TOLOWER "${strict_dependency_patches}" strict_dependency_patches)
+
+        set(base_revision "")
+        if("${entry}" MATCHES "base_revision")
+            string(JSON base_revision GET "${entry}" base_revision)
+        endif()
+        if(NOT base_revision STREQUAL "")
+            execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${source}" rev-parse HEAD
+                OUTPUT_VARIABLE dependency_head_revision OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+            if(NOT dependency_head_revision STREQUAL base_revision)
+                if(strict_dependency_patches STREQUAL "on" OR strict_dependency_patches STREQUAL "1" OR strict_dependency_patches STREQUAL "true" OR strict_dependency_patches STREQUAL "yes")
+                    message(FATAL_ERROR
+                        "Dependency patch pin drift: ${name} expects ${base_revision} but checkout is ${dependency_head_revision}; set LIBERTY_RECOMP_STRICT_DEP_PATCHES=OFF to allow upstream drift.")
+                endif()
+                message(WARNING
+                    "Dependency patch pin drift: ${name} expects ${base_revision} but checkout is ${dependency_head_revision}; skipping patch verification for this upstream-moved dependency.")
+                continue()
+            endif()
+        endif()
+
         set(patch "${patch_directory}/${patch_name}")
         file(SHA256 "${patch}" actual_patch_hash)
         if(NOT actual_patch_hash STREQUAL expected_patch_hash)
