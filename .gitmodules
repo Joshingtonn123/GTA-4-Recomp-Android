@@ -151,3 +151,7 @@
 [submodule "glue/rexglue-sdk-main/thirdparty/tracy"]
 	path = glue/rexglue-sdk-main/thirdparty/tracy
 	url = https://github.com/wolfpld/tracy.git
+[submodule "tools/XenosRecomp"]
+	path = tools/XenosRecomp
+	url = https://github.com/sonicnext-dev/XenosRecomp.git
+	branch = main
