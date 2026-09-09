@@ -1,9 +1,6 @@
 [submodule "thirdparty/ddspp"]
 	path = thirdparty/ddspp
 	url = https://github.com/redorav/ddspp.git
-[submodule "tools/XenosRecomp"]
-	path = tools/XenosRecomp
-	url = https://github.com/sonicnext-dev/XenosRecomp.git
 [submodule "tools/DLSS"]
 	path = tools/DLSS
 	url = https://github.com/NVIDIA/DLSS.git
