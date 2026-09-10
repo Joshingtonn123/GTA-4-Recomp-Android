@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include <rex/math.h>
+#include <rex/main_android.h>
 #include <rex/memory/utils.h>
 #include <rex/platform.h>
 #include <rex/string.h>
