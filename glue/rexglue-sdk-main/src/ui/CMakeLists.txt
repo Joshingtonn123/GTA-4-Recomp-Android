@@ -14,11 +14,21 @@ set(REXUI_CORE_SOURCES
     renderdoc_api.cpp
     sdl_virtual_key.cpp
     window.cpp
-    window_sdl.cpp
     windowed_app.cpp
-    windowed_app_context.cpp
-    windowed_app_context_sdl.cpp
 )
+
+if(ANDROID)
+    list(APPEND REXUI_CORE_SOURCES
+        window_android.cpp
+        windowed_app_context_android.cpp
+    )
+else()
+    list(APPEND REXUI_CORE_SOURCES
+        window_sdl.cpp
+        windowed_app_context.cpp
+        windowed_app_context_sdl.cpp
+    )
+endif()
 
 # Optional overlay dialogs
 set(REXUI_OVERLAY_SOURCES
@@ -64,7 +74,11 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 # Platform-specific surface shims (windowing itself is SDL3, platform-independent)
-if(WIN32)
+if(ANDROID)
+    set(REXUI_PLATFORM_SOURCES
+        surface_android.cpp
+    )
+elseif(WIN32)
     set(REXUI_PLATFORM_SOURCES
         surface_win.cpp
     )
