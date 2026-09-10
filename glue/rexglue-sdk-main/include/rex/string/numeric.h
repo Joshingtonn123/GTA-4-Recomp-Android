@@ -11,10 +11,12 @@
 #pragma once
 
 #include <charconv>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include <fmt/format.h>
 
@@ -133,10 +135,14 @@ inline T fpfs(const std::string_view value, bool force_hex) {
     }
     std::memcpy(&result, &pun, sizeof(PUN));
   } else {
-    auto [p, error] = std::from_chars(range.data(), range.data() + range.size(), result,
-                                      std::chars_format::general);
-    // TODO(gibbed): do something more with errors?
-    if (error != std::errc()) {
+    std::string range_string(range);
+    char* parse_end = nullptr;
+    if constexpr (std::is_same_v<T, float>) {
+      result = std::strtof(range_string.c_str(), &parse_end);
+    } else {
+      result = std::strtod(range_string.c_str(), &parse_end);
+    }
+    if (parse_end == range_string.c_str()) {
       assert_always();
       return T();
     }
@@ -253,12 +259,14 @@ inline vec128_t from_string<vec128_t>(const std::string_view value, bool force_h
         assert_always();
         return vec128_t();
       }
-      auto result = std::from_chars(p, end, v.f32[i], std::chars_format::general);
-      if (result.ec != std::errc()) {
+      std::string component(p, end - p);
+      char* parse_end = nullptr;
+      v.f32[i] = std::strtof(component.c_str(), &parse_end);
+      if (parse_end == component.c_str()) {
         assert_always();
         return vec128_t();
       }
-      p = result.ptr;
+      p += parse_end - component.c_str();
     }
   }
   return v;
