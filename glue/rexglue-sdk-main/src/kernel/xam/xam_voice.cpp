@@ -67,10 +67,8 @@ struct VoiceHandleState {
   ~VoiceHandleState() { Stop(); }
 
   void Start() {
-    capture_worker = std::jthread(
-        [this](std::stop_token stop_token) { CaptureWorkerMain(stop_token); });
-    playback_worker = std::jthread(
-        [this](std::stop_token stop_token) { PlaybackWorkerMain(stop_token); });
+    capture_worker = std::thread([this] { CaptureWorkerMain(); });
+    playback_worker = std::thread([this] { PlaybackWorkerMain(); });
   }
 
   bool EnqueueCapture(VoiceWorkItem item) {
@@ -107,8 +105,6 @@ struct VoiceHandleState {
         pending_capture.swap(capture_queue);
         pending_playback.swap(playback_queue);
       }
-      capture_worker.request_stop();
-      playback_worker.request_stop();
       condition.notify_all();
       if (capture_worker.joinable()) capture_worker.join();
       if (playback_worker.joinable()) playback_worker.join();
@@ -168,14 +164,12 @@ struct VoiceHandleState {
     memory::store_and_swap<uint32_t>(packet + 0, 0);
   }
 
-  bool WaitForWork(std::stop_token stop_token, bool capture,
-                   VoiceWorkItem& item) {
+  bool WaitForWork(bool capture, VoiceWorkItem& item) {
     std::unique_lock lock(mutex);
     condition.wait(lock, [&] {
-      return stopping || stop_token.stop_requested() ||
-             !(capture ? capture_queue : playback_queue).empty();
+      return stopping || !(capture ? capture_queue : playback_queue).empty();
     });
-    if (stopping || stop_token.stop_requested()) return false;
+    if (stopping) return false;
     auto& queue = capture ? capture_queue : playback_queue;
     item = std::move(queue.front());
     queue.pop_front();
@@ -187,9 +181,9 @@ struct VoiceHandleState {
     return stopping;
   }
 
-  void CaptureWorkerMain(std::stop_token stop_token) {
+  void CaptureWorkerMain() {
     VoiceWorkItem item;
-    while (WaitForWork(stop_token, true, item)) {
+    while (WaitForWork(true, item)) {
       if (!audio_device || !capture_codec || !item.payload_size) {
         CompleteError(item, false);
         continue;
@@ -227,9 +221,9 @@ struct VoiceHandleState {
     }
   }
 
-  void PlaybackWorkerMain(std::stop_token stop_token) {
+  void PlaybackWorkerMain() {
     VoiceWorkItem item;
-    while (WaitForWork(stop_token, false, item)) {
+    while (WaitForWork(false, item)) {
       if (!audio_device || !playback_codec || item.playback_payload.empty()) {
         CompleteError(item, true);
         continue;
@@ -263,8 +257,8 @@ struct VoiceHandleState {
   std::deque<VoiceWorkItem> playback_queue;
   bool stopping = false;
   std::once_flag stop_once;
-  std::jthread capture_worker;
-  std::jthread playback_worker;
+  std::thread capture_worker;
+  std::thread playback_worker;
 };
 
 std::mutex g_voice_mutex;
