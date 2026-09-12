@@ -35,7 +35,7 @@ namespace {
 
 struct SizeHeader {
   uint64_t requested_size;
-  uint64_t reserved;  // padding to O1HEAP_ALIGNMENT
+  uint64_t reserved[3];  // padding to O1HEAP_ALIGNMENT
 };
 static_assert(sizeof(SizeHeader) == O1HEAP_ALIGNMENT,
               "SizeHeader must be exactly one O1HEAP_ALIGNMENT unit");
@@ -151,12 +151,14 @@ uint32_t ReXHeap::Realloc(uint32_t guest_addr, uint32_t new_size, bool zero_new)
 
   auto* old_hdr = static_cast<SizeHeader*>(real_host);
   uint32_t old_size = static_cast<uint32_t>(old_hdr->requested_size);
-  void* new_ptr = o1heapReallocate(segment->heap, real_host, new_size + kHeaderSize);
+  // This O1Heap revision exposes allocate/free but not realloc. Allocate the
+  // replacement block first so the old allocation remains valid for copying.
+  void* new_ptr = o1heapAllocate(segment->heap, new_size + kHeaderSize);
   if (!new_ptr) {
     // Cross-segment fallback: allocate a fresh block, copy, then free old.
     uint32_t new_guest = AllocLocked(new_size, false);
     if (!new_guest) {
-      REXKRNL_WARN("rexcrt_RtlReAllocateHeap: o1heapReallocate({}) failed", new_size);
+      REXKRNL_WARN("rexcrt_RtlReAllocateHeap: replacement allocation({}) failed", new_size);
       return 0;
     }
 
@@ -176,9 +178,13 @@ uint32_t ReXHeap::Realloc(uint32_t guest_addr, uint32_t new_size, bool zero_new)
   new_hdr->requested_size = new_size;
 
   void* user_ptr = static_cast<uint8_t*>(new_ptr) + kHeaderSize;
+  std::memcpy(user_ptr, static_cast<uint8_t*>(real_host) + kHeaderSize,
+              std::min(old_size, new_size));
   if (zero_new && new_size > old_size) {
     std::memset(static_cast<uint8_t*>(user_ptr) + old_size, 0, new_size - old_size);
   }
+
+  o1heapFree(segment->heap, real_host);
 
   return HostToGuest(user_ptr);
 }
@@ -248,7 +254,7 @@ uint32_t ReXHeap::AllocLocked(uint32_t size, bool zero) {
 
     auto* hdr = static_cast<SizeHeader*>(ptr);
     hdr->requested_size = size;
-    hdr->reserved = 0;
+    std::memset(hdr->reserved, 0, sizeof(hdr->reserved));
 
     void* user_ptr = static_cast<uint8_t*>(ptr) + kHeaderSize;
     if (zero) {
